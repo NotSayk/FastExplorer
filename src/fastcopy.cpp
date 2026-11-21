@@ -234,6 +234,10 @@ bool FastTransfer(const std::vector<std::wstring>& sources, const std::wstring& 
         for (auto& f : t->files) prog.bytesTotal += f.size;
         prog.filesTotal += (uint32_t)t->files.size();
     }
+    // Pas assez de place : on n'écrit rien, le Shell le dit avant de commencer (comme l'Explorateur).
+    ULARGE_INTEGER avail{};
+    if (GetDiskFreeSpaceExW(dest.c_str(), &avail, nullptr, nullptr) && avail.QuadPart < prog.bytesTotal + (1ull << 20))
+        return false;
 
     // Dossiers (parents d'abord), avec les attributs de la source (masqué, compressé…).
     for (auto& t : tops) {

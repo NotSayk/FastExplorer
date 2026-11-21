@@ -15,7 +15,8 @@
 // même Corbeille que l'Explorateur. Chaque opération tourne sur son propre
 // thread : l'interface reste fluide pendant une copie de plusieurs minutes.
 
-enum class FileOpKind { Copy, Move, Delete, Rename, NewFolder };
+// Restore : remet des éléments de la Corbeille à leur place d'origine (annuler une suppression).
+enum class FileOpKind { Copy, Move, Delete, Rename, NewFolder, Restore };
 
 struct FileOp {
     FileOpKind kind = FileOpKind::Copy;
@@ -30,6 +31,8 @@ struct FileOp {
     std::wstring focusAfter;          // renvoyé tel quel : élément à cibler ensuite
     bool clipboardCut = false;        // collage d'un « Couper » : vider le presse-papiers ensuite
     DWORD clipSeq = 0;
+    int64_t since = 0;                // Restore : supprimés depuis ce moment (FILETIME UTC)
+    int tag = 0;                      // renvoyé tel quel (annuler / rétablir)
 };
 
 struct FileOpResult {
@@ -41,7 +44,22 @@ struct FileOpResult {
     std::wstring focusAfter;
     bool clipboardCut = false;
     DWORD clipSeq = 0;
+    // Pour annuler / rétablir :
+    std::vector<std::wstring> sources;  // sources en chemins complets (presse-papiers compris)
+    std::wstring newName;               // = FileOp::newName
+    bool permanent = false;             // = FileOp::permanent
+    int64_t started = 0;                // début de l'opération (FILETIME UTC)
+    int tag = 0;                        // = FileOp::tag
+    std::wstring detail;                // explication d'un échec (« ouvert dans Word »…), sinon vide
 };
+
+// Remet `original` (chemin complet d'avant la suppression) depuis la Corbeille
+// de son volume : l'élément supprimé le plus récemment, et pas avant `since`.
+// Lit les fichiers $I de $Recycle.Bin\<SID> (format de Windows Vista à 11).
+DWORD Recycle_Restore(const std::wstring& original, int64_t since);
+
+// Applications qui gardent ces fichiers ouverts (Restart Manager), ex. « Word, Excel » ; "" si aucune connue.
+std::wstring FileOps_Lockers(const std::vector<std::wstring>& paths);
 
 // Lance l'opération ; `target` reçoit `msg` (lParam = FileOpResult*, à libérer)
 // à la fin. `owner` possède les fenêtres de progression et de conflit.

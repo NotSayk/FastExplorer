@@ -4,6 +4,8 @@
 #include "paths.h"
 #include "shellmenu.h"
 
+#include <restartmanager.h>
+#include <sddl.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -12,6 +14,9 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+
+#pragma comment(lib, "rstrtmgr.lib")
+#pragma comment(lib, "advapi32.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -204,8 +209,24 @@ bool TryFastRename(const FileOp& op, FileOpResult& r) {
     return true;
 }
 
+// Annuler une suppression : chaque élément revient de la Corbeille.
+HRESULT Restore(const FileOp& op, FileOpResult& r) {
+    DWORD first = 0;
+    for (const auto& p : op.paths) {
+        if (const DWORD e = Recycle_Restore(p, op.since)) {
+            if (!first) first = e;
+            continue;
+        }
+        std::wstring parent, leaf;
+        if (ParentOf(p, parent, leaf) && _wcsicmp(parent.c_str(), op.folder.c_str()) == 0) r.created.push_back(leaf);
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, parent.c_str(), nullptr);
+    }
+    return first && r.created.empty() ? HRESULT_FROM_WIN32(first) : S_OK;
+}
+
 HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r) {
     if (op.kind == FileOpKind::NewFolder) return NewFolder(op, owner, r);
+    if (op.kind == FileOpKind::Restore) return Restore(op, r);
     if (op.kind == FileOpKind::Rename && TryFastRename(op, r)) return S_OK;
 
     HRESULT hr = S_OK;
@@ -300,7 +321,24 @@ DWORD WINAPI Run(void* p) {
     r->focusAfter = t->op.focusAfter;
     r->clipboardCut = t->op.clipboardCut;
     r->clipSeq = t->op.clipSeq;
+    r->newName = t->op.newName;
+    r->permanent = t->op.permanent;
+    r->tag = t->op.tag;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    r->started = (int64_t)(((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime);
+    r->sources = t->op.paths;
+    for (const auto& item : t->op.items) {
+        std::wstring buf(32768, L'\0');
+        if (!SHGetPathFromIDListEx(item.get(), buf.data(), (DWORD)buf.size(), GPFIDL_DEFAULT)) continue;
+        buf.resize(wcslen(buf.c_str()));
+        r->sources.push_back(std::move(buf));
+    }
     r->hr = SUCCEEDED(init) ? Perform(t->op, t->owner, *r) : init;
+    if (r->hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION) || r->hr == HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION)) {
+        const std::wstring who = FileOps_Lockers(r->sources);
+        if (!who.empty()) r->detail = L"ouvert dans " + who;
+    }
     t->op.items.clear();  // PIDL libérés avant OleUninitialize (simple mémoire, mais par ordre)
     if (SUCCEEDED(init)) OleUninitialize();
     --g_running;
@@ -462,4 +500,112 @@ void Clipboard_ClearAfterMove(DWORD seq) {
 void Clipboard_Flush() {
     if (Clipboard_IsOurs()) OleFlushClipboard();
     g_clip.Reset();
+}
+
+// ───────────────────────────── Corbeille, fichiers verrouillés ─────────────────────────────
+
+namespace {
+
+const std::wstring& UserSid() {
+    static const std::wstring sid = [] {
+        std::wstring s;
+        HANDLE tok = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return s;
+        DWORD n = 0;
+        GetTokenInformation(tok, TokenUser, nullptr, 0, &n);
+        std::vector<BYTE> b(n);
+        LPWSTR str = nullptr;
+        if (n && GetTokenInformation(tok, TokenUser, b.data(), n, &n) &&
+            ConvertSidToStringSidW(((TOKEN_USER*)b.data())->User.Sid, &str)) {
+            s = str;
+            LocalFree(str);
+        }
+        CloseHandle(tok);
+        return s;
+    }();
+    return sid;
+}
+
+}  // namespace
+
+DWORD Recycle_Restore(const std::wstring& original, int64_t since) {
+    if (original.size() < 4 || original[1] != L':' || UserSid().empty()) return ERROR_NOT_SUPPORTED;
+    const std::wstring bin = original.substr(0, 2) + L"\\$Recycle.Bin\\" + UserSid() + L"\\";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW((bin + L"$I*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+    if (h == INVALID_HANDLE_VALUE) return ERROR_FILE_NOT_FOUND;
+    std::wstring best;
+    int64_t bestT = INT64_MIN;
+    std::vector<BYTE> buf(28 + 2 * 32768);
+    do {
+        // $I : version (8 octets), taille (8), date de suppression (8, FILETIME UTC), puis
+        // version 2 : longueur (4, en caractères, \0 compris) et chemin ; version 1 : chemin sur 260 caractères.
+        HANDLE f = CreateFileW((bin + fd.cFileName).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        DWORD got = 0;
+        const BOOL ok = ReadFile(f, buf.data(), (DWORD)buf.size(), &got, nullptr);
+        CloseHandle(f);
+        if (!ok || got < 24) continue;
+        int64_t ver = 0, when = 0;
+        memcpy(&ver, buf.data(), 8);
+        memcpy(&when, buf.data() + 16, 8);
+        size_t off = 24, chars = (got - 24) / 2;
+        if (ver == 2) {
+            if (got < 28) continue;
+            uint32_t n = 0;
+            memcpy(&n, buf.data() + 24, 4);
+            off = 28;
+            chars = std::min<size_t>(n, (got - 28) / 2);
+        } else if (ver != 1) {
+            continue;
+        }
+        std::wstring orig(chars, L'\0');
+        memcpy(orig.data(), buf.data() + off, chars * 2);
+        orig.resize(wcsnlen(orig.c_str(), chars));
+        // Petite marge : l'horloge de la suppression est prise par le Shell, un peu après la nôtre.
+        if (when >= since - 20000000LL && when >= bestT && _wcsicmp(orig.c_str(), original.c_str()) == 0) {
+            bestT = when;
+            best = fd.cFileName;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (best.empty()) return ERROR_FILE_NOT_FOUND;
+    std::wstring data = best;
+    data[1] = L'R';  // $Ixxxx → $Rxxxx : l'élément lui-même
+    if (!MoveFileExW(ToNtPath(bin + data).c_str(), ToNtPath(original).c_str(), 0)) return GetLastError();
+    DeleteFileW((bin + best).c_str());
+    return 0;
+}
+
+std::wstring FileOps_Lockers(const std::vector<std::wstring>& paths) {
+    DWORD session = 0;
+    WCHAR key[CCH_RM_SESSION_KEY + 1] = {};
+    if (RmStartSession(&session, 0, key) != ERROR_SUCCESS) return L"";
+    std::vector<LPCWSTR> files;
+    for (const auto& p : paths) {
+        const DWORD a = GetFileAttributesW(p.c_str());
+        if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(p.c_str());
+        if (files.size() >= 64) break;
+    }
+    std::wstring out;
+    if (!files.empty() &&
+        RmRegisterResources(session, (UINT)files.size(), files.data(), 0, nullptr, 0, nullptr) == ERROR_SUCCESS) {
+        UINT need = 0, have = 0;
+        DWORD reasons = 0;
+        std::vector<RM_PROCESS_INFO> info;
+        DWORD e = RmGetList(session, &need, &have, nullptr, &reasons);
+        if (e == ERROR_MORE_DATA && need) {
+            info.resize(need);
+            have = need;
+            e = RmGetList(session, &need, &have, info.data(), &reasons);
+        }
+        if (e == ERROR_SUCCESS)
+            for (UINT i = 0; i < have; ++i) {
+                const std::wstring n = info[i].strAppName;
+                if (!n.empty() && out.find(n) == std::wstring::npos) out += (out.empty() ? L"" : L", ") + n;
+            }
+    }
+    RmEndSession(session);
+    return out;
 }

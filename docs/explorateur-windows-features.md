@@ -234,10 +234,10 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Dupliquer sur place | Ctrl+C, Ctrl+V dans le même dossier : « fichier - Copie.txt » | P0 |
 | **Boîte de dialogue de copie** | Progression, débit, **graphique de vitesse** (« Plus de détails »), temps restant, pause, annulation ; plusieurs copies regroupées dans une seule fenêtre | ✅ P0 (fenêtre du Shell, interface jamais bloquée) |
 | **Conflits** | Remplacer, Ignorer, **Comparer** (choix fichier par fichier, avec dates et tailles), « Faire ceci pour les N conflits suivants » ; fusion des dossiers de même nom (option *Masquer les conflits de fusion de dossiers*) | ✅ P0 (dialogue du Shell) |
-| Fichier en cours d'utilisation | « Le fichier est ouvert dans <Application> » : Réessayer / Ignorer | P1 ⚙️ Restart Manager (`RmGetList`) |
-| Droits insuffisants | « Vous devez disposer d'une autorisation » ▸ Continuer (élévation UAC pour cette opération) | P1 ⚙️ élévation via COM (`IFileOperation` dans un processus élevé) |
+| Fichier en cours d'utilisation | « Le fichier est ouvert dans <Application> » : Réessayer / Ignorer | ✅ (bloc 12 : fenêtre du Shell, qui nomme l'application ; nos propres échecs : « ouvert dans Word » par Restart Manager) ⚙️ Restart Manager (`RmGetList`) |
+| Droits insuffisants | « Vous devez disposer d'une autorisation » ▸ Continuer (élévation UAC pour cette opération) | ✅ (tout échec de notre moteur repasse par le Shell, qui propose l'élévation) ⚙️ élévation via COM (`IFileOperation` dans un processus élevé) |
 | Perte de propriétés | Copie vers FAT/exFAT ou réseau : avertissement quand les propriétés (flux NTFS…) ne peuvent pas être conservées | P2 |
-| Espace insuffisant, chemin trop long | Messages dédiés | P1 |
+| Espace insuffisant, chemin trop long | Messages dédiés | ✅ (bloc 12 : place vérifiée avant toute copie par notre moteur, sinon le Shell avertit avant de commencer ; chemins longs gérés par notre moteur, message du Shell au-delà) |
 | Moteur | ⚙️ `IFileOperation` (moteur de copie de l'Explorateur : annuler, conflits, progression, élévation) ou moteur maison (`CopyFileEx` / `MoveFileWithProgress`, E/S non tamponnées pour les gros fichiers) | — |
 
 ### 6.3 Suppression, annulation
@@ -248,7 +248,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Suppression définitive | Maj+Suppr (avec confirmation) | ✅ P0 |
 | Confirmation | Optionnelle (propriétés de la Corbeille) ; toujours demandée pour une suppression définitive | ✅ P0 |
 | Trop gros pour la Corbeille | « Supprimer définitivement ? » | ✅ P1 (avertissement du Shell) |
-| **Annuler / Rétablir** | Ctrl+Z / Ctrl+Y : copie, déplacement, renommage, suppression, création, sur plusieurs niveaux | **P1** |
+| **Annuler / Rétablir** | Ctrl+Z / Ctrl+Y : copie, déplacement, renommage, suppression, création, sur plusieurs niveaux | ✅ (bloc 12 : historique à nous, 100 niveaux, aussi dans le menu du fond du dossier ; suppression annulée en restaurant depuis la Corbeille ; pas les suppressions définitives ni les actions faites par les menus du Shell) |
 | Supprimer sur un lecteur réseau ou amovible | Définitif (pas de Corbeille), avec avertissement | P1 |
 
 ---
@@ -505,7 +505,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 |---|---|---|
 | Ctrl+C / Ctrl+X / Ctrl+V | Copier / Couper / Coller | ✅ |
 | Ctrl+Maj+C | Copier en tant que chemin d'accès | ✅ |
-| Ctrl+Z / Ctrl+Y | Annuler / Rétablir | P1 |
+| Ctrl+Z / Ctrl+Y | Annuler / Rétablir | ✅ (aussi Ctrl+Maj+Z) |
 | Suppr, Ctrl+D / Maj+Suppr | Corbeille / suppression définitive | ✅ |
 | F2 | Renommer | ✅ |
 | Ctrl+Maj+N | Nouveau dossier | ✅ |
@@ -620,7 +620,7 @@ dossiers avant l'index…) :
     raccourcis `.url`, liens symboliques et jonctions.
 11. ✅ **Filtre instantané** ⭐ du dossier courant (taper pour filtrer, sans lancer de recherche) et
     **autocomplétion** de la barre d'adresse (+ lancer une commande, ex. `cmd`, `wt`).
-12. **Annuler / Rétablir** (Ctrl+Z / Ctrl+Y) et **opérations robustes** : fichier en cours d'utilisation
+12. ✅ **Annuler / Rétablir** (Ctrl+Z / Ctrl+Y) et **opérations robustes** : fichier en cours d'utilisation
     (Restart Manager : quelle application le bloque), droits insuffisants (élévation), espace insuffisant,
     chemin trop long, suppression définitive sur un lecteur réseau ou amovible.
 13. **Onglets et fenêtres** : Ctrl+T / Ctrl+W / Ctrl+Tab, réorganiser, clic milieu sur un dossier,

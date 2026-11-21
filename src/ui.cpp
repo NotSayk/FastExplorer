@@ -28,7 +28,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -209,6 +211,18 @@ void OpenWithShell(const std::wstring& full) {
     if ((INT_PTR)r <= 32) SetStatus(L"Impossible d'ouvrir « " + full + L" » : " + ErrorText(GetLastError()));
 }
 
+// Message bref (annulation faite…) : reste devant le résumé quelques secondes,
+// même si la liste est relue entre-temps.
+std::wstring g_flash;
+ULONGLONG g_flashUntil = 0;
+
+std::wstring WithNotes(const std::wstring& s) {
+    std::wstring out = s;
+    if (!g_flash.empty() && GetTickCount64() < g_flashUntil) out = g_flash + L"   •   " + out;
+    if (!g_goneNote.empty()) out = g_goneNote + L"   •   " + out;
+    return out;
+}
+
 void ShowSummary() {
     if (!HasView() || g_progressShown) return;
     const DirData& d = *g_view.data;
@@ -240,7 +254,7 @@ void ShowSummary() {
         swprintf_s(s, L"%zu élément%s  (%zu dossier%s, %zu fichier%s%s)", shown, shown > 1 ? L"s" : L"", dirs,
                    dirs > 1 ? L"s" : L"", shown - dirs, shown - dirs > 1 ? L"s" : L"", masked);
     }
-    SetStatus(g_goneNote.empty() ? std::wstring(s) : g_goneNote + L"   •   " + s);
+    SetStatus(WithNotes(s));
     wchar_t perf[160];
     int k = swprintf_s(perf, L"lecture %.2f ms, clés %.2f ms, tri %.2f ms", d.enumMs, d.keyMs, g_view.sortMs);
     if (g_startupMs > 0 && k > 0) {
@@ -1157,9 +1171,200 @@ void AfterOpSelect(const std::wstring& folder, std::vector<std::wstring> names, 
     ApplyAfterOp();
 }
 
+// ───────────────────────────── Annuler / Rétablir ─────────────────────────────
+//
+// Notre propre historique (Ctrl+Z / Ctrl+Y), sur plusieurs niveaux : celui de
+// l'Explorateur n'est pas accessible aux autres applications. Chaque opération
+// réussie y laisse une étape en chemins complets ; l'annuler lance l'opération
+// inverse (renommer en sens inverse, remettre à sa place, mettre les copies à la
+// Corbeille, restaurer depuis la Corbeille). Une suppression définitive ne
+// s'annule pas.
+
+enum { TAG_NONE = 0, TAG_UNDO = 1, TAG_REDO = 2 };
+
+struct UndoStep {
+    FileOpKind kind = FileOpKind::Copy;
+    std::vector<std::wstring> from, to;  // avant / après, chemins complets
+    int64_t since = 0;                   // suppression : moment où elle a commencé
+};
+std::vector<UndoStep> g_undo, g_redo;
+std::optional<UndoStep> g_undoing;  // annulation en cours
+size_t g_undoPending = 0;           // opérations de cette annulation pas encore finies
+bool g_undoOk = false;
+constexpr size_t kUndoMax = 100;
+
+std::wstring ParentPath(const std::wstring& p) {
+    std::wstring parent, leaf;
+    return ParentOf(p, parent, leaf) ? parent : std::wstring();
+}
+std::wstring LeafOf(const std::wstring& p) {
+    std::wstring parent, leaf;
+    return ParentOf(p, parent, leaf) ? leaf : p;
+}
+
+void Flash(const std::wstring& msg) {
+    g_flash = msg;
+    g_flashUntil = GetTickCount64() + 4000;
+    SetStatus(WithNotes(L""));
+    if (HasView()) ShowSummary();
+}
+
+std::wstring StepText(const UndoStep& s) {
+    const size_t n = std::max(s.from.size(), s.to.size());
+    auto count = [&](const wchar_t* what) {
+        return n == 1 ? std::wstring(what) + L" de « " + LeafOf(s.to.empty() ? s.from[0] : s.to[0]) + L" »"
+                      : std::wstring(what) + L" de " + std::to_wstring(n) + L" éléments";
+    };
+    switch (s.kind) {
+        case FileOpKind::Rename: return L"renommage de « " + LeafOf(s.from[0]) + L" »";
+        case FileOpKind::NewFolder: return L"création de « " + LeafOf(s.to[0]) + L" »";
+        case FileOpKind::Copy: return count(L"copie");
+        case FileOpKind::Move: return count(L"déplacement");
+        case FileOpKind::Delete: return n == 1 ? L"suppression de « " + LeafOf(s.from[0]) + L" »"
+                                               : L"suppression de " + std::to_wstring(n) + L" éléments";
+        default: return L"opération";
+    }
+}
+
+// Étape à mémoriser pour une opération terminée (false : rien à annuler).
+bool StepFromResult(const FileOpResult& r, UndoStep& s) {
+    s = UndoStep{r.kind};
+    const bool ok = SUCCEEDED(r.hr) && !r.aborted;
+    switch (r.kind) {
+        case FileOpKind::Rename:
+            if (!ok || r.sources.size() != 1 || r.newName.empty()) return false;
+            s.from = {r.sources[0]};
+            s.to = {Join(ParentPath(r.sources[0]), r.newName.c_str())};
+            return _wcsicmp(s.from[0].c_str(), s.to[0].c_str()) != 0 || s.from[0] != s.to[0];
+        case FileOpKind::NewFolder:
+            if (r.created.empty()) return false;
+            s.to = {Join(r.folder, r.created[0].c_str())};
+            return true;
+        case FileOpKind::Copy:
+            if (r.created.empty()) return false;
+            s.from = r.sources;
+            for (const auto& c : r.created) s.to.push_back(Join(r.folder, c.c_str()));
+            return true;
+        case FileOpKind::Move:
+            for (const auto& src : r.sources) {
+                const std::wstring leaf = LeafOf(src);
+                if (_wcsicmp(ParentPath(src).c_str(), r.folder.c_str()) == 0) continue;  // déjà là
+                for (const auto& c : r.created)
+                    if (_wcsicmp(c.c_str(), leaf.c_str()) == 0) {
+                        s.from.push_back(src);
+                        s.to.push_back(Join(r.folder, c.c_str()));
+                        break;
+                    }
+            }
+            return !s.from.empty();
+        case FileOpKind::Delete:
+            if (r.permanent || r.sources.empty() || (FAILED(r.hr) && !r.aborted)) return false;
+            s.from = r.sources;
+            s.since = r.started;
+            return true;
+        default: return false;
+    }
+}
+
+// Opérations qui défont (undo) ou refont l'étape.
+std::vector<FileOp> OpsFor(const UndoStep& s, bool undo) {
+    std::vector<FileOp> ops;
+    auto add = [&](FileOpKind k, std::wstring folder, std::vector<std::wstring> paths) {
+        FileOp op;
+        op.kind = k;
+        op.folder = std::move(folder);
+        op.paths = std::move(paths);
+        ops.push_back(std::move(op));
+        return &ops.back();
+    };
+    switch (s.kind) {
+        case FileOpKind::Rename: {
+            const std::wstring& src = undo ? s.to[0] : s.from[0];
+            add(FileOpKind::Rename, ParentPath(src), {src})->newName = LeafOf(undo ? s.from[0] : s.to[0]);
+            break;
+        }
+        case FileOpKind::NewFolder:
+            if (undo) add(FileOpKind::Delete, ParentPath(s.to[0]), s.to);
+            else add(FileOpKind::NewFolder, ParentPath(s.to[0]), {})->newName = LeafOf(s.to[0]);
+            break;
+        case FileOpKind::Copy:
+            if (undo) add(FileOpKind::Delete, ParentPath(s.to[0]), s.to);
+            else add(FileOpKind::Copy, ParentPath(s.to[0]), s.from);
+            break;
+        case FileOpKind::Move:
+            if (undo) {  // chaque élément retourne dans son dossier d'origine
+                std::map<std::wstring, std::vector<std::wstring>> back;
+                for (size_t i = 0; i < s.from.size(); ++i) back[ParentPath(s.from[i])].push_back(s.to[i]);
+                for (auto& [dir, paths] : back) add(FileOpKind::Move, dir, std::move(paths));
+            } else {
+                add(FileOpKind::Move, ParentPath(s.to[0]), s.from);
+            }
+            break;
+        case FileOpKind::Delete:
+            if (undo) add(FileOpKind::Restore, ParentPath(s.from[0]), s.from)->since = s.since;
+            else add(FileOpKind::Delete, ParentPath(s.from[0]), s.from);
+            break;
+        default: break;
+    }
+    return ops;
+}
+
+void StartOp(FileOp op);
+
+void Undo() {
+    if (g_undoPending) { Flash(L"Annulation déjà en cours…"); return; }
+    if (g_undo.empty()) { Flash(L"Rien à annuler."); return; }
+    g_undoing = std::move(g_undo.back());
+    g_undo.pop_back();
+    auto ops = OpsFor(*g_undoing, true);
+    g_undoPending = ops.size();
+    g_undoOk = false;
+    if (ops.empty()) { g_undoing.reset(); return; }
+    Flash(L"Annulation : " + StepText(*g_undoing) + L"…");
+    for (auto& op : ops) {
+        op.tag = TAG_UNDO;
+        StartOp(std::move(op));
+    }
+}
+
+void Redo() {
+    if (g_undoPending) { Flash(L"Annulation en cours…"); return; }
+    if (g_redo.empty()) { Flash(L"Rien à rétablir."); return; }
+    UndoStep s = std::move(g_redo.back());
+    g_redo.pop_back();
+    Flash(L"Rétablir : " + StepText(s) + L"…");
+    for (auto& op : OpsFor(s, false)) {
+        op.tag = TAG_REDO;
+        StartOp(std::move(op));
+    }
+}
+
+// Résultat d'une opération : mémorisé pour Ctrl+Z (ou fin d'une annulation).
+void RecordUndo(const FileOpResult& r) {
+    if (r.tag == TAG_UNDO) {
+        if (!FileOps_IsFailure(r) && !r.aborted) g_undoOk = true;
+        if (g_undoPending && --g_undoPending == 0) {
+            if (g_undoOk && g_undoing) {
+                Flash(L"Annulé : " + StepText(*g_undoing) + L"   (Ctrl+Y pour rétablir)");
+                g_redo.push_back(std::move(*g_undoing));
+            }
+            g_undoing.reset();
+        }
+        return;
+    }
+    UndoStep s;
+    if (!StepFromResult(r, s)) return;
+    if (r.tag != TAG_REDO) g_redo.clear();
+    else Flash(L"Rétabli : " + StepText(s));
+    g_undo.push_back(std::move(s));
+    if (g_undo.size() > kUndoMax) g_undo.erase(g_undo.begin());
+}
+
 void OnFileOp(FileOpResult* raw) {
     std::unique_ptr<FileOpResult> r(raw);
-    if (FileOps_IsFailure(*r)) SetStatus(L"Opération impossible : " + ErrorText((DWORD)r->hr));
+    RecordUndo(*r);
+    if (FileOps_IsFailure(*r))
+        SetStatus(L"Opération impossible : " + ErrorText((DWORD)r->hr) + (r->detail.empty() ? L"" : L" (" + r->detail + L")"));
     if (r->clipboardCut && SUCCEEDED(r->hr) && !r->aborted) Clipboard_ClearAfterMove(r->clipSeq);
     if (g_quitWhenIdle) {
         if (FileOps_Running() == 0) DestroyWindow(g_hwnd);
@@ -1183,6 +1388,7 @@ void OnFileOp(FileOpResult* raw) {
                 break;
             }
             [[fallthrough]];
+        case FileOpKind::Restore:
         case FileOpKind::Copy:
         case FileOpKind::Move:
             if (!c.empty()) AfterOpSelect(r->folder, c, c[0]);  // sinon la surveillance suffit
@@ -1521,7 +1727,9 @@ void ShowContextMenu(LPARAM lp) {
     if (sel.size() == 1 && E(sel[0]).isDir()) {
         const std::wstring dir = g_path.empty() ? names[0] : Join(g_path, names[0].c_str());  // Ce PC : un lecteur
         extras = PinExtras(dir, true);
-    } else if (sel.empty() && !g_path.empty()) {  // fond du dossier : options d'affichage
+    } else if (sel.empty() && !g_path.empty()) {  // fond du dossier : annuler / rétablir, options d'affichage
+        if (!g_undo.empty()) extras.push_back({L"Annuler " + StepText(g_undo.back()) + L"\tCtrl+Z", Undo});
+        if (!g_redo.empty()) extras.push_back({L"Rétablir " + StepText(g_redo.back()) + L"\tCtrl+Y", Redo});
         extras.push_back({L"Afficher les éléments masqués", ToggleHidden, false, g_prefs.showHidden});
         extras.push_back({L"Afficher les extensions de noms de fichiers", ToggleExtensions, false, g_prefs.showExtensions});
     }
@@ -2197,8 +2405,13 @@ bool HandleGlobalKeys(const MSG& m) {
             if (focus == g_list) { GoUp(); return true; }
             return false;
     }
-    if (focus != g_list) return false;
     const bool shift = GetKeyState(VK_SHIFT) < 0;
+    if ((focus == g_list || focus == g_nav) && ctrl && (m.wParam == 'Z' || m.wParam == 'Y')) {
+        if (m.wParam == 'Y' || shift) Redo();
+        else Undo();
+        return true;
+    }
+    if (focus != g_list) return false;
     switch (m.wParam) {
         case VK_F2: BeginRename(); return true;
         case VK_DELETE: DeleteNames(NamesOf(SelectedEntries()), shift); return true;

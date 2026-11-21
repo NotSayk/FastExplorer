@@ -906,6 +906,8 @@ void TestFileOps() {    HWND sink = CreateWindowW(L"FeTestSink", L"", 0, 0, 0, 0
     CHECK(r && SUCCEEDED(r->hr));
     CHECK_STR(created(r), L"renommé");
     CHECK(Exists(Join(ops, L"renommé")) && !Exists(Join(ops, L"Nouveau dossier (2)")));
+    // Données d'annulation : source complète et nouveau nom.
+    CHECK(r && r->sources.size() == 1 && r->sources[0] == Join(ops, L"Nouveau dossier (2)") && r->newName == L"renommé");
 
     MakeFile(Join(ops, L"f.txt"), 10);
     FileOp cp;
@@ -963,6 +965,46 @@ void TestFileOps() {    HWND sink = CreateWindowW(L"FeTestSink", L"", 0, 0, 0, 0
     r = run(std::move(gone));
     CHECK(r && FileOps_IsFailure(*r));
     CHECK(FileOps_Running() == 0);
+
+    // Annuler une suppression : retour depuis la Corbeille (fichiers $I / $R).
+    {
+        const std::wstring bin = Join(ops, L"corbeille é.txt");
+        MakeFile(bin, 123);
+        FileOp rb;
+        rb.kind = FileOpKind::Delete;
+        rb.folder = ops;
+        rb.paths = {bin};
+        r = run(std::move(rb));
+        CHECK(r && SUCCEEDED(r->hr) && !r->permanent && r->started > 0 && r->sources.size() == 1);
+        CHECK(!Exists(bin));
+        const int64_t since = r ? r->started : 0;
+        CHECK(Recycle_Restore(bin, since) == 0);
+        CHECK(Exists(bin));
+        CHECK(Recycle_Restore(bin, since) == ERROR_FILE_NOT_FOUND);  // déjà restauré
+        // Même chose par une opération Restore (celle de Ctrl+Z).
+        FileOp rb2;
+        rb2.kind = FileOpKind::Delete;
+        rb2.folder = ops;
+        rb2.paths = {bin};
+        r = run(std::move(rb2));
+        FileOp rs;
+        rs.kind = FileOpKind::Restore;
+        rs.folder = ops;
+        rs.paths = {bin};
+        rs.since = r ? r->started : 0;
+        r = run(std::move(rs));
+        CHECK(r && SUCCEEDED(r->hr));
+        CHECK_STR(created(r), L"corbeille é.txt");
+        CHECK(Exists(bin));
+        CHECK(Recycle_Restore(Join(ops, L"jamais supprimé.txt"), 0) == ERROR_FILE_NOT_FOUND);
+        // Fichier ouvert : Restart Manager nomme le processus qui le garde.
+        HANDLE h = CreateFileW(bin.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        const std::wstring who = FileOps_Lockers({bin});
+        printf("  fichier ouvert par : [%ls]\n", who.c_str());
+        CHECK(!who.empty());
+        CloseHandle(h);
+        CHECK(FileOps_Lockers({bin}).empty());
+    }
 
     // Collage depuis une application qui ne fournit que des chemins (CF_HDROP),
     // et depuis un « Couper » de l'Explorateur (format Shell + effet DÉPLACER).
