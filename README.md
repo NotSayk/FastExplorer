@@ -25,6 +25,7 @@ Mesurer un dossier : `FastExplorer.exe --bench <dossier> [--seq|--par]`
 | `icons.*` | icônes propres (exe, lnk…) et surimpressions, thread dédié |
 | `watch.*` | surveillance du dossier affiché |
 | `fileops.*` | copier, déplacer, supprimer, renommer, nouveau dossier (`IFileOperation`, thread par opération) ; presse-papiers |
+| `dragdrop.*` | glisser-déposer OLE : source (objet de données du Shell) et cible (relais vers la cible du Shell) |
 | `ui.*` | fenêtre, ListView virtuelle, raccourcis |
 | `main.cpp` | entrée, mode benchmark |
 

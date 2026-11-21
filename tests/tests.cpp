@@ -3,6 +3,7 @@
 
 #include "win.h"
 
+#include "dragdrop.h"
 #include "fileops.h"
 #include "icons.h"
 #include "jobs.h"
@@ -576,6 +577,62 @@ void TestFileOps() {
     DestroyWindow(sink);
 }
 
+// Dépôt : comme ListDropTarget, on confie les éléments à la cible du Shell
+// (dossier, ou élément survolé) avec les touches de l'utilisateur.
+void TestDrop() {
+    const std::wstring src = Join(g_root, L"dnd_src"), dst = Join(g_root, L"dnd_dst");
+    CreateDirectoryW(src.c_str(), nullptr);
+    CreateDirectoryW(dst.c_str(), nullptr);
+    CreateDirectoryW(Join(dst, L"sous").c_str(), nullptr);
+    MakeFile(Join(src, L"copie.txt"), 5);
+    MakeFile(Join(src, L"deplace.txt"), 5);
+    MakeFile(Join(src, L"dans_sous.txt"), 5);
+    auto waitFor = [](const std::wstring& p, bool present) {
+        for (int i = 0; i < 500; ++i) {
+            if ((GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) == present) return true;
+            MSG m;  // la cible Shell peut poster des messages à son thread
+            while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
+            Sleep(10);
+        }
+        return false;
+    };
+    auto drop = [&](const std::wstring& file, const std::wstring& onItem, DWORD keys) -> DWORD {
+        IDataObject* data = nullptr;
+        IDropTarget* target = nullptr;
+        if (!ShellObjectOf(nullptr, src, {file}, IID_IDataObject, (void**)&data)) return DROPEFFECT_NONE;
+        DWORD e = DROPEFFECT_NONE;
+        if (DragDrop_ShellTarget(nullptr, dst, onItem, &target)) {
+            const POINTL pt{0, 0};
+            e = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+            target->DragEnter(data, MK_LBUTTON | keys, pt, &e);
+            e = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+            target->DragOver(MK_LBUTTON | keys, pt, &e);
+            e = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+            target->Drop(data, keys, pt, &e);
+            target->Release();
+        }
+        data->Release();
+        return e;
+    };
+    IDropTarget* none = nullptr;
+    CHECK(DragDrop_ShellTarget(nullptr, dst, L"", &none));  // cible du dossier
+    if (none) none->Release();
+    CHECK(DragDrop_ShellTarget(nullptr, dst, L"sous", &none));  // cible d'un sous-dossier
+    if (none) none->Release();
+
+    CHECK(drop(L"copie.txt", L"", MK_CONTROL) == DROPEFFECT_COPY);  // Ctrl : copier
+    CHECK(waitFor(Join(dst, L"copie.txt"), true));
+    CHECK(GetFileAttributesW(Join(src, L"copie.txt").c_str()) != INVALID_FILE_ATTRIBUTES);
+
+    drop(L"deplace.txt", L"", MK_SHIFT);  // Maj : déplacer
+    CHECK(waitFor(Join(dst, L"deplace.txt"), true));
+    CHECK(waitFor(Join(src, L"deplace.txt"), false));
+
+    drop(L"dans_sous.txt", L"sous", 0);  // même volume, sans touche : déplacer, dans le dossier survolé
+    CHECK(waitFor(Join(dst, L"sous\\dans_sous.txt"), true));
+    CHECK(waitFor(Join(src, L"dans_sous.txt"), false));
+}
+
 }  // namespace
 
 int wmain() {
@@ -600,6 +657,7 @@ int wmain() {
     TestFileNames();
     TestWatch();
     TestFileOps();
+    TestDrop();
     RemoveTree(g_root);
     printf("\n%d verifications OK, %d echec(s)\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

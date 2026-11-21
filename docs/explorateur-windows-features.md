@@ -229,7 +229,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Coller en tant que raccourci | Menu contextuel classique | P2 |
 | Copier en tant que chemin d'accès | Ctrl+Maj+C : chemin(s) entre guillemets | P1 |
 | Copier vers / Déplacer vers | Choix d'un dossier de destination | P2 |
-| **Glisser-déposer** | Même volume = déplacer ; autre volume = copier ; Ctrl = forcer la copie ; Maj = forcer le déplacement ; Alt ou Ctrl+Maj = créer un raccourci ; **clic droit + glisser** = menu au dépôt (Copier ici, Déplacer ici, Créer un raccourci ici). Interopérable avec les autres applications | **P0** ⚙️ OLE `IDropTarget` / `IDropSource` / `IDataObject` |
+| **Glisser-déposer** | Même volume = déplacer ; autre volume = copier ; Ctrl = forcer la copie ; Maj = forcer le déplacement ; Alt ou Ctrl+Maj = créer un raccourci ; **clic droit + glisser** = menu au dépôt (Copier ici, Déplacer ici, Créer un raccourci ici). Interopérable avec les autres applications | ✅ P0 (dépôt confié à la cible du Shell : dossier affiché ou élément survolé — dossier, .zip, raccourci ; testé hors écran, pas encore à la souris) ⚙️ OLE `IDropTarget` / `IDropSource` / `IDataObject` |
 | Ouverture au survol pendant le glisser | Survoler un dossier ou un onglet ouvre celui-ci après un délai | P2 |
 | Dupliquer sur place | Ctrl+C, Ctrl+V dans le même dossier : « fichier - Copie.txt » | P0 |
 | **Boîte de dialogue de copie** | Progression, débit, **graphique de vitesse** (« Plus de détails »), temps restant, pause, annulation ; plusieurs copies regroupées dans une seule fenêtre | ✅ P0 (fenêtre du Shell, interface jamais bloquée) |
@@ -426,7 +426,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | Lien symbolique (fichier, dossier) | Flèche ; le dossier s'ouvre comme un dossier ; colonne « Cible du lien » ⚠️ | P1 |
 | Jonction | Idem pour les dossiers ; jonctions système masquées (« Documents and Settings ») | P1 |
 | Lien physique (hard link) | Invisible dans l'Explorateur | P3 |
-| Créer un raccourci | Glisser avec Alt ou Ctrl+Maj, clic droit ▸ Créer un raccourci, Nouveau ▸ Raccourci | P1 |
+| Créer un raccourci | Glisser avec Alt ou Ctrl+Maj, clic droit ▸ Créer un raccourci, Nouveau ▸ Raccourci | ✅ P1 (Shell) |
 | Cible absente | « Le raccourci a été modifié ou déplacé » + recherche de la cible | P2 |
 
 ---
@@ -533,10 +533,10 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Boutons 4/5 | Précédent / Suivant | ✅ |
 | Alt+double-clic | Propriétés | P2 |
 | Ctrl+double-clic | Nouvelle fenêtre | P2 |
-| Glisser (et ses variantes avec modificateurs) | Voir §6.2 | P0 |
-| Glisser **depuis** l'application vers d'autres (mail, navigateur, éditeur) | P0 |
-| Glisser **vers** l'application depuis d'autres (navigateur, Outlook : fichiers virtuels `CFSTR_FILEDESCRIPTOR`) | P1 |
-| Défilement automatique pendant le glisser près des bords | P1 |
+| Glisser (et ses variantes avec modificateurs) | Voir §6.2 | ✅ |
+| Glisser **depuis** l'application vers d'autres (mail, navigateur, éditeur) | ✅ P0 (objet de données du Shell, image de glissement) |
+| Glisser **vers** l'application depuis d'autres (navigateur, Outlook : fichiers virtuels `CFSTR_FILEDESCRIPTOR`) | ✅ P1 (via la cible du Shell) |
+| Défilement automatique pendant le glisser près des bords | ✅ P1 |
 | Tactile | Appui long = clic droit, défilement inertiel, sélection par cases | P3 |
 
 ---
@@ -599,7 +599,7 @@ Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre
 
 1. ✅ **Fondations Shell** : menu contextuel Shell complet, propriétés natives, icônes réelles (exe/lnk) en tâche de fond, raccourcis `.lnk`.
 2. ✅ **Opérations de fichiers** : nouveau dossier, renommer (F2, validation), copier/couper/coller (presse-papiers interopérable), supprimer (Corbeille et définitif), moteur de copie avec progression et conflits.
-3. **Glisser-déposer** OLE, dans les deux sens.
+3. ✅ **Glisser-déposer** OLE, dans les deux sens.
 4. 🟡 **Rafraîchissement automatique** : fait pour le dossier affiché ; reste l'arrivée des lecteurs.
 5. **Volet de navigation** : dossiers épinglés + arborescence de Ce PC ; libellés et jauges des lecteurs.
 6. **Fil d'Ariane** dans la barre d'adresse.

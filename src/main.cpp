@@ -12,6 +12,7 @@
 //   icons.*    icônes propres aux fichiers (exe, lnk…), thread dédié
 //   watch.*    surveillance du dossier affiché
 //   fileops.*  opérations sur les fichiers (moteur du Shell), presse-papiers
+//   dragdrop.* glisser-déposer (source et cible OLE)
 //   ui.*       fenêtre, ListView virtuelle, raccourcis
 
 #include "win.h"

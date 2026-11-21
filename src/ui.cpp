@@ -6,6 +6,7 @@
 
 #include "ui.h"
 
+#include "dragdrop.h"
 #include "fileops.h"
 #include "icons.h"
 #include "jobs.h"
@@ -132,11 +133,16 @@ struct AfterOp {
     std::vector<std::wstring> names;
 } g_afterOp;
 // Commande du fond du dossier (Nouveau ▸ Document texte…) : le nouvel élément,
-// vu au rafraîchissement suivant, passe directement en renommage.
+// vu au rafraîchissement suivant, passe directement en renommage. Après un
+// dépôt (selectAll), les éléments arrivés sont sélectionnés.
 struct {
     std::shared_ptr<const DirData> before;
     ULONGLONG deadline = 0;
+    bool selectAll = false;
 } g_expectNew;
+// Glisser-déposer
+int g_dropRow = -1;                            // ligne cible en surbrillance
+std::unordered_set<std::wstring> g_dragNames;  // éléments que l'on fait glisser
 
 int S(int v) { return MulDiv(v, (int)g_dpi, 96); }
 bool HasView() { return g_view.data != nullptr; }
@@ -310,8 +316,9 @@ void FillDispInfo(LVITEMW& it) {
         it.iImage = g_view.icons[idx];
     }
     if (it.mask & LVIF_STATE) {  // surimpression (flèche de raccourci, état cloud), élément coupé
-        it.state = INDEXTOOVERLAYMASK(g_view.overlays[idx]) | (g_view.cut[idx] ? LVIS_CUT : 0);
-        it.stateMask = LVIS_OVERLAYMASK | LVIS_CUT;
+        it.state = INDEXTOOVERLAYMASK(g_view.overlays[idx]) | (g_view.cut[idx] ? LVIS_CUT : 0) |
+                   (it.iItem == g_dropRow ? LVIS_DROPHILITED : 0);
+        it.stateMask = LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED;
     }
     if (!(it.mask & LVIF_TEXT) || !it.pszText || it.cchTextMax <= 0) return;
     wchar_t* out = it.pszText;
@@ -588,11 +595,15 @@ void OnResult(Result* raw) {
             std::unordered_set<std::wstring_view> had;
             had.reserve(old.entries.size());
             for (const Entry& e : old.entries) had.emplace(old.name(e), e.nameLen);
-            int added = -1, count = 0;
-            for (size_t i = 0; i < d.entries.size() && count < 2; ++i)
-                if (!had.count(std::wstring_view(d.name(d.entries[i]), d.entries[i].nameLen))) { added = (int)i; ++count; }
-            if (count == 1) g_editAfter = NameOf(added);
-            if (count) g_expectNew = {};
+            std::vector<int> added;
+            for (size_t i = 0; i < d.entries.size(); ++i)
+                if (!had.count(std::wstring_view(d.name(d.entries[i]), d.entries[i].nameLen))) added.push_back((int)i);
+            if (g_expectNew.selectAll) {
+                if (!added.empty()) ApplySelection(added, added[0], true);
+            } else if (added.size() == 1) {
+                g_editAfter = NameOf(added[0]);
+            }
+            if (!added.empty()) g_expectNew = {};
         }
     }
     if (!g_editAfter.empty()) {
@@ -876,6 +887,49 @@ void ReclaimForeground() {
     if (pid == GetCurrentProcessId() && wcscmp(cls, L"OperationStatusWindow") == 0) SetForegroundWindow(g_hwnd);
 }
 
+// ───────────────────────────── Glisser-déposer ─────────────────────────────
+
+void StartDrag(POINT client) {
+    if (!HasView()) return;
+    const std::vector<std::wstring> names = NamesOf(SelectedEntries());
+    if (names.empty()) return;
+    g_dragNames.clear();
+    g_dragNames.insert(names.begin(), names.end());
+    DragDrop_Start(g_list, g_path, names, client);  // bloquant jusqu'au dépôt
+    g_dragNames.clear();
+    ShellMenu_Discard();  // menu préparé au bouton droit enfoncé : c'était un glisser
+}
+
+void SetDropRow(int row) {
+    if (row == g_dropRow) return;
+    const int old = g_dropRow;
+    g_dropRow = row;
+    if (old >= 0 && old < RowCount()) ListView_RedrawItems(g_list, old, old);
+    if (row >= 0) ListView_RedrawItems(g_list, row, row);
+    UpdateWindow(g_list);
+}
+
+void RegisterDrop() {
+    DropHost h;
+    h.folder = [] { return g_path; };
+    h.hit = [](POINT c, std::wstring& name) {
+        if (!HasView() || g_pending.active) return -1;
+        LVHITTESTINFO hit{};
+        hit.pt = c;
+        const int row = ListView_HitTest(g_list, &hit);
+        const int e = EntryAt(row);
+        if (e < 0) return -1;
+        name = NameOf(e);
+        return row;
+    };
+    h.dragged = [](const std::wstring& n) { return g_dragNames.count(n) > 0; };
+    h.highlight = SetDropRow;
+    h.dropped = [](bool intoFolder) {
+        if (intoFolder && HasView()) g_expectNew = {g_view.data, GetTickCount64() + 15000, true};
+    };
+    DragDrop_RegisterTarget(g_list, std::move(h));
+}
+
 void ShowContextMenu(LPARAM lp) {
     if (!HasView()) return;
     POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -1075,7 +1129,7 @@ void CreateChildren(HWND hwnd) {
                                  LVS_SHOWSELALWAYS | LVS_EDITLABELS,
                              0, 0, 0, 0, hwnd, (HMENU)ID_LIST, g_inst, nullptr);
     ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
-    ListView_SetCallbackMask(g_list, LVIS_OVERLAYMASK | LVIS_CUT);  // fournis par LVN_GETDISPINFO
+    ListView_SetCallbackMask(g_list, LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED);  // fournis par LVN_GETDISPINFO
     SetWindowTheme(g_list, L"Explorer", nullptr);
 
     struct {
@@ -1114,6 +1168,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             CreateChildren(hwnd);
             Icons_Start(hwnd, WM_APP_ICON);
             AddClipboardFormatListener(hwnd);
+            RegisterDrop();
             AttachTarget(hwnd);
             return 0;
         case WM_CONTEXTMENU:
@@ -1179,6 +1234,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case LVN_ODFINDITEMW: return FindItem((NMLVFINDITEMW*)lp);
                 case LVN_COLUMNCLICK: Resort(((NMLISTVIEW*)lp)->iSubItem); return 0;
                 case NM_DBLCLK: Activate(((NMITEMACTIVATE*)lp)->iItem); return 0;
+                case LVN_BEGINDRAG:
+                case LVN_BEGINRDRAG: StartDrag(((NMLISTVIEW*)lp)->ptAction); return 0;
                 case LVN_BEGINLABELEDITW: return OnBeginLabelEdit((NMLVDISPINFOW*)lp);
                 case LVN_ENDLABELEDITW: OnEndLabelEdit((NMLVDISPINFOW*)lp); return FALSE;  // la liste relira le nom
             }
@@ -1191,6 +1248,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Watch_Stop();
             ShellMenu_Discard();
             RemoveClipboardFormatListener(hwnd);
+            DragDrop_RevokeTarget(g_list);
             Clipboard_Flush();  // ce qui a été copié reste disponible après la fermeture
             Jobs_NewGeneration();  // périme et interrompt la tâche en cours
             PostQuitMessage(0);
