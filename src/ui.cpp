@@ -49,6 +49,7 @@ constexpr UINT WM_APP_RECLAIM = WM_APP + 7;     // reprendre le premier plan au 
 constexpr UINT WM_APP_SHELLNOTIFY = WM_APP + 8; // lecteur ou média ajouté / retiré (SHChangeNotifyRegister)
 constexpr UINT WM_APP_NAV = WM_APP + 9;         // résultat d'une lecture du volet de navigation
 constexpr UINT WM_APP_SELSUM = WM_APP + 10;     // sélection changée : résumé dans la barre d'état (une fois par rafale)
+constexpr UINT WM_APP_TABEDIT = WM_APP + 11;    // Tab pendant un renommage : renommer l'élément suivant
 constexpr UINT_PTR TIMER_LOADING = 1;
 constexpr UINT_PTR TIMER_WATCH = 2;
 constexpr UINT_PTR TIMER_AFTEROP = 3;
@@ -65,7 +66,7 @@ constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-
 // d'événements (copie de milliers de fichiers) et s'espace sur les gros dossiers.
 constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
-enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH };
+enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH };
 enum class Nav { Normal, Back, Forward, Refresh };
 enum class JobKind { Navigate, Sort };
 
@@ -89,6 +90,7 @@ struct Pending {
     std::wstring fallbackOpen;
     bool fallbackAnyError = false;  // raccourci : aussi si la cible a disparu (le Shell s'en occupe)
     std::wstring query;             // recherche dans `path` ("" : simple lecture)
+    size_t steps = 1;               // Précédent / Suivant : pas d'historique franchis (liste déroulante)
 };
 
 enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
@@ -107,7 +109,11 @@ struct View {
 };
 
 HINSTANCE g_inst;
-HWND g_hwnd, g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav, g_crumbs, g_searchBox;
+HWND g_hwnd, g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_btnRefresh, g_nav, g_crumbs, g_searchBox;
+std::wstring g_tabNext;         // renommage validé par Tab / Maj+Tab : élément à renommer ensuite
+std::wstring g_tabEdit;         // … saisie à ouvrir (WM_APP_TABEDIT, ou après le renommage en cours)
+std::wstring g_tabTyped;        // touches tapées avant que cette saisie ne s'ouvre : remises dedans
+ULONGLONG g_tabSince = 0;       // ≠ 0 : saisie suivante attendue depuis ce moment
 std::wstring g_query;           // recherche affichée ("" : contenu ordinaire du dossier)
 bool g_searchSync = false;      // texte de la zone de recherche changé par le programme
 int g_navW96 = 240;            // largeur du volet de navigation (à 96 ppp)
@@ -744,13 +750,18 @@ void OnResult(Result* raw) {
                 if (_wcsicmp(g_path.c_str(), d.path.c_str()) != 0) { g_back.push_back(g_path); g_fwd.clear(); }
                 break;
             case Nav::Back:
-                if (!g_back.empty()) g_back.pop_back();
-                g_fwd.push_back(g_path);
+            case Nav::Forward: {
+                // Plusieurs pas (liste déroulante) : les dossiers franchis passent de l'autre côté.
+                auto& from = p.nav == Nav::Back ? g_back : g_fwd;
+                auto& to = p.nav == Nav::Back ? g_fwd : g_back;
+                to.push_back(g_path);
+                for (size_t k = 1; k < p.steps && !from.empty(); ++k) {
+                    to.push_back(std::move(from.back()));
+                    from.pop_back();
+                }
+                if (!from.empty()) from.pop_back();
                 break;
-            case Nav::Forward:
-                if (!g_fwd.empty()) g_fwd.pop_back();
-                g_back.push_back(g_path);
-                break;
+            }
             case Nav::Refresh: break;
         }
     }
@@ -873,8 +884,45 @@ void OnResult(Result* raw) {
     }
 }
 
-void GoBack() { if (!g_back.empty()) Navigate(g_back.back(), Nav::Back); }
-void GoForward() { if (!g_fwd.empty()) Navigate(g_fwd.back(), Nav::Forward); }
+// Recule (avance) de `steps` dossiers dans l'historique.
+void GoHistory(bool back, size_t steps = 1) {
+    const auto& h = back ? g_back : g_fwd;
+    if (steps == 0 || steps > h.size()) return;
+    Navigate(h[h.size() - steps], back ? Nav::Back : Nav::Forward);
+    g_pending.steps = steps;
+}
+void GoBack() { GoHistory(true); }
+void GoForward() { GoHistory(false); }
+
+// Nom court d'un dossier de l'historique, comme l'Explorateur : « Documents », « Données (D:) ».
+std::wstring HistoryText(const std::wstring& path) {
+    if (path.empty()) return L"Ce PC";
+    std::wstring parent, leaf;
+    if (!ParentOf(path, parent, leaf) || leaf.empty()) return NavPane_DriveText(path);
+    return leaf;
+}
+
+// Clic droit sur Précédent / Suivant : les derniers dossiers de ce côté, le plus proche en haut.
+void ShowHistoryMenu(bool back) {
+    const auto& h = back ? g_back : g_fwd;
+    if (h.empty()) return;
+    HMENU m = CreatePopupMenu();
+    const size_t n = std::min<size_t>(h.size(), 15);
+    for (size_t k = 1; k <= n; ++k) {
+        std::wstring t = HistoryText(h[h.size() - k]);
+        for (size_t i = t.find(L'&'); i != std::wstring::npos; i = t.find(L'&', i + 2)) t.insert(i, 1, L'&');
+        AppendMenuW(m, MF_STRING, k, t.c_str());
+    }
+    RECT r;
+    GetWindowRect(back ? g_btnBack : g_btnFwd, &r);
+    const UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN, r.left, r.bottom,
+                                      g_hwnd, nullptr);
+    DestroyMenu(m);
+    if (cmd) {
+        GoHistory(back, cmd);
+        SetFocus(g_list);
+    }
+}
 void GoUp() {
     std::wstring parent, child;
     if (HasView() && ParentOf(g_path, parent, child)) Navigate(parent, Nav::Normal, child);
@@ -1045,6 +1093,14 @@ void OnFileOp(FileOpResult* raw) {
                           r->focusAfter);
             break;
         case FileOpKind::Rename:
+            if (!g_tabEdit.empty()) {  // Tab : renommer le suivant, une fois la liste à jour (nouveau nom visible)
+                const std::wstring t = std::move(g_tabEdit);
+                g_tabEdit.clear();
+                if (SUCCEEDED(r->hr) && !r->aborted) AfterOpSelect(r->folder, {t}, t, t);
+                else g_tabSince = 0;
+                break;
+            }
+            [[fallthrough]];
         case FileOpKind::Copy:
         case FileOpKind::Move:
             if (!c.empty()) AfterOpSelect(r->folder, c, c[0]);  // sinon la surveillance suffit
@@ -1067,6 +1123,34 @@ void CopyNames(const std::vector<std::wstring>& names, bool cut) {
     swprintf_s(s, L"%zu élément%s %s dans le presse-papiers.", names.size(), names.size() > 1 ? L"s" : L"",
                cut ? L"coupé(s)" : L"copié(s)");
     SetStatus(g_goneNote.empty() ? std::wstring(s) : g_goneNote + L"   •   " + s);
+}
+
+// « Copier en tant que chemin d'accès » (Ctrl+Maj+C) : chemins complets entre
+// guillemets, un par ligne, comme l'Explorateur. Rien sélectionné : le dossier.
+void CopyPaths(const std::vector<std::wstring>& names) {
+    if (!HasView()) return;
+    std::vector<std::wstring> full;
+    if (names.empty()) {
+        if (g_path.empty()) return;
+        full.push_back(g_path);
+    }
+    for (const auto& n : names) full.push_back(g_path.empty() ? n : Join(g_path, n.c_str()));  // Ce PC : lecteurs
+    std::wstring text;
+    for (const auto& p : full) text += (text.empty() ? L"\"" : L"\r\n\"") + p + L"\"";
+    bool ok = false;
+    if (OpenClipboard(g_hwnd)) {
+        EmptyClipboard();
+        if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t))) {
+            memcpy(GlobalLock(h), text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+            GlobalUnlock(h);
+            ok = SetClipboardData(CF_UNICODETEXT, h) != nullptr;
+            if (!ok) GlobalFree(h);
+        }
+        CloseClipboard();
+    }
+    if (!ok) { SetStatus(L"Impossible d'utiliser le presse-papiers."); return; }
+    SetStatus(full.size() == 1 ? L"Chemin copié : " + full[0]
+                               : std::to_wstring(full.size()) + L" chemins copiés dans le presse-papiers.");
 }
 
 void OnClipboardUpdate() {
@@ -1147,9 +1231,20 @@ BOOL OnBeginLabelEdit(const NMLVDISPINFOW* di) {
 
 // Après l'ouverture de la saisie : nom sans l'extension sélectionné, ou texte
 // refusé remis en place avec la raison dans une bulle.
+void SelectEditName(HWND ed);
+
 void OnEditSel() {
     HWND ed = ListView_GetEditControl(g_list);
     if (!ed || !g_editing) return;
+    SelectEditName(ed);
+    if (g_tabSince) {
+        g_tabSince = 0;
+        if (!g_tabTyped.empty()) SendMessageW(ed, EM_REPLACESEL, TRUE, (LPARAM)g_tabTyped.c_str());
+        g_tabTyped.clear();
+    }
+}
+
+void SelectEditName(HWND ed) {
     if (g_reedit.error) {
         SetWindowTextW(ed, g_reedit.text.c_str());
         Edit_SetSel(ed, 0, -1);
@@ -1183,9 +1278,32 @@ void OnReedit() {
     ListView_EditLabel(g_list, g_view.rowOf[idx]);
 }
 
+// Tab pendant un renommage : saisie suivante, ouverte après celle-ci (message
+// posté avant le lancement du renommage, donc traité avant son résultat).
+// renamed : un renommage est lancé, la saisie suivante s'ouvrira après lui
+// (sinon l'ancien nom resterait affiché pendant qu'on tape le suivant).
+void ContinueWithTab(const std::wstring& next, bool renamed) {
+    if (next.empty()) return;
+    g_tabEdit = next;
+    g_tabTyped.clear();
+    g_tabSince = GetTickCount64();
+    if (!renamed) PostMessageW(g_hwnd, WM_APP_TABEDIT, 0, 0);
+}
+
+void OnTabEdit() {
+    const int e = g_tabEdit.empty() || !HasView() ? -1 : FindEntryByName(g_tabEdit);
+    g_tabEdit.clear();
+    if (e < 0 || g_view.rowOf[e] < 0) { g_tabSince = 0; return; }
+    ApplySelection({e}, e, true);
+    SetFocus(g_list);
+    ListView_EditLabel(g_list, g_view.rowOf[e]);
+}
+
 void OnEndLabelEdit(const NMLVDISPINFOW* di) {
     g_editing = false;
     const std::wstring old = g_editName;
+    const std::wstring next = std::move(g_tabNext);
+    g_tabNext.clear();
     g_editName.clear();
     if (!di->item.pszText || old.empty()) return;  // Échap
     const std::wstring typed = di->item.pszText;
@@ -1193,8 +1311,7 @@ void OnEndLabelEdit(const NMLVDISPINFOW* di) {
     if (!name.empty() && !g_editExt.empty()) name += g_editExt;  // extension masquée : conservée
     const size_t slash = old.rfind(L'\\');  // résultat de recherche : seul le nom change
     const std::wstring oldLeaf = slash == std::wstring::npos ? old : old.substr(slash + 1);
-    if (name == oldLeaf) return;
-    if (name.empty() || name == old) return;
+    if (name.empty() || name == oldLeaf || name == old) { ContinueWithTab(next, false); return; }
     if (const wchar_t* err = FileNameError(name)) {
         g_reedit = Reedit{old, typed, err};
         PostMessageW(g_hwnd, WM_APP_REEDIT, 0, 0);
@@ -1212,6 +1329,7 @@ void OnEndLabelEdit(const NMLVDISPINFOW* di) {
     op.folder = g_path;
     op.paths.push_back(Join(g_path, old.c_str()));
     op.newName = name;
+    ContinueWithTab(next, true);
     StartOp(std::move(op));
 }
 
@@ -1325,6 +1443,8 @@ void ShowContextMenu(LPARAM lp) {
         extras.push_back({L"Afficher les éléments masqués", ToggleHidden, false, g_prefs.showHidden});
         extras.push_back({L"Afficher les extensions de noms de fichiers", ToggleExtensions, false, g_prefs.showExtensions});
     }
+    if ((!names.empty() || !g_path.empty()) && GetKeyState(VK_SHIFT) >= 0)  // Maj : le Shell la propose déjà
+        extras.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C", [names] { CopyPaths(names); }});
     if (!g_query.empty() && names.size() == 1) {  // résultat de recherche : son dossier, élément sélectionné
         std::wstring parent, leaf;
         if (ParentOf(Join(g_path, names[0].c_str()), parent, leaf))
@@ -1547,7 +1667,7 @@ void ApplyFont() {
         SelectObject(dc, old);
         ReleaseDC(g_hwnd, dc);
     }
-    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav, g_crumbs, g_searchBox})
+    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_btnRefresh, g_nav, g_crumbs, g_searchBox})
         SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
 }
 
@@ -1584,7 +1704,7 @@ void Layout() {
     const int editH = g_fontH + S(10);  // texte centré verticalement
     const int h = std::max(S(30), editH);
     // Un seul lot de déplacements : un repaint au lieu d'un par contrôle.
-    HDWP dwp = BeginDeferWindowPos(9);
+    HDWP dwp = BeginDeferWindowPos(10);
     auto place = [&](HWND w, int x, int y, int cx, int cy) {
         if (dwp) dwp = DeferWindowPos(dwp, w, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
         else MoveWindow(w, x, y, cx, cy, TRUE);
@@ -1596,9 +1716,10 @@ void Layout() {
     }
     x += S(4);
     const int searchW = std::min(S(260), std::max(0, (int)rc.right - x - m) / 3);
-    const int addrW = std::max(0, (int)rc.right - x - m - searchW - S(6));
+    const int addrW = std::max(0, (int)rc.right - x - m - searchW - S(6) - bw - S(2));
     place(g_addr, x, m + (h - editH) / 2, addrW, editH);
     place(g_crumbs, x, m + (h - editH) / 2, addrW, editH);  // même place
+    place(g_btnRefresh, x + addrW + S(2), m, bw, h);  // Actualiser, à droite de l'adresse comme l'Explorateur
     place(g_searchBox, (int)rc.right - m - searchW, m + (h - editH) / 2, searchW, editH);
     const int top = m + h + m;
     const int bodyH = std::max(0, (int)rc.bottom - top - statusH);
@@ -1634,6 +1755,7 @@ void CreateChildren(HWND hwnd) {
     g_btnBack = btn(L"←", ID_BACK);
     g_btnFwd = btn(L"→", ID_FWD);
     g_btnUp = btn(L"↑", ID_UP);
+    g_btnRefresh = btn(L"↻", ID_REFRESH);
 
     // Zone de saisie cachée : le fil d'Ariane occupe sa place, sauf pendant la saisie.
     g_addr = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
@@ -1708,6 +1830,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CONTEXTMENU:
             if ((HWND)wp == g_list) { ShowContextMenu(lp); return 0; }
             if ((HWND)wp == g_nav) { NavPane_ContextMenu(lp); return 0; }
+            if ((HWND)wp == g_btnBack || (HWND)wp == g_btnFwd) { ShowHistoryMenu((HWND)wp == g_btnBack); return 0; }
             break;
         case WM_APP_NAV:
             NavPane_OnResult(lp);
@@ -1747,6 +1870,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_FILEOP: OnFileOp((FileOpResult*)lp); return 0;
         case WM_APP_EDITSEL: OnEditSel(); return 0;
         case WM_APP_REEDIT: OnReedit(); return 0;
+        case WM_APP_TABEDIT: OnTabEdit(); return 0;
         case WM_APP_RECLAIM: ReclaimForeground(); return 0;
         case WM_ACTIVATE:
             // (y compris juste après la fin d'une opération : la fenêtre du moteur peut encore s'activer)
@@ -1815,6 +1939,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case ID_BACK: GoBack(); SetFocus(g_list); return 0;
                 case ID_FWD: GoForward(); SetFocus(g_list); return 0;
                 case ID_UP: GoUp(); SetFocus(g_list); return 0;
+                case ID_REFRESH: Refresh(); SetFocus(g_list); return 0;
                 case ID_ADDR:
                     if (HIWORD(wp) == EN_KILLFOCUS) EndAddressEdit();
                     return 0;
@@ -1880,7 +2005,25 @@ bool HandleGlobalKeys(const MSG& m) {
         if (!(m.wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))) SetTimer(g_hwnd, TIMER_HOVER, kMenuHoverMs, nullptr);
         return false;
     }
-    if (g_editing) return false;  // saisie d'un nom : toutes les touches vont à la zone d'édition
+    if (g_tabSince && !g_editing && m.hwnd == g_list && (m.message == WM_KEYDOWN || m.message == WM_CHAR)) {
+        if (GetTickCount64() - g_tabSince > 2000) g_tabSince = 0;  // la saisie ne s'est pas ouverte : on lâche
+        else if (m.message == WM_CHAR) { if (m.wParam >= 32) g_tabTyped += (wchar_t)m.wParam; return true; }
+        else if (m.wParam != VK_ESCAPE) { TranslateMessage(&m); return true; }  // → WM_CHAR, gardé ci-dessus
+        else { g_tabSince = 0; g_tabEdit.clear(); g_editAfter.clear(); return true; }
+    }
+    if (g_editing) {
+        // Tab / Maj+Tab : valide le nom et renomme l'élément suivant / précédent, comme l'Explorateur.
+        if (m.message == WM_KEYDOWN && m.wParam == VK_TAB && m.hwnd == ListView_GetEditControl(g_list)) {
+            const int e = HasView() ? FindEntryByName(g_editName) : -1;
+            const int row = e >= 0 ? g_view.rowOf[e] : -1;
+            const int next = row + (GetKeyState(VK_SHIFT) < 0 ? -1 : 1);
+            g_tabNext = row >= 0 && next >= 0 && next < RowCount() ? NameOf(EntryAt(next)) : L"";
+            SetFocus(g_list);  // la liste valide la saisie (LVN_ENDLABELEDIT)
+            g_tabNext.clear();
+            return true;
+        }
+        return false;  // saisie d'un nom : toutes les touches vont à la zone d'édition
+    }
     const HWND focus = GetFocus();
     if (m.message == WM_XBUTTONUP) {
         if (GET_XBUTTON_WPARAM(m.wParam) == XBUTTON1) GoBack(); else GoForward();
@@ -1903,6 +2046,10 @@ bool HandleGlobalKeys(const MSG& m) {
     const bool ctrl = GetKeyState(VK_CONTROL) < 0;
     switch (m.wParam) {
         case VK_F5: Refresh(); return true;
+        case 'R':
+            if (!ctrl) return false;
+            Refresh();
+            return true;
         case 'L':
             if (!ctrl) return false;
             BeginAddressEdit();
@@ -1948,7 +2095,11 @@ bool HandleGlobalKeys(const MSG& m) {
     switch (m.wParam) {
         case VK_F2: BeginRename(); return true;
         case VK_DELETE: DeleteNames(NamesOf(SelectedEntries()), shift); return true;
-        case 'C': if (!ctrl) return false; CopyNames(NamesOf(SelectedEntries()), false); return true;
+        case 'C':
+            if (!ctrl) return false;
+            if (shift) CopyPaths(NamesOf(SelectedEntries()));
+            else CopyNames(NamesOf(SelectedEntries()), false);
+            return true;
         case 'X': if (!ctrl) return false; CopyNames(NamesOf(SelectedEntries()), true); return true;
         case 'V': if (!ctrl) return false; Paste(g_path); return true;
         case 'A': if (!ctrl) return false; ListView_SetItemState(g_list, -1, LVIS_SELECTED, LVIS_SELECTED); return true;

@@ -183,8 +183,30 @@ HRESULT NewFolder(const FileOp& op, HWND owner, FileOpResult& r) {
     return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
 }
 
+// Renommage simple : directement, sans le moteur du Shell (dont la fenêtre,
+// même invisible, prend le focus et fermerait la saisie du nom suivant après
+// Tab). Tout échec (nom pris, fichier ouvert, droits) repasse par le Shell, qui
+// sait demander et expliquer.
+bool TryFastRename(const FileOp& op, FileOpResult& r) {
+    if (op.paths.size() != 1 || !op.items.empty() || op.newName.empty()) return false;
+    const std::wstring& src = op.paths[0];
+    const size_t slash = src.find_last_of(L'\\');
+    if (slash == std::wstring::npos || slash + 1 >= src.size()) return false;
+    const std::wstring dir = src.substr(0, slash);
+    const std::wstring dst = dir + L"\\" + op.newName;  // « C: » + « \nom » à la racine
+    const DWORD attr = GetFileAttributesW(src.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !MoveFileExW(src.c_str(), dst.c_str(), 0)) return false;
+    if (_wcsicmp(dir.c_str(), op.folder.c_str()) == 0 ||
+        (dir.size() == 2 && op.folder.size() == 3 && _wcsnicmp(dir.c_str(), op.folder.c_str(), 2) == 0))
+        r.created.push_back(op.newName);
+    SHChangeNotify((attr & FILE_ATTRIBUTE_DIRECTORY) ? SHCNE_RENAMEFOLDER : SHCNE_RENAMEITEM,
+                   SHCNF_PATHW | SHCNF_FLUSHNOWAIT, src.c_str(), dst.c_str());
+    return true;
+}
+
 HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r) {
     if (op.kind == FileOpKind::NewFolder) return NewFolder(op, owner, r);
+    if (op.kind == FileOpKind::Rename && TryFastRename(op, r)) return S_OK;
 
     HRESULT hr = S_OK;
     std::vector<std::wstring> left;  // éléments que notre moteur rend au Shell

@@ -26,7 +26,7 @@ De haut en bas :
 | Zone | Contenu | Prio |
 |---|---|---|
 | **Barre d'onglets** (barre de titre) | Onglets, bouton « + », boutons fenêtre | P1 |
-| **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅🟡 P0 (tout sauf le bouton Actualiser : F5) |
+| **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅ (bouton Actualiser : bloc 10) |
 | **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | P1 |
 | **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accès rapide épinglé + arborescence de Ce PC, séparateur ; Accueil, Galerie, Réseau, Linux à venir) |
 | **Zone de contenu** | La liste des éléments | ✅ P0 |
@@ -44,9 +44,9 @@ De haut en bas :
 | Fonction | Détail | État |
 |---|---|---|
 | Précédent / Suivant | Boutons, Alt+← / Alt+→, boutons souris 4/5, **Retour arrière = Précédent** (et non dossier parent !) | ✅ (⚠️ chez nous, Retour arrière remonte au parent : à aligner ou rendre configurable) |
-| Historique déroulant | Clic droit (ou appui long) sur Précédent/Suivant : liste des derniers dossiers visités | P1 |
+| Historique déroulant | Clic droit (ou appui long) sur Précédent/Suivant : liste des derniers dossiers visités | ✅ (bloc 10 : clic droit, 15 derniers) |
 | Dossier parent | Bouton ↑, Alt+↑ | ✅ |
-| Actualiser | F5, Ctrl+R, bouton | ✅ (F5) |
+| Actualiser | F5, Ctrl+R, bouton | ✅ |
 | Rafraîchissement automatique | Le dossier se met à jour seul quand des fichiers sont créés, supprimés ou renommés | ✅ P0 (dossier affiché, lecteurs de Ce PC, dossier disparu → parent, éjection libérée) ⚙️ `ReadDirectoryChangesW` / `SHChangeNotifyRegister` |
 | Ouvrir dans une nouvelle fenêtre | Ctrl+N, Ctrl+double-clic, Ctrl+Entrée | P1 |
 | Ouvrir dans un nouvel onglet | Clic milieu sur un dossier (contenu, volet de navigation, et depuis 2026 barre d'adresse et Accueil), menu contextuel | P1 |
@@ -183,7 +183,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Couleur des fichiers compressés/chiffrés NTFS | Bleu / vert (option) | P3 |
 | Couper (Ctrl+X) | L'élément coupé devient semi-transparent jusqu'au collage | ✅ P1 |
 | **Info-bulles** | Survol : type, taille, date ; pour les dossiers, taille et premiers fichiers (option) | P2 |
-| Mise en évidence des nouveaux éléments | Un élément créé ou collé est sélectionné et rendu visible | P1 |
+| Mise en évidence des nouveaux éléments | Un élément créé ou collé est sélectionné et rendu visible | ✅ (bloc 2) |
 
 ---
 
@@ -213,9 +213,9 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 |---|---|---|
 | Nouveau dossier | Ctrl+Maj+N, Nouveau ▸ Dossier ; nom « Nouveau dossier (2) » si déjà pris ; directement en mode renommage | ✅ P0 |
 | Nouveau fichier | Nouveau ▸ (Document texte, Raccourci, Image bitmap, Dossier compressé, + entrées des applications) | ✅ P1 (menu Shell ; l'élément créé passe en renommage) ⚙️ clés `ShellNew` du registre (`NullFile`, `FileName`, `Data`, `Command`) |
-| **Renommer** | F2, clic lent sur un élément sélectionné, bouton | ✅ P0 (F2, clic lent, menu ; un seul élément) |
+| **Renommer** | F2, clic lent sur un élément sélectionné, bouton | ✅ P0 (F2, clic lent, menu ; un seul élément ; renommage direct `MoveFileEx`, le Shell en cas d'échec : nom pris, fichier ouvert, droits) |
 | Sélection intelligente | À l'édition, seul le nom **sans l'extension** est sélectionné | ✅ P0 |
-| Tab / Maj+Tab pendant le renommage | Valide et passe au fichier suivant / précédent | P1 |
+| Tab / Maj+Tab pendant le renommage | Valide et passe au fichier suivant / précédent | ✅ (bloc 10 ; touches tapées pendant le changement de saisie gardées) |
 | Renommage multiple | Sélection de N fichiers + F2 : « Vacances (1).jpg », « Vacances (2).jpg »… | P1 |
 | Validation | Caractères interdits `\ / : * ? " < > |` (info-bulle d'erreur), noms réservés (`CON`, `PRN`, `AUX`, `NUL`, `COM1`…`LPT9`), point ou espace final retirés | ✅ P0 (bulle d'erreur, la saisie reste ouverte) |
 | Changement d'extension | Avertissement « Si vous modifiez l'extension… » | ✅ P0 |
@@ -227,7 +227,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 |---|---|---|
 | Copier / Couper / Coller | Ctrl+C / Ctrl+X / Ctrl+V ; interopérable avec les autres applications via le presse-papiers | ✅ P0 (dans les deux sens, CF_HDROP seul compris) ⚙️ formats `CF_HDROP`, `Shell IDList Array`, `Preferred DropEffect` |
 | Coller en tant que raccourci | Menu contextuel classique | P2 |
-| Copier en tant que chemin d'accès | Ctrl+Maj+C : chemin(s) entre guillemets | P1 |
+| Copier en tant que chemin d'accès | Ctrl+Maj+C : chemin(s) entre guillemets | ✅ (bloc 10 : aussi dans le menu contextuel, sans Maj) |
 | Copier vers / Déplacer vers | Choix d'un dossier de destination | P2 |
 | **Glisser-déposer** | Même volume = déplacer ; autre volume = copier ; Ctrl = forcer la copie ; Maj = forcer le déplacement ; Alt ou Ctrl+Maj = créer un raccourci ; **clic droit + glisser** = menu au dépôt (Copier ici, Déplacer ici, Créer un raccourci ici). Interopérable avec les autres applications | ✅ P0 (dépôt confié à la cible du Shell : dossier affiché ou élément survolé — dossier, .zip, raccourci ; testé hors écran, pas encore à la souris) ⚙️ OLE `IDropTarget` / `IDropSource` / `IDataObject` |
 | Ouverture au survol pendant le glisser | Survoler un dossier ou un onglet ouvre celui-ci après un délai | P2 |
@@ -422,9 +422,9 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | Type | Comportement | Prio |
 |---|---|---|
 | Raccourci `.lnk` | Flèche en surimpression, extension toujours masquée ; ouvrir = ouvrir la cible ; Propriétés ▸ Emplacement du fichier ; dossier : navigue dans la cible | ✅ P0 (cible dossier ouverte dans FastExplorer, sans `Resolve`) ⚙️ `IShellLink` |
-| Raccourci Internet `.url` | Ouvre le navigateur | P1 |
-| Lien symbolique (fichier, dossier) | Flèche ; le dossier s'ouvre comme un dossier ; colonne « Cible du lien » ⚠️ | P1 |
-| Jonction | Idem pour les dossiers ; jonctions système masquées (« Documents and Settings ») | P1 |
+| Raccourci Internet `.url` | Ouvre le navigateur | ✅ (Shell ; extension masquée comme dans l'Explorateur) |
+| Lien symbolique (fichier, dossier) | Flèche ; le dossier s'ouvre comme un dossier ; colonne « Cible du lien » ⚠️ | ✅🟡 P1 (flèche, ouverture ; colonne Cible : avec le choix des colonnes, bloc 17) |
+| Jonction | Idem pour les dossiers ; jonctions système masquées (« Documents and Settings ») | ✅ (masquées comme fichiers protégés) |
 | Lien physique (hard link) | Invisible dans l'Explorateur | P3 |
 | Créer un raccourci | Glisser avec Alt ou Ctrl+Maj, clic droit ▸ Créer un raccourci, Nouveau ▸ Raccourci | ✅ P1 (Shell) |
 | Cible absente | « Le raccourci a été modifié ou déplacé » + recherche de la cible | P2 |
@@ -493,10 +493,10 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Alt+↑ | Dossier parent | ✅ |
 | Alt+D, Ctrl+L, F4 | Barre d'adresse (F4 : avec la liste déroulante) | ✅ (F4 : sans liste déroulante, l'historique n'existe pas encore) |
 | Ctrl+E, Ctrl+F, F3 | Recherche | ✅ P0 |
-| F5, Ctrl+R | Actualiser | ✅ (F5) |
+| F5, Ctrl+R | Actualiser | ✅ |
 | F6, Tab | Passer d'un volet à l'autre | 🟡 (Tab : adresse ↔ liste) |
 | Ctrl+Maj+E | Développer le volet de navigation jusqu'au dossier courant | P2 |
-| Pavé num. * / + / − , ← / → (volet de navigation) | Tout développer / développer / réduire | P1 |
+| Pavé num. * / + / − , ← / → (volet de navigation) | Tout développer / développer / réduire | ✅ (natif) |
 | Entrée | Ouvrir | ✅ |
 | Ctrl+Entrée | Ouvrir le dossier dans une nouvelle fenêtre ⚠️ | P2 |
 
@@ -504,7 +504,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Raccourci | Action | État |
 |---|---|---|
 | Ctrl+C / Ctrl+X / Ctrl+V | Copier / Couper / Coller | ✅ |
-| Ctrl+Maj+C | Copier en tant que chemin d'accès | P1 |
+| Ctrl+Maj+C | Copier en tant que chemin d'accès | ✅ |
 | Ctrl+Z / Ctrl+Y | Annuler / Rétablir | P1 |
 | Suppr, Ctrl+D / Maj+Suppr | Corbeille / suppression définitive | ✅ |
 | F2 | Renommer | ✅ |
@@ -528,7 +528,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Geste | Action | État |
 |---|---|---|
 | Double-clic (ou simple clic selon l'option) | Ouvrir | ✅ (double) |
-| Clic lent sur un élément sélectionné | Renommer | P1 |
+| Clic lent sur un élément sélectionné | Renommer | ✅ |
 | Clic milieu sur un dossier | Nouvel onglet | P1 |
 | Boutons 4/5 | Précédent / Suivant | ✅ |
 | Alt+double-clic | Propriétés | P2 |
@@ -614,7 +614,7 @@ Tous les P0 sont faits. Puis les **P1**, par blocs, dans un ordre qui fait passe
 tous les jours et ce dont d'autres blocs dépendent (les onglets avant le double panneau, la taille des
 dossiers avant l'index…) :
 
-10. **Finitions rapides** : copier le chemin (Ctrl+Maj+C, « Copier en tant que chemin d'accès »), clic lent
+10. ✅ **Finitions rapides** : copier le chemin (Ctrl+Maj+C, « Copier en tant que chemin d'accès »), clic lent
     pour renommer, Tab / Maj+Tab pendant le renommage, historique déroulant de Précédent / Suivant, bouton
     Actualiser, mise en évidence des nouveaux éléments, pavé numérique dans le volet, affichage des
     raccourcis `.url`, liens symboliques et jonctions.
