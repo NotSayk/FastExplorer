@@ -150,7 +150,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Réordonner | Glisser l'en-tête | ✅ |
 | Trier | Clic sur l'en-tête, flèche de tri | ✅ |
 | **Filtres de colonne** | Survol de l'en-tête ▸ flèche ▾ : filtre par valeurs (« A–H », « Aujourd'hui », « Grand (128 Mo–1 Go) »…), cases multiples | P2 |
-| Taille des dossiers | **Jamais affichée** (colonne vide pour les dossiers) | ⭐ opportunité (§20) |
+| Taille des dossiers | **Jamais affichée** (colonne vide pour les dossiers) | ✅ ⭐ (§20 : calculée en arrière-plan) |
 | Colonnes par type de dossier | Musique : Titre, Artiste, Album… ; Images : Date de prise de vue, Dimensions… | P2 |
 
 ### 4.4 Tri et regroupement
@@ -201,7 +201,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Cases à cocher | Option d'affichage | P2 |
 | Déplacer le focus sans sélectionner | Ctrl+flèches, puis Ctrl+Espace pour (dé)sélectionner | ✅ (natif) |
 | **Recherche par frappe** | Taper le début d'un nom ; option alternative : « Taper dans la zone de recherche » | ✅ |
-| Résumé de sélection | Barre d'état : « 3 éléments sélectionnés, 12,4 Mo » | ✅ P0 (taille seulement sans dossier sélectionné, comme l'Explorateur ; un seul calcul par rafale de changements) |
+| Résumé de sélection | Barre d'état : « 3 éléments sélectionnés, 12,4 Mo » | ✅ P0 (taille seulement sans dossier sélectionné, comme l'Explorateur ; avec les dossiers dès que leur taille est connue ; un seul calcul par rafale de changements) |
 
 ---
 
@@ -548,7 +548,7 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | Manque | Idée | Prio |
 |---|---|---|
 | **Lenteur** (ouverture, gros dossiers, réseau, « Travail en cours… ») | Notre cœur : lecture NT, liste virtuelle, rien de bloquant | ✅ |
-| **Taille des dossiers** | Calcul en tâche de fond, colonne Taille remplie pour les dossiers, cache | P1 ⭐ |
+| **Taille des dossiers** | Calcul en tâche de fond, colonne Taille remplie pour les dossiers, cache | ✅ P1 ⭐ (3 threads en priorité d'E/S basse, jonctions non suivies, « ≥ » si un sous-dossier est illisible, tri par taille, cache de 30 s périmé par les opérations de fichiers ; F5 recalcule ; pas sur les lecteurs réseau et optiques) |
 | **Recherche instantanée** sur tout le disque | Index MFT + journal USN (à la *Everything*) | P1 ⭐ |
 | **Double panneau** (à la Total Commander) | Deux listes côte à côte, F5/F6 copier/déplacer vers l'autre panneau | P1 ⭐ |
 | **File d'attente de copies** | Copies mises en file (pas en parallèle sur le même disque), pause/reprise, reprise après erreur, vérification | P1 ⭐ |
@@ -625,7 +625,7 @@ dossiers avant l'index…) :
     chemin trop long, suppression définitive sur un lecteur réseau ou amovible.
 13. ✅ **Onglets et fenêtres** : Ctrl+T / Ctrl+W / Ctrl+Tab, réorganiser, clic milieu sur un dossier,
     Ctrl+N, ouvrir dans un nouvel onglet depuis le volet et le fil d'Ariane.
-14. **Taille des dossiers** ⭐ : calculée en arrière-plan (colonne Taille), sans ralentir la navigation.
+14. ✅ **Taille des dossiers** ⭐ : calculée en arrière-plan (colonne Taille), sans ralentir la navigation.
 15. **Recherche instantanée sur tout le disque** ⭐ : index MFT + journal USN (à la *Everything*), puis
     filtres de recherche (date, type, taille).
 16. **Modes d'affichage** : grandes / moyennes icônes, zoom continu (Ctrl+molette), Ctrl+Maj+1…8,

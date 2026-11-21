@@ -529,7 +529,8 @@ uint32_t HiddenExtLen(const wchar_t* name, uint32_t nameLen, uint32_t extOff, bo
     return hide ? nameLen - extOff : 0;
 }
 
-std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs, const std::wstring& nameFilter) {
+std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs, const std::wstring& nameFilter,
+                                const std::vector<uint64_t>* dirSizes) {
     const uint32_t n = (uint32_t)d.entries.size();
     std::vector<uint32_t> order;
     order.reserve(n);
@@ -549,12 +550,15 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewP
     const Entry* E = d.entries.data();
     const BYTE* K = d.keys.data();
     const wchar_t* P = d.pool.data();
+    const uint64_t* DS = dirSizes && dirSizes->size() == n ? dirSizes->data() : nullptr;
     auto cmp = [=](uint32_t ia, uint32_t ib) {
         const Entry& a = E[ia];
         const Entry& b = E[ib];
         int c = 0;
         switch (col) {
-            case COL_SIZE: c = Cmp3(a.size, b.size); break;
+            case COL_SIZE:
+                c = DS && a.isDir() ? Cmp3(DS[ia], DS[ib]) : Cmp3(a.size, b.size);
+                break;
             case COL_DATE: c = Cmp3(a.mtime, b.mtime); break;
             case COL_TYPE:
                 c = CompareStringOrdinal(P + a.nameOff + a.extOff, (int)(a.nameLen - a.extOff), P + b.nameOff + b.extOff,

@@ -6,6 +6,7 @@
 #include "dragdrop.h"
 #include "fastcopy.h"
 #include "fileops.h"
+#include "foldersize.h"
 #include "icons.h"
 #include "jobs.h"
 #include "listing.h"
@@ -220,6 +221,45 @@ void TestSortOther() {
     CHECK_STR(s.back(), L"été.md");
     auto t = Names(d, SortOrder(d, COL_TYPE, true));
     CHECK_STR(t[2], L"noext");  // extension vide en premier
+}
+
+void TestFolderSize() {
+    const std::wstring base = Join(g_root, L"tailles");
+    CreateDirectoryW(base.c_str(), nullptr);
+    CreateDirectoryW(Join(base, L"sous").c_str(), nullptr);
+    CreateDirectoryW(Join(base, L"sous\\profond").c_str(), nullptr);
+    CreateDirectoryW(Join(base, L"vide").c_str(), nullptr);
+    MakeFile(Join(base, L"un.bin"), 100);
+    MakeFile(Join(base, L"sous\\deux.bin"), 1000);
+    MakeFile(Join(base, L"sous\\profond\\trois.bin"), 5);
+    // Jonction vers le dossier lui-même : ni boucle, ni double compte.
+    _wsystem((L"cmd /c mklink /J \"" + Join(base, L"sous\\boucle") + L"\" \"" + base + L"\" >nul").c_str());
+    FolderSize fs;
+    CHECK(FolderSize_Compute(base, fs));
+    CHECK(fs.bytes == 1105);
+    CHECK(fs.files == 3);
+    CHECK(fs.dirs == 3);
+    CHECK(fs.complete);
+    FolderSize empty;
+    CHECK(FolderSize_Compute(Join(base, L"vide"), empty) && empty.bytes == 0 && empty.files == 0);
+    // Arrêt demandé : abandon.
+    CHECK(!FolderSize_Compute(base, fs, [] { return true; }));
+    // Dossier introuvable : incomplet, taille nulle.
+    FolderSize none;
+    CHECK(FolderSize_Compute(Join(base, L"absent"), none) && !none.complete && none.bytes == 0);
+
+    // Tri par taille avec les tailles calculées des dossiers.
+    DirData d;
+    d.path = base;
+    Enumerate(d);
+    std::vector<uint64_t> sizes(d.entries.size(), 0);
+    for (size_t i = 0; i < d.entries.size(); ++i)
+        if (wcscmp(d.name(d.entries[i]), L"sous") == 0) sizes[i] = 1005;
+    auto s = Names(d, SortOrder(d, COL_SIZE, false, {}, {}, &sizes));
+    CHECK_STR(s[0], L"sous");
+    auto a = Names(d, SortOrder(d, COL_SIZE, true, {}, {}, &sizes));
+    CHECK_STR(a[0], L"vide");
+    RemoveDirectoryW(Join(base, L"sous\\boucle").c_str());
 }
 
 void TestEdgeCases() {
@@ -1125,6 +1165,7 @@ int wmain() {
     TestEnumerate();
     TestSortName();
     TestSortOther();
+    TestFolderSize();
     TestEdgeCases();
     TestLongPath();
     TestParallelMatchesSequential();

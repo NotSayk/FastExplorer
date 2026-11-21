@@ -8,6 +8,7 @@
 
 #include "dragdrop.h"
 #include "fileops.h"
+#include "foldersize.h"
 #include "icons.h"
 #include "jobs.h"
 #include "listing.h"
@@ -53,6 +54,7 @@ constexpr UINT WM_APP_NAV = WM_APP + 9;         // résultat d'une lecture du vo
 constexpr UINT WM_APP_SELSUM = WM_APP + 10;     // sélection changée : résumé dans la barre d'état (une fois par rafale)
 constexpr UINT WM_APP_TABEDIT = WM_APP + 11;    // Tab pendant un renommage : renommer l'élément suivant
 constexpr UINT WM_APP_CMDFAIL = WM_APP + 12;    // commande tapée dans la barre d'adresse impossible (lParam = std::wstring*)
+constexpr UINT WM_APP_DIRSIZE = WM_APP + 14;    // taille d'un dossier calculée (lParam = DirSizeResult*)
 constexpr UINT WM_APP_TESTDPI = WM_APP + 13;    // tests : comme WM_DPICHANGED (wParam = nouvelle échelle), que Windows
                                                 // ne laisse pas envoyer d'un autre processus
 constexpr UINT_PTR TIMER_LOADING = 1;
@@ -100,6 +102,7 @@ struct Pending {
 };
 
 enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
+enum SizeState : uint8_t { SIZE_KNOWN = 1, SIZE_PARTIAL = 2, SIZE_PENDING = 4 };
 
 // Ce qui est affiché. `order` : ligne → index d'entrée ; `rowOf` : l'inverse.
 struct View {
@@ -110,6 +113,8 @@ struct View {
     std::vector<uint8_t> overlays;  // surimpression par index d'entrée
     std::vector<uint8_t> iconState;
     std::vector<uint8_t> cut;       // 1 = coupé (affiché estompé)
+    std::vector<uint64_t> dirBytes; // taille calculée des dossiers (par index d'entrée)
+    std::vector<uint8_t> dirState;  // SIZE_* (combinables)
     uint64_t serial = 0;            // identifie la vue auprès du thread d'icônes
     double sortMs = 0;
 };
@@ -394,6 +399,103 @@ std::wstring BytesText(uint64_t bytes) {
     return b;
 }
 
+// ───────────────────────────── Taille des dossiers ─────────────────────────────
+//
+// Calculée en arrière-plan pour les sous-dossiers du dossier affiché, gardée
+// en cache par chemin : y revenir l'affiche aussitôt. Une valeur de moins de
+// 30 s n'est pas recalculée (sauf F5) ; une opération de fichiers périme celles
+// des dossiers qu'elle touche. Pas de calcul sur les lecteurs réseau et optiques.
+
+struct SizeCache {
+    uint64_t bytes = 0;
+    bool complete = true;
+    ULONGLONG at = 0;  // GetTickCount64 du calcul
+};
+std::unordered_map<std::wstring, SizeCache> g_sizeCache;  // clé : chemin en minuscules
+bool g_forceSizes = false;   // F5 : tout recalculer
+size_t g_sizeWaiting = 0;    // dossiers demandés pour la vue, pas encore mesurés
+constexpr ULONGLONG kSizeFreshMs = 30000;
+
+std::wstring SizeKey(std::wstring p) {
+    CharLowerBuffW(p.data(), (DWORD)p.size());
+    while (p.size() > 3 && p.back() == L'\\') p.pop_back();
+    return p;
+}
+
+// Un dossier et tous ses parents : leur taille a changé.
+void ForgetSizes(const std::wstring& path) {
+    std::wstring p = path, parent, leaf;
+    for (int guard = 0; guard < 512 && !p.empty(); ++guard) {
+        g_sizeCache.erase(SizeKey(p));
+        if (!ParentOf(p, parent, leaf) || parent == p) break;
+        p = parent;
+    }
+}
+
+bool SizesWanted(const DirData& d) {
+    if (d.isRoot() || !d.query.empty() || d.path.size() < 2) return false;
+    if (d.path[0] == L'\\' && d.path[1] == L'\\') return false;  // UNC
+    const wchar_t root[4] = {d.path[0], L':', L'\\', 0};
+    const UINT t = GetDriveTypeW(root);
+    return t != DRIVE_REMOTE && t != DRIVE_CDROM;
+}
+
+// Nouvelle vue : tailles déjà connues reprises du cache.
+void InitDirSizes() {
+    const DirData& d = *g_view.data;
+    const size_t n = d.entries.size();
+    g_view.dirBytes.assign(n, 0);
+    g_view.dirState.assign(n, 0);
+    if (!SizesWanted(d) || g_sizeCache.empty()) return;
+    for (size_t i = 0; i < n; ++i) {
+        if (!d.entries[i].isDir()) continue;
+        auto it = g_sizeCache.find(SizeKey(Join(d.path, d.name(d.entries[i]))));
+        if (it == g_sizeCache.end()) continue;
+        g_view.dirBytes[i] = it->second.bytes;
+        g_view.dirState[i] = SIZE_KNOWN | (it->second.complete ? 0 : SIZE_PARTIAL);
+    }
+}
+
+// Demande la taille des sous-dossiers affichés qui ne sont pas à jour, dans l'ordre d'affichage.
+void RequestDirSizes() {
+    const bool force = std::exchange(g_forceSizes, false);
+    g_sizeWaiting = 0;
+    std::vector<std::wstring> dirs;
+    if (HasView() && SizesWanted(*g_view.data)) {
+        const ULONGLONG now = GetTickCount64();
+        for (uint32_t i : g_view.order) {
+            if (!E((int)i).isDir()) break;  // dossiers d'abord
+            std::wstring full = Join(g_path, NameOf((int)i));
+            auto it = g_sizeCache.find(SizeKey(full));
+            if (!force && it != g_sizeCache.end() && now - it->second.at < kSizeFreshMs) continue;
+            g_view.dirState[i] |= SIZE_PENDING;
+            dirs.push_back(std::move(full));
+            if (dirs.size() >= 5000) break;
+        }
+    }
+    g_sizeWaiting = dirs.size();
+    DirSizes_Request(g_view.serial, std::move(dirs));
+}
+
+void SortView();
+
+void OnDirSize(DirSizeResult* raw) {
+    std::unique_ptr<DirSizeResult> r(raw);
+    if (g_sizeCache.size() > 200000) g_sizeCache.clear();
+    g_sizeCache[SizeKey(r->path)] = SizeCache{r->size.bytes, r->size.complete, GetTickCount64()};
+    std::wstring parent, leaf;
+    if (!HasView() || !ParentOf(r->path, parent, leaf) || _wcsicmp(parent.c_str(), g_path.c_str()) != 0 ||
+        !g_query.empty())
+        return;
+    const int e = FindEntryByName(leaf);
+    if (e < 0 || !(g_view.dirState[e] & SIZE_PENDING)) return;
+    g_view.dirBytes[e] = r->size.bytes;
+    g_view.dirState[e] = SIZE_KNOWN | (r->size.complete ? 0 : SIZE_PARTIAL);
+    if (const int row = g_view.rowOf[e]; row >= 0) ListView_RedrawItems(g_list, row, row);
+    if (ListView_GetItemState(g_list, g_view.rowOf[e], LVIS_SELECTED) & LVIS_SELECTED) ScheduleSelectionSummary();
+    if (g_sizeWaiting && --g_sizeWaiting == 0 && g_sortCol == COL_SIZE) SortView();  // tout est mesuré : on retrie
+}
+
 void FillDispInfo(LVITEMW& it) {
     const int idx = EntryAt(it.iItem);
     if (idx < 0) return;
@@ -438,6 +540,11 @@ void FillDispInfo(LVITEMW& it) {
                 if (di->total)
                     wcsncpy_s(out, cch, (BytesText(di->free) + L" libres sur " + BytesText(di->total)).c_str(), _TRUNCATE);
             } else if (!e.isDir()) StrFormatKBSizeW((LONGLONG)e.size, out, (UINT)cch);
+            else if (const uint8_t st = g_view.dirState[idx]; st & SIZE_KNOWN) {
+                // Unités adaptées (« 106 Go ») ; dossier en partie illisible : au moins cette taille.
+                const std::wstring s = ((st & SIZE_PARTIAL) ? L"≥ " : L"") + BytesText(g_view.dirBytes[idx]);
+                wcsncpy_s(out, cch, s.c_str(), _TRUNCATE);
+            } else if (st & SIZE_PENDING) wcsncpy_s(out, cch, L"…", _TRUNCATE);
             break;
         case COL_TYPE:
             if (g_view.data->isRoot()) wcsncpy_s(out, cch, DriveTypeText(e.extra), _TRUNCATE);
@@ -632,7 +739,7 @@ void SortView() {
     auto data = g_view.data;
     if (data->entries.size() <= kSyncSortMax) {
         const double t = NowMs();
-        auto order = SortOrder(*data, g_sortCol, g_sortAsc, g_prefs, g_filter);
+        auto order = SortOrder(*data, g_sortCol, g_sortAsc, g_prefs, g_filter, &g_view.dirBytes);
         ApplyOrder(std::move(order), NowMs() - t);
         return;
     }
@@ -640,9 +747,9 @@ void SortView() {
     const int c = g_sortCol;
     const bool asc = g_sortAsc;
     SetStatus(L"Tri…");
-    Jobs_Spawn([ct, data, c, asc, prefs = g_prefs, filter = g_filter] {
+    Jobs_Spawn([ct, data, c, asc, prefs = g_prefs, filter = g_filter, sizes = g_view.dirBytes] {
         const double t = NowMs();
-        auto order = SortOrder(*data, c, asc, prefs, filter);
+        auto order = SortOrder(*data, c, asc, prefs, filter, &sizes);
         if (ct.cancelled()) return;
         auto* r = new Result{ct.gen, JobKind::Sort, data, std::move(order), NowMs() - t};
         Post(r);
@@ -661,8 +768,9 @@ void ShowSelectionSummary() {
         const int e = EntryAt(r);
         if (e < 0) continue;
         ++count;
-        if (E(e).isDir()) anyDir = true;
-        else bytes += E(e).size;
+        if (!E(e).isDir()) bytes += E(e).size;
+        else if (!g_view.dirState.empty() && (g_view.dirState[e] & SIZE_KNOWN)) bytes += g_view.dirBytes[e];
+        else anyDir = true;  // taille inconnue : pas de total
     }
     SetStatusPart(SB_SEL, SelectionText(count, anyDir, bytes, !g_view.data->isRoot()));
 }
@@ -861,6 +969,10 @@ void OnResult(Result* raw) {
     g_view.iconState = std::move(states);
     g_view.serial = ++g_viewSerial;
     Icons_SetSerial(g_view.serial);
+    InitDirSizes();
+    if (g_sortCol == COL_SIZE && d.entries.size() <= kSyncSortMax &&
+        std::any_of(g_view.dirState.begin(), g_view.dirState.end(), [](uint8_t s) { return s != 0; }))
+        g_view.order = SortOrder(d, g_sortCol, g_sortAsc, g_prefs, g_filter, &g_view.dirBytes);
     RebuildRowOf();
     g_path = d.path;
     g_query = d.query;
@@ -871,6 +983,7 @@ void OnResult(Result* raw) {
         g_searchSync = false;
     }
     ApplyCutMarks();
+    RequestDirSizes();
 
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
     if (g_path.empty()) {
@@ -1370,6 +1483,11 @@ void RecordUndo(const FileOpResult& r) {
 void OnFileOp(FileOpResult* raw) {
     std::unique_ptr<FileOpResult> r(raw);
     RecordUndo(*r);
+    // Tailles des dossiers touchés périmées (le dossier affiché ne change pas
+    // forcément : copier dans un sous-dossier ne le modifie pas).
+    ForgetSizes(r->folder);
+    for (const std::wstring& s : r->sources) ForgetSizes(s);
+    if (HasView() && !g_pending.active) RequestDirSizes();
     if (FileOps_IsFailure(*r))
         SetStatus(L"Opération impossible : " + ErrorText((DWORD)r->hr) + (r->detail.empty() ? L"" : L" (" + r->detail + L")"));
     if (r->clipboardCut && SUCCEEDED(r->hr) && !r->aborted) Clipboard_ClearAfterMove(r->clipSeq);
@@ -2398,6 +2516,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             CreateChildren(hwnd);
             NavPane_SetViewPrefs(g_prefs);
             Icons_Start(hwnd, WM_APP_ICON);
+            DirSizes_Start(hwnd, WM_APP_DIRSIZE);
             AddClipboardFormatListener(hwnd);
             RegisterDrop();
             AttachTarget(hwnd);
@@ -2439,6 +2558,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_CAPTURECHANGED: g_splitDrag = false; return 0;
         case WM_APP_ICON: OnIcon((IconResult*)lp); return 0;
+        case WM_APP_DIRSIZE: OnDirSize((DirSizeResult*)lp); return 0;
         case WM_APP_DIRCHANGED: OnDirChanged((uintptr_t)wp, lp); return 0;
         case WM_DEVICECHANGE: return OnDeviceChange(wp, lp);
         case WM_APP_SHELLNOTIFY: OnShellNotify(wp, lp); return 0;
@@ -2537,7 +2657,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case ID_BACK: GoBack(); SetFocus(g_list); return 0;
                 case ID_FWD: GoForward(); SetFocus(g_list); return 0;
                 case ID_UP: GoUp(); SetFocus(g_list); return 0;
-                case ID_REFRESH: Refresh(); SetFocus(g_list); return 0;
+                case ID_REFRESH: g_forceSizes = true; Refresh(); SetFocus(g_list); return 0;
                 case ID_ADDR:
                     if (HIWORD(wp) == EN_KILLFOCUS) EndAddressEdit();
                     return 0;
@@ -2599,6 +2719,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DESTROY:
             g_target.store(nullptr);
             Icons_Stop();
+            DirSizes_Stop();
             Watch_Stop();
             ShellMenu_Discard(true);
             if (g_taskbar) g_taskbar->Release();
@@ -2735,9 +2856,10 @@ bool HandleGlobalKeys(const MSG& m) {
         }
     }
     switch (m.wParam) {
-        case VK_F5: Refresh(); return true;
+        case VK_F5: g_forceSizes = true; Refresh(); return true;
         case 'R':
             if (!ctrl) return false;
+            g_forceSizes = true;
             Refresh();
             return true;
         case 'L':

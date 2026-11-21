@@ -122,5 +122,6 @@ uint32_t HiddenExtLen(const wchar_t* name, uint32_t nameLen, uint32_t extOff, bo
 // Les éléments que `prefs` masque n'y figurent pas (lecteurs de Ce PC : jamais),
 // ni ceux dont le nom ne correspond pas à `nameFilter` (filtre instantané,
 // mêmes règles que NameMatches ; vide : aucun filtre).
+// dirSizes : taille calculée de chaque dossier (par index d'entrée), pour le tri par taille.
 std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs = {},
-                                const std::wstring& nameFilter = {});
+                                const std::wstring& nameFilter = {}, const std::vector<uint64_t>* dirSizes = nullptr);
