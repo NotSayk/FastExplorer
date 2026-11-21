@@ -51,6 +51,8 @@ constexpr UINT WM_APP_NAV = WM_APP + 9;         // résultat d'une lecture du vo
 constexpr UINT WM_APP_SELSUM = WM_APP + 10;     // sélection changée : résumé dans la barre d'état (une fois par rafale)
 constexpr UINT WM_APP_TABEDIT = WM_APP + 11;    // Tab pendant un renommage : renommer l'élément suivant
 constexpr UINT WM_APP_CMDFAIL = WM_APP + 12;    // commande tapée dans la barre d'adresse impossible (lParam = std::wstring*)
+constexpr UINT WM_APP_TESTDPI = WM_APP + 13;    // tests : comme WM_DPICHANGED (wParam = nouvelle échelle), que Windows
+                                                // ne laisse pas envoyer d'un autre processus
 constexpr UINT_PTR TIMER_LOADING = 1;
 constexpr UINT_PTR TIMER_WATCH = 2;
 constexpr UINT_PTR TIMER_AFTEROP = 3;
@@ -1982,7 +1984,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_SIZE: Layout(); return 0;
         case WM_SETFOCUS: SetFocus(g_list); return 0;
+        case WM_APP_TESTDPI: {
+            RECT r;
+            GetWindowRect(hwnd, &r);
+            r.right = r.left + MulDiv(r.right - r.left, (int)wp, (int)g_dpi);
+            r.bottom = r.top + MulDiv(r.bottom - r.top, (int)wp, (int)g_dpi);
+            return SendMessageW(hwnd, WM_DPICHANGED, MAKEWPARAM(wp, wp), (LPARAM)&r);
+        }
         case WM_DPICHANGED: {
+            // Passage sur un écran d'une autre échelle : colonnes, police, icônes,
+            // taille et positions changent en plusieurs temps. Sans précaution,
+            // chaque étape s'affiche (et Windows recopie l'ancien contenu aux
+            // nouvelles positions) : tout semble se décaler un instant. On
+            // recompose donc sans dessiner, puis on peint une seule fois.
+            std::vector<HWND> kids;
+            for (HWND c = GetWindow(hwnd, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
+                if (IsWindowVisible(c)) kids.push_back(c);
+            for (HWND c : kids) SendMessageW(c, WM_SETREDRAW, FALSE, 0);
             const UINT nd = HIWORD(wp);
             for (int i = 0; i < COL_COUNT; ++i)
                 ListView_SetColumnWidth(g_list, i, MulDiv(ListView_GetColumnWidth(g_list, i), (int)nd, (int)g_dpi));
@@ -1991,8 +2009,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ApplyImageList();
             const RECT* r = (const RECT*)lp;
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
             Layout();
+            for (HWND c : kids) SendMessageW(c, WM_SETREDRAW, TRUE, 0);
+            RedrawWindow(hwnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
             return 0;
         }
         case WM_TIMER:
@@ -2217,7 +2237,7 @@ bool Ui_Create(HINSTANCE inst, int show, const std::wstring& start) {
     if (!RegisterClassExW(&wc)) return false;
 
     const UINT sd = GetDpiForSystem();
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"FastExplorer", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"FastExplorer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
                                 CW_USEDEFAULT, MulDiv(1100, (int)sd, 96), MulDiv(700, (int)sd, 96), nullptr, nullptr,
                                 inst, nullptr);
     if (!hwnd) return false;
