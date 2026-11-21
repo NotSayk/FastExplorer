@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <deque>
 #include <unordered_map>
 
 namespace {
@@ -48,7 +49,7 @@ void AddEntry(DirData& d, const wchar_t* fn, uint32_t n, uint32_t attr, uint64_t
     e.size = dir ? 0 : size;
     e.extOff = n;
     if (!dir)
-        for (uint32_t i = n; i-- > 0;)
+        for (uint32_t i = n; i-- > 0 && fn[i] != L'\\';)  // (résultats de recherche : chemin relatif)
             if (fn[i] == L'.') { e.extOff = i; break; }
     d.pool.insert(d.pool.end(), fn, fn + n);
     d.pool.push_back(L'\0');
@@ -215,6 +216,217 @@ void BuildSortKeys(DirData& d) {
 }  // namespace
 
 void SetParallel(Parallel p) { g_parallel.store(p); }
+
+namespace {
+struct Matcher {
+    std::vector<std::wstring> terms;
+    std::vector<bool> wild;
+    std::vector<std::string> ascii;  // mot en ASCII minuscule ("" : pas d'ASCII pur)
+    explicit Matcher(const std::wstring& q) {
+        size_t i = 0;
+        while (i < q.size()) {
+            while (i < q.size() && iswspace(q[i])) ++i;
+            size_t j = i;
+            while (j < q.size() && !iswspace(q[j])) ++j;
+            if (j > i) {
+                terms.push_back(q.substr(i, j - i));
+                wild.push_back(terms.back().find_first_of(L"*?") != std::wstring::npos);
+                std::string a;
+                for (wchar_t c : terms.back()) {
+                    if (c >= 0x80) { a.clear(); break; }
+                    a += (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
+                }
+                ascii.push_back(std::move(a));
+            }
+            i = j;
+        }
+    }
+    // Recherche sans casse en ASCII pur : le cas de presque tous les noms, et
+    // ~50 fois plus rapide que FindNLSStringEx. Renvoie -1 si le nom n'est pas
+    // en ASCII (il faut alors la comparaison linguistique, accents compris).
+    static int AsciiFind(const wchar_t* name, uint32_t n, const std::string& term) {
+        const size_t m = term.size();
+        for (uint32_t i = 0; i < n; ++i)
+            if (name[i] >= 0x80) return -1;
+        if (m > n) return 0;
+        for (uint32_t i = 0; i + m <= n; ++i) {
+            size_t k = 0;
+            for (; k < m; ++k) {
+                wchar_t c = name[i + k];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != (wchar_t)(unsigned char)term[k]) break;
+            }
+            if (k == m) return 1;
+        }
+        return 0;
+    }
+
+    bool operator()(const wchar_t* name, uint32_t n) const {
+        if (terms.empty()) return false;
+        std::wstring z;  // nom terminé par \0, pour les motifs
+        for (size_t t = 0; t < terms.size(); ++t) {
+            if (!wild[t] && !ascii[t].empty()) {
+                const int r = AsciiFind(name, n, ascii[t]);
+                if (r == 0) return false;
+                if (r == 1) continue;
+            }
+            if (wild[t]) {
+                if (z.empty()) z.assign(name, n);
+                if (!PathMatchSpecW(z.c_str(), terms[t].c_str())) return false;
+            } else if (FindNLSStringEx(LOCALE_NAME_USER_DEFAULT,
+                                       FIND_FROMSTART | LINGUISTIC_IGNORECASE | LINGUISTIC_IGNOREDIACRITIC, name, (int)n,
+                                       terms[t].c_str(), (int)terms[t].size(), nullptr, nullptr, nullptr, 0) < 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+}  // namespace
+
+bool NameMatches(const std::wstring& query, const wchar_t* name, uint32_t n) { return Matcher(query)(name, n); }
+
+void SearchTree(DirData& d, const std::wstring& query, const ViewPrefs& prefs, const CancelToken& ct,
+                const std::function<void(std::shared_ptr<DirData>)>& partial) {
+    const double t0 = NowMs();
+    d.query = query;
+    d.searchDone = false;
+    {  // la racine doit être un dossier lisible
+        HANDLE h = CreateFileW(ToNtPath(d.path).c_str(), FILE_LIST_DIRECTORY,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (h == INVALID_HANDLE_VALUE) { d.error = GetLastError(); return; }
+        CloseHandle(h);
+    }
+    const Matcher match(query);
+    const std::wstring root = d.path;
+    // Disque réseau : moins de requêtes en parallèle (le serveur sert aussi les autres).
+    const bool remote = (root.size() > 1 && root[0] == L'\\') ||
+                        (root.size() >= 2 && root[1] == L':' && GetDriveTypeW(root.substr(0, 3).c_str()) == DRIVE_REMOTE);
+    const unsigned T = remote ? 4u : std::clamp(std::thread::hardware_concurrency(), 2u, 16u);
+
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::wstring> queue{L""};  // dossiers à lire (relatifs à la racine)
+    unsigned busy = 0;
+    bool finished = false, changed = false;
+    std::atomic<bool> stop{false};
+    DirData acc;  // résultats (sous m)
+
+    auto worker = [&] {
+        std::unique_ptr<BYTE[]> buf(new BYTE[kEnumBuf]);
+        struct Hit { std::wstring rel; uint32_t attr; uint64_t size; int64_t mtime; };
+        for (;;) {
+            std::wstring rel;
+            {
+                std::unique_lock lock(m);
+                cv.wait(lock, [&] { return !queue.empty() || busy == 0 || stop.load() || ct.cancelled(); });
+                if (queue.empty() || stop.load() || ct.cancelled()) {
+                    finished = true;
+                    cv.notify_all();
+                    return;
+                }
+                rel = std::move(queue.front());
+                queue.pop_front();
+                ++busy;
+            }
+            std::vector<Hit> hits;
+            std::vector<std::wstring> subdirs;
+            HANDLE h = CreateFileW(ToNtPath(rel.empty() ? root : Join(root, rel.c_str())).c_str(), FILE_LIST_DIRECTORY,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                   FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {  // refusé (dossier protégé) : ignoré, comme l'Explorateur
+                IO_STATUS_BLOCK iosb{};
+                BOOLEAN restart = TRUE;
+                while (!stop.load(std::memory_order_relaxed) && !ct.cancelled()) {
+                    const NTSTATUS st = pNtQueryDirectoryFile(h, nullptr, nullptr, nullptr, &iosb, buf.get(), kEnumBuf,
+                                                              FileDirectoryInformation, FALSE, nullptr, restart);
+                    restart = FALSE;
+                    if (!NT_SUCCESS(st) || st == STATUS_NO_MORE_FILES) break;
+                    const BYTE* p = buf.get();
+                    for (;;) {
+                        auto* di = (const DirInfo*)p;
+                        const uint32_t n = di->FileNameLength / sizeof(WCHAR);
+                        const WCHAR* fn = di->FileName;
+                        const bool dot = (n == 1 && fn[0] == L'.') || (n == 2 && fn[0] == L'.' && fn[1] == L'.');
+                        const DWORD attr = di->FileAttributes;
+                        if (!dot && IsShown(attr, prefs)) {
+                            // Pas de jonction ni de lien : pas de boucle, pas de doublon.
+                            const bool descend = (attr & FILE_ATTRIBUTE_DIRECTORY) && !(attr & FILE_ATTRIBUTE_REPARSE_POINT);
+                            const bool hit = match(fn, n);
+                            if (hit || descend) {  // chemin construit seulement si utile
+                                std::wstring child = rel.empty() ? std::wstring(fn, n) : rel + L"\\" + std::wstring(fn, n);
+                                if (hit)
+                                    hits.push_back({child, attr, (uint64_t)di->EndOfFile.QuadPart, di->LastWriteTime.QuadPart});
+                                if (descend) subdirs.push_back(std::move(child));
+                            }
+                        }
+                        if (!di->NextEntryOffset) break;
+                        p += di->NextEntryOffset;
+                    }
+                }
+                CloseHandle(h);
+            }
+            std::lock_guard lock(m);
+            for (auto& s : subdirs) queue.push_back(std::move(s));
+            for (const Hit& x : hits) {
+                if (acc.entries.size() >= kSearchMaxResults) {
+                    acc.truncated = true;
+                    stop = true;
+                    break;
+                }
+                AddEntry(acc, x.rel.c_str(), (uint32_t)x.rel.size(), x.attr, x.size, x.mtime);
+            }
+            ++acc.scanned;
+            changed |= !hits.empty();
+            --busy;
+            cv.notify_all();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (unsigned i = 0; i < T; ++i) threads.emplace_back(worker);
+    // Copies partielles pendant la recherche : la liste se remplit au fil de l'eau.
+    ULONGLONG nextAt = GetTickCount64() + 120;
+    for (;;) {
+        std::unique_lock lock(m);
+        cv.wait_for(lock, std::chrono::milliseconds(40), [&] { return finished; });
+        if (finished) break;
+        if (!partial || GetTickCount64() < nextAt) continue;
+        nextAt = GetTickCount64() + 250;
+        auto snap = std::make_shared<DirData>();
+        snap->path = root;
+        snap->query = query;
+        snap->searchDone = false;
+        snap->scanned = acc.scanned;
+        if (changed) {
+            snap->entries = acc.entries;
+            snap->pool = acc.pool;
+            snap->nDirs = acc.nDirs;
+            snap->nFiles = acc.nFiles;
+            changed = false;
+        } else {
+            continue;  // rien de nouveau : pas de copie
+        }
+        lock.unlock();
+        BuildSortKeys(*snap);
+        snap->enumMs = NowMs() - t0;
+        if (!ct.cancelled()) partial(std::move(snap));
+    }
+    for (auto& t : threads) t.join();
+    if (ct.cancelled()) { d.error = ERROR_CANCELLED; return; }
+    d.entries = std::move(acc.entries);
+    d.pool = std::move(acc.pool);
+    d.nDirs = acc.nDirs;
+    d.nFiles = acc.nFiles;
+    d.scanned = acc.scanned;
+    d.truncated = acc.truncated;
+    d.enumMs = NowMs() - t0;
+    const double t1 = NowMs();
+    BuildSortKeys(d);
+    d.keyMs = NowMs() - t1;
+    d.searchDone = true;
+}
 
 void Enumerate(DirData& d, const CancelToken& ct) {
     const double t0 = NowMs();

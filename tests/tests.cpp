@@ -10,6 +10,8 @@
 #include "jobs.h"
 #include "listing.h"
 #include <shlwapi.h>
+#include <algorithm>
+#include <atomic>
 #include "crumbs.h"
 #include "navpane.h"
 #include "pins.h"
@@ -679,6 +681,77 @@ void TestSelectionText() {
     CHECK_STR(SelectionText(1, false, 0), std::wstring(L"1 élément sélectionné  ") + b);  // fichier vide
 }
 
+void TestSearch() {
+    auto m = [](const wchar_t* q, const wchar_t* n) { return NameMatches(q, n, (uint32_t)wcslen(n)); };
+    CHECK(m(L"rap", L"Rapport.txt"));
+    CHECK(m(L"resume", L"RÉSUMÉ.doc"));      // ni casse ni accents
+    CHECK(m(L"*.txt", L"notes.TXT") && !m(L"*.txt", L"notes.txt.bak"));
+    CHECK(m(L"rap txt", L"rapport.txt"));    // tous les mots
+    CHECK(!m(L"rap doc", L"rapport.txt"));
+    CHECK(m(L"  rap  ", L"rapport.txt"));
+    CHECK(!m(L"", L"rapport.txt") && !m(L"   ", L"rapport.txt"));
+    CHECK(m(L"rap*", L"Rapport.txt") && !m(L"?ap", L"Rapport.txt"));
+
+    const std::wstring base = Join(g_root, L"recherche");
+    for (const wchar_t* d : {L"", L"a", L"a\\b", L"cache", L"vide"}) CreateDirectoryW(Join(base, d).c_str(), nullptr);
+    MakeFile(Join(base, L"a\\b\\Rapport final.txt"), 10);
+    MakeFile(Join(base, L"a\\rapport_2.TXT"), 20);
+    MakeFile(Join(base, L"autre.txt"), 1);
+    MakeFile(Join(base, L"cache\\rapport_cache.txt"), 1);
+    CreateDirectoryW(Join(base, L"a\\Rapports").c_str(), nullptr);  // un dossier qui correspond
+    SetFileAttributesW(Join(base, L"cache").c_str(), FILE_ATTRIBUTE_HIDDEN);
+    _wsystem((L"cmd /c mklink /J \"" + Join(base, L"jonction") + L"\" \"" + Join(base, L"a") + L"\" >nul").c_str());
+
+    auto names = [](const DirData& d) {
+        std::vector<std::wstring> v;
+        for (const Entry& e : d.entries) v.emplace_back(d.name(e));
+        std::sort(v.begin(), v.end());
+        std::wstring s;
+        for (auto& x : v) s += x + L";";
+        return s;
+    };
+    const ViewPrefs noHidden{false, false, true}, all{true, true, true};
+    DirData d;
+    d.path = base;
+    int partials = 0;
+    SearchTree(d, L"rapport", noHidden, CancelToken{}, [&](std::shared_ptr<DirData>) { ++partials; });
+    CHECK(d.error == 0 && d.searchDone && !d.truncated);
+    // Pas le dossier caché, pas de doublon par la jonction.
+    CHECK_STR(names(d), L"a\\Rapports;a\\b\\Rapport final.txt;a\\rapport_2.TXT;");  // ordre ordinal
+    CHECK(d.scanned >= 4);
+    CHECK(d.nDirs == 1 && d.nFiles == 2);
+    // L'extension se lit dans le nom, pas dans le chemin : « a\Rapports » n'en a pas.
+    for (const Entry& e : d.entries)
+        if (e.isDir()) CHECK(e.extOff == e.nameLen);
+    // Triable comme un dossier ordinaire.
+    CHECK(SortOrder(d, COL_NAME, true, noHidden).size() == 3);
+
+    DirData h;
+    h.path = base;
+    SearchTree(h, L"rapport", all, CancelToken{});
+    CHECK(h.entries.size() == 4);  // + le fichier du dossier caché
+
+    DirData none;
+    none.path = base;
+    SearchTree(none, L"zzzintrouvable", all, CancelToken{});
+    CHECK(none.error == 0 && none.entries.empty() && none.searchDone);
+
+    DirData bad;
+    bad.path = Join(base, L"absent");
+    SearchTree(bad, L"x", all, CancelToken{});
+    CHECK(bad.error != 0);
+
+    std::atomic<uint64_t> gen{5};
+    DirData cancelled;
+    cancelled.path = base;
+    SearchTree(cancelled, L"rapport", all, CancelToken{&gen, 4});
+    CHECK(cancelled.error == ERROR_CANCELLED);
+
+    RemoveDirectoryW(Join(base, L"jonction").c_str());
+    SetFileAttributesW(Join(base, L"cache").c_str(), FILE_ATTRIBUTE_NORMAL);
+    RemoveTree(base);
+}
+
 void TestFastCopy() {
     const std::wstring base = Join(g_root, L"fast");
     const std::wstring src = Join(base, L"src"), dst = Join(base, L"dst");
@@ -1012,6 +1085,7 @@ int wmain() {
     TestCrumbs();
     TestViewPrefs();
     TestSelectionText();
+    TestSearch();
     TestFastCopy();
     TestFileOps();
     TestDrop();

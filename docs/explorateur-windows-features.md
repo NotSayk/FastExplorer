@@ -26,7 +26,7 @@ De haut en bas :
 | Zone | Contenu | Prio |
 |---|---|---|
 | **Barre d'onglets** (barre de titre) | Onglets, bouton « + », boutons fenêtre | P1 |
-| **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅🟡 P0 |
+| **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅🟡 P0 (tout sauf le bouton Actualiser : F5) |
 | **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | P1 |
 | **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accès rapide épinglé + arborescence de Ce PC, séparateur ; Accueil, Galerie, Réseau, Linux à venir) |
 | **Zone de contenu** | La liste des éléments | ✅ P0 |
@@ -290,7 +290,7 @@ comme arrière-plan, Pivoter (images), Monter (ISO/VHD), Graver…
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Barre de recherche | Ctrl+E, Ctrl+F, F3 ; cherche dans le dossier courant et ses sous-dossiers | **P0** |
+| Barre de recherche | Ctrl+E, Ctrl+F, F3 ; cherche dans le dossier courant et ses sous-dossiers | ✅ **P0** (sans index : parcours parallèle, résultats au fil de l'eau ; mots sans casse ni accents, motifs * ?, dossiers cachés selon le réglage, jonctions non suivies ; « Ouvrir l'emplacement du fichier » ; Échap pour sortir. C:\Windows entier : ~3 s) |
 | Résultats en direct | Au fil de la frappe, nom et contenu des fichiers indexés | P1 |
 | Index Windows Search | Rapide dans les emplacements indexés, lent (parcours disque) ailleurs ; options *Ne pas utiliser l'index*, *Inclure les fichiers système*, *Fichiers compressés*, *Correspondances partielles* | P2 ⚙️ requêtes OLE DB / `ISearchQueryHelper` sur `SystemIndex` |
 | **Syntaxe AQS** | `nom:`, `ext:.pdf`, `type:image`, `kind:music`, `taille:>100Mo`, `size:gigantic`, `date:aujourd'hui`, `datemodified:01/01/2026..31/01/2026`, `auteur:`, opérateurs `AND`, `OR`, `NOT`, `-`, guillemets, joker `*` | P2 |
@@ -492,7 +492,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Alt+← / Alt+→ / **Retour arrière** | Précédent / Suivant / Précédent | ✅ (⚠️ Retour arrière) |
 | Alt+↑ | Dossier parent | ✅ |
 | Alt+D, Ctrl+L, F4 | Barre d'adresse (F4 : avec la liste déroulante) | ✅ (F4 : sans liste déroulante, l'historique n'existe pas encore) |
-| Ctrl+E, Ctrl+F, F3 | Recherche | P0 |
+| Ctrl+E, Ctrl+F, F3 | Recherche | ✅ P0 |
 | F5, Ctrl+R | Actualiser | ✅ (F5) |
 | F6, Tab | Passer d'un volet à l'autre | 🟡 (Tab : adresse ↔ liste) |
 | Ctrl+Maj+E | Développer le volet de navigation jusqu'au dossier courant | P2 |
@@ -608,7 +608,7 @@ Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre
 6. ✅ **Fil d'Ariane** dans la barre d'adresse.
 7. ✅ **Affichage** : éléments cachés et système, masquage des extensions (en respectant les préférences de l'utilisateur).
 8. ✅ **Barre d'état** : résumé de la sélection (nombre, taille).
-9. **Recherche** dans le dossier courant (puis l'index MFT en P1 ⭐).
+9. ✅ **Recherche** dans le dossier courant (puis l'index MFT en P1 ⭐).
 
 Puis les **P1** : onglets, annuler/rétablir, aperçu, miniatures, taille des dossiers ⭐, double panneau ⭐,
 file d'attente de copies ⭐, filtre instantané ⭐, autocomplétion, archives…

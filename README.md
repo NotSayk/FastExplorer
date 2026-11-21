@@ -19,7 +19,7 @@ Mesurer un dossier : `FastExplorer.exe --bench <dossier> [--seq|--par]`
 |---|---|
 | `nt.*` | accès à ntdll (`NtQueryDirectoryFile`) |
 | `paths.*` | chemins : `\\?\`, UNC, parent, normalisation de saisie |
-| `listing.*` | lecture d'un dossier, clés de tri, tri, filtre des éléments cachés et extensions masquées (réglages de l'Explorateur) — sans UI, testé |
+| `listing.*` | lecture d'un dossier, clés de tri, tri, filtre des éléments cachés et extensions masquées (réglages de l'Explorateur), recherche récursive parallèle — sans UI, testé |
 | `jobs.*` | tâches de fond : génération, annulation, `CancelSynchronousIo` |
 | `shellmenu.*` | menus contextuels et verbes du Shell, raccourcis `.lnk` |
 | `icons.*` | icônes propres (exe, lnk…) et surimpressions, thread dédié |

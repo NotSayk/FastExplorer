@@ -34,6 +34,26 @@ bool ShellObjectOf(HWND owner, const std::wstring& folder, const std::vector<std
         abs.push_back(std::move(p));
     }
     if (abs.empty()) return false;
+    // Éléments de dossiers différents (résultats de recherche) : un objet de
+    // données reste possible (copier, glisser) ; un menu contextuel, non.
+    bool sameParent = true;
+    {
+        Pidl p0((ITEMIDLIST*)ILClone(abs[0].get()));
+        ILRemoveLastID(p0.get());
+        for (size_t i = 1; i < abs.size() && sameParent; ++i) {
+            Pidl pi((ITEMIDLIST*)ILClone(abs[i].get()));
+            ILRemoveLastID(pi.get());
+            sameParent = ILIsEqual(p0.get(), pi.get()) != FALSE;
+        }
+    }
+    if (!sameParent) {
+        if (riid != IID_IDataObject) return false;
+        std::vector<PCIDLIST_ABSOLUTE> list;
+        for (const auto& p : abs) list.push_back(p.get());
+        ComPtr<IShellItemArray> arr;
+        if (FAILED(SHCreateShellItemArrayFromIDLists((UINT)list.size(), list.data(), &arr))) return false;
+        return SUCCEEDED(arr->BindToHandler(nullptr, BHID_DataObject, riid, out)) && *out;
+    }
     ComPtr<IShellFolder> parent;
     PCUITEMID_CHILD first = nullptr;
     if (FAILED(SHBindToParent(abs[0].get(), IID_PPV_ARGS(&parent), &first))) return false;

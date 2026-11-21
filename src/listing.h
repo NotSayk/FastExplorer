@@ -3,6 +3,8 @@
 #include "cancel.h"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -41,6 +43,11 @@ struct DirData {
     double enumMs = 0, keyMs = 0;
     std::wstring vanished;  // EnumerateNearest : dossier demandé, disparu (sinon vide)
     std::vector<DriveInfo> drives;  // Ce PC : une par entrée
+    // Résultats de recherche (SearchTree) : les noms sont des chemins relatifs à `path`.
+    std::wstring query;      // "" : contenu ordinaire du dossier
+    bool searchDone = true;  // false : résultats partiels, la recherche continue
+    bool truncated = false;  // trop de résultats : recherche arrêtée
+    size_t scanned = 0;      // dossiers parcourus
 
     bool isRoot() const { return path.empty(); }
     const wchar_t* name(const Entry& e) const { return pool.data() + e.nameOff; }
@@ -72,6 +79,21 @@ void EnumerateNearest(DirData& d, const CancelToken& ct = {});
 // « 3 éléments sélectionnés  4,52 Mo » ; taille seulement s'il n'y a que des
 // fichiers (withSize = false : jamais, p. ex. lecteurs de Ce PC). "" si rien.
 std::wstring SelectionText(size_t count, bool anyDir, uint64_t bytes, bool withSize = true);
+
+struct ViewPrefs;
+
+// Le nom correspond-il à la recherche ? Mots séparés par des espaces, tous
+// présents (sans tenir compte de la casse ni des accents) ; un mot avec * ou ?
+// est un motif sur le nom entier (« *.txt »).
+bool NameMatches(const std::wstring& query, const wchar_t* name, uint32_t n);
+
+// Recherche récursive dans d.path (sous-dossiers compris, sans suivre les
+// jonctions ni entrer dans les dossiers masqués par `prefs`), sur plusieurs
+// threads. `partial` reçoit, depuis le thread appelant, des copies triables
+// des résultats au fil de l'eau (~4 par seconde) ; d contient tout à la fin.
+constexpr size_t kSearchMaxResults = 100000;
+void SearchTree(DirData& d, const std::wstring& query, const ViewPrefs& prefs, const CancelToken& ct,
+                const std::function<void(std::shared_ptr<DirData>)>& partial = {});
 
 // Préférences d'affichage de l'Explorateur (communes avec lui).
 struct ViewPrefs {

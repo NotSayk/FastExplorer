@@ -56,6 +56,7 @@ constexpr UINT_PTR TIMER_HOVER = 6;   // souris immobile sur la liste : prépare
 constexpr UINT kMenuHoverMs = 100;
 constexpr UINT_PTR TIMER_PROGRESS = 7;  // progression des copies de notre moteur
 constexpr UINT_PTR TIMER_PINNED = 8;    // après un menu contextuel : relire l'Accès rapide (épinglage)
+constexpr UINT_PTR TIMER_SEARCH = 9;    // frappe dans la zone de recherche : lancer la recherche après une pause
 constexpr UINT_PTR TIMER_DRIVES = 4;  // Ce PC : regroupe les annonces d'arrivée / retrait de lecteurs
 constexpr UINT_PTR TIMER_EJECT = 5;   // éjection demandée : si elle échoue, on reprend la surveillance  // resélection après une opération, différée pendant un renommage
 constexpr UINT kLoadingDelayMs = 150;   // en dessous, aucun « Chargement… » (évite le clignotement)
@@ -64,7 +65,7 @@ constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-
 // d'événements (copie de milliers de fichiers) et s'espace sur les gros dossiers.
 constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
-enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS };
+enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH };
 enum class Nav { Normal, Back, Forward, Refresh };
 enum class JobKind { Navigate, Sort };
 
@@ -87,6 +88,7 @@ struct Pending {
     // vers un fichier, chemin de fichier tapé dans la barre d'adresse).
     std::wstring fallbackOpen;
     bool fallbackAnyError = false;  // raccourci : aussi si la cible a disparu (le Shell s'en occupe)
+    std::wstring query;             // recherche dans `path` ("" : simple lecture)
 };
 
 enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
@@ -105,7 +107,9 @@ struct View {
 };
 
 HINSTANCE g_inst;
-HWND g_hwnd, g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav, g_crumbs;
+HWND g_hwnd, g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav, g_crumbs, g_searchBox;
+std::wstring g_query;           // recherche affichée ("" : contenu ordinaire du dossier)
+bool g_searchSync = false;      // texte de la zone de recherche changé par le programme
 int g_navW96 = 240;            // largeur du volet de navigation (à 96 ppp)
 bool g_splitDrag = false;      // séparateur volet / liste en cours de déplacement
 RECT g_split{};                // zone du séparateur (coordonnées client)
@@ -204,8 +208,18 @@ void ShowSummary() {
     const size_t shown = g_view.order.size(), hidden = d.entries.size() - shown;
     wchar_t masked[64] = L"";
     if (hidden) swprintf_s(masked, L", %zu masqué%s", hidden, hidden > 1 ? L"s" : L"");
-    swprintf_s(s, L"%zu élément%s  (%zu dossier%s, %zu fichier%s%s)", shown, shown > 1 ? L"s" : L"", dirs,
-               dirs > 1 ? L"s" : L"", shown - dirs, shown - dirs > 1 ? L"s" : L"", masked);
+    if (!d.query.empty()) {
+        swprintf_s(s, L"%zu résultat%s pour « %s »%s", shown, shown > 1 ? L"s" : L"", d.query.c_str(),
+                   d.searchDone ? (d.truncated ? L"   •   arrêtée : trop de résultats" : L"")
+                                : L"   •   recherche en cours…");
+        if (!d.searchDone) {
+            const size_t k = wcslen(s);
+            swprintf_s(s + k, _countof(s) - k, L" (%zu dossiers parcourus)", d.scanned);
+        }
+    } else {
+        swprintf_s(s, L"%zu élément%s  (%zu dossier%s, %zu fichier%s%s)", shown, shown > 1 ? L"s" : L"", dirs,
+                   dirs > 1 ? L"s" : L"", shown - dirs, shown - dirs > 1 ? L"s" : L"", masked);
+    }
     SetStatus(g_goneNote.empty() ? std::wstring(s) : g_goneNote + L"   •   " + s);
     wchar_t perf[160];
     int k = swprintf_s(perf, L"lecture %.2f ms, clés %.2f ms, tri %.2f ms", d.enumMs, d.keyMs, g_view.sortMs);
@@ -513,19 +527,30 @@ void AttachTarget(HWND hwnd) {
     if (Result* e = g_early.exchange(nullptr)) PostTo(hwnd, e);
 }
 
+// query : recherche à lancer dans `path`. Par défaut, un rafraîchissement
+// relance la recherche affichée ; toute autre navigation en sort.
 void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::vector<std::wstring> selected = {},
-              std::wstring fallbackOpen = {}, bool fallbackAnyError = false) {
+              std::wstring fallbackOpen = {}, bool fallbackAnyError = false, const std::wstring* query = nullptr) {
     const CancelToken ct = Jobs_NewGeneration();
+    const std::wstring q = query ? *query : (nav == Nav::Refresh ? g_query : std::wstring());
     g_pending = Pending{true,           path, nav, std::move(focus), std::move(selected), std::move(fallbackOpen),
-                        fallbackAnyError};
+                        fallbackAnyError, q};
     if (g_hwnd) SetTimer(g_hwnd, TIMER_LOADING, kLoadingDelayMs, nullptr);
     const int col = g_sortCol;
     const bool asc = g_sortAsc;
-    const bool climb = nav == Nav::Refresh;  // dossier affiché disparu : on remonte, comme l'Explorateur
-    Jobs_Spawn([ct, path, col, asc, climb, prefs = g_prefs] {
+    const bool climb = nav == Nav::Refresh && q.empty();  // dossier affiché disparu : on remonte, comme l'Explorateur
+    Jobs_Spawn([ct, path, col, asc, climb, q, prefs = g_prefs] {
         auto d = std::make_shared<DirData>();
         d->path = path;
-        if (climb) EnumerateNearest(*d, ct);
+        if (!q.empty()) {
+            // Résultats au fil de l'eau : chaque copie partielle s'affiche comme un rafraîchissement.
+            SearchTree(*d, q, prefs, ct, [&](std::shared_ptr<DirData> s) {
+                auto* r = new Result{ct.gen, JobKind::Navigate};
+                r->order = SortOrder(*s, col, asc, prefs);
+                r->data = std::move(s);
+                Post(r);
+            });
+        } else if (climb) EnumerateNearest(*d, ct);
         else Enumerate(*d, ct);
         if (ct.cancelled()) return;
         auto* r = new Result{ct.gen, JobKind::Navigate};
@@ -564,7 +589,7 @@ void Resort(int col) {
 void SortView() {
     if (g_pending.active) {  // une navigation est en vol : on la relance avec le nouveau tri
         Pending p = g_pending;
-        Navigate(p.path, p.nav, p.focus, p.selected, p.fallbackOpen, p.fallbackAnyError);
+        Navigate(p.path, p.nav, p.focus, p.selected, p.fallbackOpen, p.fallbackAnyError, &p.query);
         return;
     }
     if (!HasView()) return;
@@ -606,6 +631,32 @@ void ShowSelectionSummary() {
     SetStatusPart(SB_SEL, SelectionText(count, anyDir, bytes, !g_view.data->isRoot()));
 }
 
+void Refresh();
+
+// Lance (ou quitte) la recherche tapée dans la zone de recherche.
+void RunSearch() {
+    KillTimer(g_hwnd, TIMER_SEARCH);
+    if (!HasView()) return;
+    const int n = GetWindowTextLengthW(g_searchBox);
+    std::wstring q(n + 1, L'\0');
+    GetWindowTextW(g_searchBox, q.data(), n + 1);
+    q.resize(n);
+    while (!q.empty() && iswspace(q.back())) q.pop_back();
+    while (!q.empty() && iswspace(q.front())) q.erase(0, 1);
+    const std::wstring current = g_pending.active ? g_pending.query : g_query;
+    if (q == current) return;
+    if (!q.empty() && g_path.empty()) {
+        SetStatus(L"Ouvrez un dossier ou un lecteur pour y rechercher.");
+        return;
+    }
+    Navigate(g_path, Nav::Refresh, {}, {}, {}, false, &q);  // q vide : retour au contenu du dossier
+}
+
+void FocusSearch() {
+    SetFocus(g_searchBox);
+    Edit_SetSel(g_searchBox, 0, -1);
+}
+
 // Préférences d'affichage changées (ici, dans l'Explorateur ou les options des dossiers).
 void ApplyViewPrefs(const ViewPrefs& p) {
     if (p == g_prefs) return;
@@ -613,7 +664,8 @@ void ApplyViewPrefs(const ViewPrefs& p) {
     g_prefs = p;
     NavPane_SetViewPrefs(p);
     if (!HasView()) return;
-    if (refilter) SortView();
+    if (refilter && !g_query.empty()) Refresh();  // recherche : les dossiers cachés sont parcourus ou non
+    else if (refilter) SortView();
     else InvalidateRect(g_list, nullptr, FALSE);  // extensions : seul l'affichage des noms change
 }
 
@@ -663,6 +715,14 @@ void OnResult(Result* raw) {
     Pending p = std::move(g_pending);
     g_pending = Pending{};
     const DirData& d = *r->data;
+    if (!p.active && !d.query.empty() && HasView()) {
+        // Suite d'une recherche déjà affichée : même dossier, sélection gardée.
+        p.nav = Nav::Refresh;
+        for (int e : SelectedEntries()) p.selected.emplace_back(NameOf(e));
+        if (const int f = FocusedEntry(); f >= 0) p.focus = NameOf(f);
+    }
+    if (!d.query.empty() && !d.error && d.entries.size() <= kSyncSortMax)  // tri changé pendant la recherche
+        r->order = SortOrder(d, g_sortCol, g_sortAsc, g_prefs);
 
     if (d.error) {
         SetWindowTextW(g_addr, g_path.c_str());
@@ -737,6 +797,12 @@ void OnResult(Result* raw) {
     Icons_SetSerial(g_view.serial);
     RebuildRowOf();
     g_path = d.path;
+    g_query = d.query;
+    if (g_query.empty() && GetWindowTextLengthW(g_searchBox) && GetFocus() != g_searchBox) {
+        g_searchSync = true;  // sorti de la recherche (autre dossier) : zone vidée
+        SetWindowTextW(g_searchBox, L"");
+        g_searchSync = false;
+    }
     ApplyCutMarks();
 
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
@@ -1093,7 +1159,18 @@ void OnEditSel() {
         return;
     }
     const int idx = FindEntryByName(g_editName);
-    if (idx < 0 || E(idx).isDir() || !g_editExt.empty()) return;  // extension masquée : tout est sélectionné
+    if (idx < 0) return;
+    // Résultat de recherche (« sous-dossier\nom ») : on ne renomme que le nom.
+    const size_t slash = g_editName.rfind(L'\\');
+    if (slash != std::wstring::npos) {
+        std::wstring leaf = g_editName.substr(slash + 1);
+        leaf.resize(leaf.size() - std::min(leaf.size(), g_editExt.size()));
+        SetWindowTextW(ed, leaf.c_str());
+        const int dot = E(idx).isDir() || !g_editExt.empty() ? -1 : (int)(PathFindExtensionW(leaf.c_str()) - leaf.c_str());
+        Edit_SetSel(ed, 0, dot > 0 && dot < (int)leaf.size() ? dot : -1);
+        return;
+    }
+    if (E(idx).isDir() || !g_editExt.empty()) return;  // extension masquée : tout est sélectionné
     const wchar_t* name = NameOf(idx);
     const int dot = (int)(PathFindExtensionW(name) - name);
     if (dot > 0 && name[dot]) Edit_SetSel(ed, 0, dot);
@@ -1114,6 +1191,9 @@ void OnEndLabelEdit(const NMLVDISPINFOW* di) {
     const std::wstring typed = di->item.pszText;
     std::wstring name = CleanFileName(typed);
     if (!name.empty() && !g_editExt.empty()) name += g_editExt;  // extension masquée : conservée
+    const size_t slash = old.rfind(L'\\');  // résultat de recherche : seul le nom change
+    const std::wstring oldLeaf = slash == std::wstring::npos ? old : old.substr(slash + 1);
+    if (name == oldLeaf) return;
     if (name.empty() || name == old) return;
     if (const wchar_t* err = FileNameError(name)) {
         g_reedit = Reedit{old, typed, err};
@@ -1245,6 +1325,14 @@ void ShowContextMenu(LPARAM lp) {
         extras.push_back({L"Afficher les éléments masqués", ToggleHidden, false, g_prefs.showHidden});
         extras.push_back({L"Afficher les extensions de noms de fichiers", ToggleExtensions, false, g_prefs.showExtensions});
     }
+    if (!g_query.empty() && names.size() == 1) {  // résultat de recherche : son dossier, élément sélectionné
+        std::wstring parent, leaf;
+        if (ParentOf(Join(g_path, names[0].c_str()), parent, leaf))
+            extras.insert(extras.begin(), {L"Ouvrir l'emplacement du fichier", [parent, leaf] {
+                              Navigate(parent, Nav::Normal, leaf, {leaf});
+                              SetFocus(g_list);
+                          }});
+    }
     const bool ok = ShellMenu_Show(g_hwnd, g_path, names, pt, GetKeyState(VK_SHIFT) < 0, [names](const std::wstring& verb) {
         auto is = [&](const wchar_t* v) { return _wcsicmp(verb.c_str(), v) == 0; };
         const int single = names.size() == 1 ? FindEntryByName(names[0]) : -1;
@@ -1266,7 +1354,9 @@ void ShowContextMenu(LPARAM lp) {
         if (background) g_expectNew = {g_view.data, GetTickCount64() + 10000};
         return false;
     }, extras);
-    if (!ok) SetStatus(L"Menu contextuel indisponible pour cet emplacement.");
+    if (!ok && !g_query.empty() && names.size() > 1)
+        SetStatus(L"Menu contextuel : choisissez des résultats d'un même dossier.");
+    else if (!ok) SetStatus(L"Menu contextuel indisponible pour cet emplacement.");
     SetTimer(g_hwnd, TIMER_PINNED, 800, nullptr);  // « Épingler à Accès rapide » a pu être choisi
 }
 
@@ -1434,7 +1524,8 @@ void RegisterShellNotify() {
 
 void OnWatchTimer() {
     KillTimer(g_hwnd, TIMER_WATCH);
-    if (g_pending.active || g_editing) {  // navigation ou renommage en cours : on réessaie plus tard
+    // Navigation, renommage ou recherche en cours : on réessaie plus tard.
+    if (g_pending.active || g_editing || (HasView() && !g_view.data->searchDone)) {
         SetTimer(g_hwnd, TIMER_WATCH, (UINT)kWatchMinDelayMs, nullptr);
         return;
     }
@@ -1456,7 +1547,7 @@ void ApplyFont() {
         SelectObject(dc, old);
         ReleaseDC(g_hwnd, dc);
     }
-    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav, g_crumbs})
+    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav, g_crumbs, g_searchBox})
         SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
 }
 
@@ -1493,7 +1584,7 @@ void Layout() {
     const int editH = g_fontH + S(10);  // texte centré verticalement
     const int h = std::max(S(30), editH);
     // Un seul lot de déplacements : un repaint au lieu d'un par contrôle.
-    HDWP dwp = BeginDeferWindowPos(8);
+    HDWP dwp = BeginDeferWindowPos(9);
     auto place = [&](HWND w, int x, int y, int cx, int cy) {
         if (dwp) dwp = DeferWindowPos(dwp, w, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
         else MoveWindow(w, x, y, cx, cy, TRUE);
@@ -1504,8 +1595,11 @@ void Layout() {
         x += bw + S(2);
     }
     x += S(4);
-    place(g_addr, x, m + (h - editH) / 2, std::max(0, (int)rc.right - x - m), editH);
-    place(g_crumbs, x, m + (h - editH) / 2, std::max(0, (int)rc.right - x - m), editH);  // même place
+    const int searchW = std::min(S(260), std::max(0, (int)rc.right - x - m) / 3);
+    const int addrW = std::max(0, (int)rc.right - x - m - searchW - S(6));
+    place(g_addr, x, m + (h - editH) / 2, addrW, editH);
+    place(g_crumbs, x, m + (h - editH) / 2, addrW, editH);  // même place
+    place(g_searchBox, (int)rc.right - m - searchW, m + (h - editH) / 2, searchW, editH);
     const int top = m + h + m;
     const int bodyH = std::max(0, (int)rc.bottom - top - statusH);
     // Volet de navigation, séparateur (déplaçable à la souris), liste.
@@ -1552,6 +1646,9 @@ void CreateChildren(HWND hwnd) {
     crumbs.edit = BeginAddressEdit;
     crumbs.driveText = NavPane_DriveText;
     g_crumbs = Crumbs_Create(hwnd, ID_CRUMBS, std::move(crumbs));
+    g_searchBox = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0,
+                                  0, 0, hwnd, (HMENU)ID_SEARCH, g_inst, nullptr);
+    Edit_SetCueBannerTextFocused(g_searchBox, L"Rechercher (Ctrl+F)", TRUE);
 
     g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_SHAREIMAGELISTS |
@@ -1698,6 +1795,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_AFTEROP) { ApplyAfterOp(); return 0; }
             if (wp == TIMER_PROGRESS) { OnProgressTimer(); return 0; }
             if (wp == TIMER_PINNED) { KillTimer(hwnd, wp); NavPane_RefreshPinned(true); return 0; }
+            if (wp == TIMER_SEARCH) { RunSearch(); return 0; }
             if (wp == TIMER_HOVER) {
                 KillTimer(hwnd, wp);
                 POINT c;
@@ -1719,6 +1817,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case ID_UP: GoUp(); SetFocus(g_list); return 0;
                 case ID_ADDR:
                     if (HIWORD(wp) == EN_KILLFOCUS) EndAddressEdit();
+                    return 0;
+                case ID_SEARCH:  // recherche lancée après une courte pause dans la frappe
+                    if (HIWORD(wp) == EN_CHANGE && !g_searchSync) SetTimer(hwnd, TIMER_SEARCH, 300, nullptr);
                     return 0;
             }
             break;
@@ -1807,16 +1908,30 @@ bool HandleGlobalKeys(const MSG& m) {
             BeginAddressEdit();
             return true;
         case VK_F4: BeginAddressEdit(); return true;
-        case VK_TAB:
-            if (focus == g_addr) SetFocus(g_list);
+        case VK_F3: FocusSearch(); return true;
+        case 'F':
+        case 'E':
+            if (!ctrl) return false;
+            FocusSearch();
+            return true;
+        case VK_TAB:  // barre d'adresse → recherche → liste
+            if (focus == g_addr) FocusSearch();
+            else if (focus == g_searchBox) SetFocus(g_list);
             else BeginAddressEdit();
             return true;
         case VK_RETURN:
             if (focus == g_addr) { NavigateAddress(); return true; }
+            if (focus == g_searchBox) { RunSearch(); SetFocus(g_list); return true; }
             if (focus == g_list) { Activate(ListView_GetNextItem(g_list, -1, LVNI_FOCUSED)); return true; }
             return false;
         case VK_ESCAPE: {
             if (focus == g_addr) { SetWindowTextW(g_addr, g_path.c_str()); SetFocus(g_list); return true; }
+            if (focus == g_searchBox) {  // Échap : on quitte la recherche
+                SetWindowTextW(g_searchBox, L"");
+                RunSearch();
+                SetFocus(g_list);
+                return true;
+            }
             FileOpsProgress p;
             if (FileOps_Progress(p)) {  // copie en cours : on l'arrête (ce qui est copié reste)
                 FileOps_Cancel();
