@@ -1100,7 +1100,10 @@ std::vector<MenuExtra> PinExtras(const std::wstring& path, bool withOpen) {
     std::vector<MenuExtra> x;
     if (withOpen) x.push_back({L"Ouvrir", [path] { Navigate(path, Nav::Normal); }, true});
     const NavPin pin = NavPane_PinOf(path);
-    if (pin == NavPin::Windows) return x;
+    if (pin == NavPin::Windows) {
+        x.push_back({L"Désépingler de l'Accès rapide", [path] { NavPane_UnpinWindows(path); }});
+        return x;
+    }
     const bool add = pin == NavPin::None;
     x.push_back({add ? L"Épingler dans FastExplorer" : L"Désépingler de FastExplorer", [path, add] {
                      if (!NavPane_Pin(path, add)) SetStatus(L"Impossible d'enregistrer les dossiers épinglés.");
@@ -1452,6 +1455,7 @@ void CreateChildren(HWND hwnd) {
     NavHost nav;
     nav.navigate = [](const std::wstring& path) { Navigate(path, Nav::Normal); };
     nav.contextMenu = ShowNavMenu;
+    nav.status = [](const std::wstring& text) { SetStatus(text); };
     g_nav = NavPane_Create(hwnd, ID_NAV, WM_APP_NAV, std::move(nav));
 
     g_status = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd,

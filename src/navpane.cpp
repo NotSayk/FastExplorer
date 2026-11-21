@@ -117,7 +117,9 @@ struct Result {
     uintptr_t id = 0;  // Children : nœud visé
     std::vector<NavFolder> folders;
     int rootIcon = -1;  // icône du nœud racine (Accès rapide, Ce PC)
+    bool unpinFailed = false;
 };
+std::wstring g_unpinQueued;  // désépinglage demandé pendant une lecture
 
 Node* NodeOf(HTREEITEM h) {
     if (!h) return nullptr;
@@ -413,18 +415,55 @@ void NavPane_SetImageList(HIMAGELIST il) {
     if (g_tree) TreeView_SetImageList(g_tree, il, TVSIL_NORMAL);  // le volet ne la détruit pas
 }
 
-void NavPane_RefreshPinned(bool force) {
-    if (!g_tree) return;
-    if (g_pinnedLoading) {
-        g_pinnedAgain |= force;
-        return;
+namespace {
+// Exécute le verbe « désépingler » de l'élément `path` de l'Accès rapide.
+bool UnpinFromQuickAccess(const std::wstring& path) {
+    ComPtr<IShellItem> qa;
+    if (FAILED(SHCreateItemFromParsingName(kQuickAccess, nullptr, IID_PPV_ARGS(&qa)))) return false;
+    ComPtr<IEnumShellItems> en;
+    if (FAILED(qa->BindToHandler(nullptr, BHID_EnumItems, IID_PPV_ARGS(&en))) || !en) return false;
+    for (ComPtr<IShellItem> it; en->Next(1, &it, nullptr) == S_OK; it.Reset()) {
+        PWSTR p = nullptr;
+        if (FAILED(it->GetDisplayName(SIGDN_FILESYSPATH, &p)) || !p) continue;
+        const bool same = SamePath(p, path);
+        CoTaskMemFree(p);
+        if (!same) continue;
+        ComPtr<IContextMenu> cm;
+        if (FAILED(it->BindToHandler(nullptr, BHID_SFUIObject, IID_PPV_ARGS(&cm)))) return false;
+        HMENU menu = CreatePopupMenu();
+        if (!menu) return false;
+        bool done = false;
+        constexpr UINT first = 1, last = 0x7FFF;
+        if (SUCCEEDED(cm->QueryContextMenu(menu, 0, first, last, CMF_NORMAL))) {
+            // Le nom du verbe varie selon la version (unpinfromhome, unpinfromquickaccess…).
+            const int count = GetMenuItemCount(menu);
+            for (int i = 0; i < count && !done; ++i) {
+                const UINT id = GetMenuItemID(menu, i);
+                if (id == (UINT)-1 || id < first || id > last) continue;  // sous-menu, séparateur
+                wchar_t verb[128] = {};
+                if (FAILED(cm->GetCommandString(id - first, GCS_VERBW, nullptr, (LPSTR)verb, _countof(verb)))) continue;
+                if (_wcsnicmp(verb, L"unpinfrom", 9) != 0) continue;
+                CMINVOKECOMMANDINFO ci{sizeof ci};
+                ci.lpVerb = MAKEINTRESOURCEA(id - first);
+                ci.nShow = SW_SHOWNORMAL;
+                ci.fMask = CMIC_MASK_FLAG_NO_UI;
+                done = SUCCEEDED(cm->InvokeCommand(&ci));
+                if (!done) break;
+            }
+        }
+        DestroyMenu(menu);
+        return done;
     }
-    if (!force && GetTickCount64() - g_pinnedAt < 2000) return;
+    return false;
+}
+
+void StartPinnedRead(const std::wstring& unpinFirst) {
     g_pinnedLoading = true;
     g_pinnedAt = GetTickCount64();
-    std::thread([] {
+    std::thread([unpinFirst] {
         auto* r = new Result{Result::Pinned};
         const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        if (!unpinFirst.empty()) r->unpinFailed = !UnpinFromQuickAccess(unpinFirst);
         r->folders = NavPane_ReadPinned();
         PIDLIST_ABSOLUTE p = nullptr;
         if (SUCCEEDED(SHParseDisplayName(kQuickAccess, nullptr, &p, 0, nullptr))) {
@@ -436,6 +475,26 @@ void NavPane_RefreshPinned(bool force) {
         if (SUCCEEDED(co)) CoUninitialize();
         Post(r);
     }).detach();
+}
+}  // namespace
+
+void NavPane_RefreshPinned(bool force) {
+    if (!g_tree) return;
+    if (g_pinnedLoading) {
+        g_pinnedAgain |= force;
+        return;
+    }
+    if (!force && GetTickCount64() - g_pinnedAt < 2000) return;
+    StartPinnedRead(L"");
+}
+
+void NavPane_UnpinWindows(const std::wstring& path) {
+    if (!g_tree) return;
+    if (g_pinnedLoading) {  // rare : la lecture en cours finit vite, on attend son résultat
+        g_unpinQueued = path;
+        return;
+    }
+    StartPinnedRead(path);
 }
 
 void NavPane_RefreshDrives() {
@@ -452,7 +511,13 @@ void NavPane_OnResult(LPARAM lp) {
     if (r->type == Result::Pinned) {
         g_pinnedLoading = false;
         g_shownPins = r->folders;
-        if (g_pinnedAgain) {
+        if (r->unpinFailed && g_host.status) g_host.status(L"Impossible de désépingler ce dossier de l'Accès rapide.");
+        if (!g_unpinQueued.empty()) {
+            const std::wstring p = std::move(g_unpinQueued);
+            g_unpinQueued.clear();
+            g_pinnedAgain = false;
+            StartPinnedRead(p);
+        } else if (g_pinnedAgain) {
             g_pinnedAgain = false;
             NavPane_RefreshPinned(true);
         }

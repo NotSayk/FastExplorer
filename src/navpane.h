@@ -22,6 +22,7 @@ struct NavHost {
     std::function<void(const std::wstring& path)> navigate;  // "" = Ce PC
     // Menu contextuel d'un dossier du volet (path : "" = Ce PC).
     std::function<void(const std::wstring& path, POINT screen)> contextMenu;
+    std::function<void(const std::wstring& text)> status;  // message pour la barre d'état
 };
 
 HWND NavPane_Create(HWND parent, UINT id, UINT msg, NavHost host);
@@ -50,6 +51,10 @@ enum class NavPin {
 NavPin NavPane_PinOf(const std::wstring& path);
 // Épingle / retire dans FastExplorer puis rafraîchit le volet ; false si échec.
 bool NavPane_Pin(const std::wstring& path, bool pin);
+// Désépingle de l'Accès rapide de Windows (verbe du Shell, sur un thread) puis
+// rafraîchit le volet. Le menu d'un dossier ouvert depuis son parent ne propose
+// que « Épingler » : seul l'élément de l'Accès rapide sait se désépingler.
+void NavPane_UnpinWindows(const std::wstring& path);
 
 // ── Lectures (n'importe quel thread ; utilisées par le volet et les tests) ──
 struct NavFolder {
