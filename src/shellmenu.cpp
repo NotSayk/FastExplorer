@@ -465,19 +465,39 @@ namespace {
 constexpr UINT kExtraFirst = kLast + 1;  // identifiants des MenuExtra, après ceux du Shell
 
 // Ajoute les commandes de l'application en tête de `menu` (suivies d'un séparateur).
+constexpr UINT kSubStride = 64;  // sous-menu i : identifiants kExtraFirst + (i + 1) * 64 + j
+
+// Ajoute les commandes de l'application en tête de `menu` (suivies d'un séparateur).
 void AddExtras(HMENU menu, const std::vector<MenuExtra>& extras, bool shell) {
     UINT pos = 0;
     for (size_t i = 0; i < extras.size(); ++i) {
-        if (shell && extras[i].onlyWithoutShell) continue;
-        InsertMenuW(menu, pos++, MF_BYPOSITION | MF_STRING | (extras[i].checked ? MF_CHECKED : 0), kExtraFirst + (UINT)i,
-                    extras[i].text.c_str());
+        const MenuExtra& x = extras[i];
+        if (shell && x.onlyWithoutShell) continue;
+        if (!x.sub.empty()) {
+            HMENU sub = CreatePopupMenu();
+            for (size_t j = 0; j < x.sub.size() && j < kSubStride; ++j)
+                AppendMenuW(sub, MF_STRING | (x.sub[j].checked ? MF_CHECKED : 0),
+                            kExtraFirst + ((UINT)i + 1) * kSubStride + (UINT)j, x.sub[j].text.c_str());
+            InsertMenuW(menu, pos++, MF_BYPOSITION | MF_POPUP, (UINT_PTR)sub, x.text.c_str());
+            continue;
+        }
+        InsertMenuW(menu, pos++, MF_BYPOSITION | MF_STRING | (x.checked ? MF_CHECKED : 0), kExtraFirst + (UINT)i,
+                    x.text.c_str());
     }
     if (pos && shell && GetMenuItemCount(menu) > (int)pos) InsertMenuW(menu, pos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
 }
 
 bool RunExtra(UINT cmd, const std::vector<MenuExtra>& extras) {
-    if (cmd < kExtraFirst || cmd - kExtraFirst >= extras.size()) return false;
-    if (extras[cmd - kExtraFirst].run) extras[cmd - kExtraFirst].run();
+    if (cmd < kExtraFirst) return false;
+    const UINT k = cmd - kExtraFirst;
+    if (k < kSubStride) {
+        if (k >= extras.size()) return false;
+        if (extras[k].run) extras[k].run();
+        return true;
+    }
+    const UINT i = k / kSubStride - 1, j = k % kSubStride;
+    if (i >= extras.size() || j >= extras[i].sub.size()) return false;
+    if (extras[i].sub[j].run) extras[i].sub[j].run();
     return true;
 }
 }  // namespace

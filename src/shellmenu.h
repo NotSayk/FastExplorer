@@ -28,6 +28,7 @@ struct MenuExtra {
     std::function<void()> run;
     bool onlyWithoutShell = false;  // seulement si le Shell ne fournit pas de menu
     bool checked = false;           // coche devant le texte
+    std::vector<MenuExtra> sub;     // non vide : sous-menu (run est alors ignoré)
 };
 
 // Affiche le menu à `pt` (coordonnées écran) et exécute la commande choisie.

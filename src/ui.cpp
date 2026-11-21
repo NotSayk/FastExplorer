@@ -11,6 +11,7 @@
 #include "foldersize.h"
 #include "icons.h"
 #include "index.h"
+#include "thumbs.h"
 #include "jobs.h"
 #include "listing.h"
 #include "crumbs.h"
@@ -56,6 +57,7 @@ constexpr UINT WM_APP_SELSUM = WM_APP + 10;     // sélection changée : résum�
 constexpr UINT WM_APP_TABEDIT = WM_APP + 11;    // Tab pendant un renommage : renommer l'élément suivant
 constexpr UINT WM_APP_CMDFAIL = WM_APP + 12;    // commande tapée dans la barre d'adresse impossible (lParam = std::wstring*)
 constexpr UINT WM_APP_DIRSIZE = WM_APP + 14;    // taille d'un dossier calculée (lParam = DirSizeResult*)
+constexpr UINT WM_APP_THUMB = WM_APP + 16;      // miniature lue (lParam = ThumbResult*)
 constexpr UINT WM_APP_INDEXDONE = WM_APP + 15;  // service de recherche installé / retiré (wParam = code, lParam = 1 : installé)
 constexpr UINT ID_SYS_INDEX = 0x0100;           // menu de la fenêtre : activer / désactiver la recherche instantanée
 constexpr UINT WM_APP_TESTDPI = WM_APP + 13;    // tests : comme WM_DPICHANGED (wParam = nouvelle échelle), que Windows
@@ -107,6 +109,8 @@ struct Pending {
 
 enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
 enum SizeState : uint8_t { SIZE_KNOWN = 1, SIZE_PARTIAL = 2, SIZE_PENDING = 4 };
+enum ThumbState : int32_t { THUMB_UNKNOWN = -1, THUMB_PENDING = -2, THUMB_NONE = -3 };
+enum ViewMode { VM_DETAILS, VM_LIST, VM_SMALL, VM_ICONS };
 
 // Ce qui est affiché. `order` : ligne → index d'entrée ; `rowOf` : l'inverse.
 struct View {
@@ -119,6 +123,7 @@ struct View {
     std::vector<uint8_t> cut;       // 1 = coupé (affiché estompé)
     std::vector<uint64_t> dirBytes; // taille calculée des dossiers (par index d'entrée)
     std::vector<uint8_t> dirState;  // SIZE_* (combinables)
+    std::vector<int32_t> thumb;     // modes icônes : place de la miniature (THUMB_* si négatif)
     uint64_t serial = 0;            // identifie la vue auprès du thread d'icônes
     double sortMs = 0;
 };
@@ -502,6 +507,200 @@ void OnDirSize(DirSizeResult* raw) {
     if (g_sizeWaiting && --g_sizeWaiting == 0 && g_sortCol == COL_SIZE) SortView();  // tout est mesuré : on retrie
 }
 
+// ───────────────────────────── Modes d'affichage ─────────────────────────────
+//
+// Détails, liste, petites icônes : liste d'images système (16 px × échelle).
+// Icônes (32 à 256 px) : notre propre liste d'images, à la taille demandée :
+// icônes système agrandies (liste « jumbo ») et miniatures, lues sur un thread.
+
+int g_viewMode = VM_DETAILS;
+int g_iconPx = 96;                    // taille des icônes à 96 ppp (VM_ICONS)
+HIMAGELIST g_bigList = nullptr;       // liste d'images des modes icônes
+int g_bigPx = 0;                      // sa taille en pixels réels
+std::unordered_map<int, int> g_bigSys;  // icône système → place dans g_bigList
+uint32_t g_bigOverlays = 0;           // surimpressions déjà déclarées (bits 1 à 15)
+int g_wheelAcc = 0;                   // Ctrl+molette : crans partiels (pavés tactiles)
+constexpr int kZoomPx[] = {32, 48, 64, 96, 128, 192, 256};
+
+bool BigMode() { return g_viewMode == VM_ICONS; }
+
+void ResetBigList() {
+    if (g_bigList) ImageList_Destroy(g_bigList);
+    g_bigPx = S(g_iconPx);
+    g_bigList = ImageList_Create(g_bigPx, g_bigPx, ILC_COLOR32, 64, 64);
+    g_bigSys.clear();
+    g_bigOverlays = 0;
+    if (HasView()) g_view.thumb.assign(g_view.data->entries.size(), THUMB_UNKNOWN);
+    if (HasView()) Thumbs_SetSerial(g_view.serial);  // demandes à l'ancienne taille abandonnées
+}
+
+// Beaucoup de miniatures accumulées (≈ 256 Ko chacune en très grandes icônes) : on repart de zéro.
+void TrimBigList() {
+    if (g_bigList && ImageList_GetImageCount(g_bigList) > 3000) ResetBigList();
+}
+
+// Icône système agrandie, ajoutée une fois à g_bigList.
+int SysSlot(int sys) {
+    if (auto it = g_bigSys.find(sys); it != g_bigSys.end()) return it->second;
+    IImageList* il = nullptr;
+    int slot = -1;
+    if (SUCCEEDED(SHGetImageList(g_bigPx > S(48) ? SHIL_JUMBO : SHIL_EXTRALARGE, __uuidof(IImageList), (void**)&il))) {
+        HICON ic = nullptr;
+        if (SUCCEEDED(il->GetIcon(sys, ILD_TRANSPARENT, &ic)) && ic) {
+            slot = ImageList_ReplaceIcon(g_bigList, -1, ic);  // mise à l'échelle par la liste d'images
+            DestroyIcon(ic);
+        }
+    }
+    g_bigSys[sys] = slot;
+    return slot;
+}
+
+// Surimpression système (flèche de raccourci, état cloud) déclarée dans g_bigList.
+void BigOverlay(int ov) {
+    if (ov <= 0 || ov > 15 || (g_bigOverlays & (1u << ov))) return;
+    g_bigOverlays |= 1u << ov;
+    IImageList* il = nullptr;
+    int img = -1;
+    if (SUCCEEDED(SHGetImageList(SHIL_SMALL, __uuidof(IImageList), (void**)&il)) && SUCCEEDED(il->GetOverlayImage(ov, &img)) &&
+        img >= 0)
+        if (const int slot = SysSlot(img); slot >= 0) ImageList_SetOverlayImage(g_bigList, slot, ov);
+}
+
+// Miniature (au plus px × px) posée en bas et au centre d'un carré transparent.
+int AddThumb(HBITMAP bmp) {
+    BITMAP bm{};
+    if (!GetObjectW(bmp, sizeof bm, &bm) || bm.bmWidth <= 0 || bm.bmHeight == 0) return -1;
+    const int px = g_bigPx;
+    const int w = std::min<int>(bm.bmWidth, px), h = std::min<int>(std::abs(bm.bmHeight), px);
+    BITMAPINFO bi{};
+    bi.bmiHeader = {sizeof(BITMAPINFOHEADER), bm.bmWidth, -std::abs(bm.bmHeight), 1, 32, BI_RGB};
+    std::vector<uint32_t> src((size_t)bm.bmWidth * std::abs(bm.bmHeight));
+    HDC dc = GetDC(nullptr);
+    const int got = GetDIBits(dc, bmp, 0, std::abs(bm.bmHeight), src.data(), &bi, DIB_RGB_COLORS);
+    BITMAPINFO di{};
+    di.bmiHeader = {sizeof(BITMAPINFOHEADER), px, -px, 1, 32, BI_RGB};
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(dc, &di, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, dc);
+    if (!got || !dib) {
+        if (dib) DeleteObject(dib);
+        return -1;
+    }
+    bool alpha = false;  // image opaque livrée avec un canal alpha nul : on la rend opaque
+    for (uint32_t p : src)
+        if (p >> 24) { alpha = true; break; }
+    auto* dst = (uint32_t*)bits;
+    memset(dst, 0, (size_t)px * px * 4);
+    const int x0 = (px - w) / 2, y0 = px - h;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const uint32_t p = src[(size_t)y * bm.bmWidth + x];
+            dst[(size_t)(y0 + y) * px + x0 + x] = alpha ? p : (p | 0xFF000000u);
+        }
+    const int slot = ImageList_Add(g_bigList, dib, nullptr);
+    DeleteObject(dib);
+    return slot;
+}
+
+void OnThumb(ThumbResult* raw) {
+    std::unique_ptr<ThumbResult> r(raw);
+    struct Bmp { HBITMAP b; ~Bmp() { if (b) DeleteObject(b); } } bmp{r->bmp};
+    if (!HasView() || !g_bigList || r->serial != g_view.serial || r->px != g_bigPx || r->idx >= g_view.thumb.size())
+        return;
+    const int slot = bmp.b ? AddThumb(bmp.b) : -1;
+    g_view.thumb[r->idx] = slot >= 0 ? slot : THUMB_NONE;
+    if (slot >= 0)
+        if (const int row = g_view.rowOf[r->idx]; row >= 0) ListView_RedrawItems(g_list, row, row);
+}
+
+// Image d'une entrée dans les modes icônes : miniature si elle existe, sinon l'icône agrandie.
+int BigImage(int idx, int sysIcon) {
+    int32_t& th = g_view.thumb[idx];
+    if (th == THUMB_UNKNOWN) {
+        const Entry& e = E(idx);
+        th = THUMB_NONE;
+        if (!g_view.data->isRoot() && Thumbs_Wanted(e.attr, e.size)) {
+            th = THUMB_PENDING;
+            Thumbs_Request(g_view.serial, (uint32_t)idx, Join(g_path, NameOf(idx)), g_bigPx);
+        }
+    }
+    return th >= 0 ? th : SysSlot(sysIcon);
+}
+
+void SaveViewMode() {
+    const DWORD mode = (DWORD)g_viewMode, px = (DWORD)g_iconPx;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"ViewMode", REG_DWORD, &mode, sizeof mode);
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"IconPx", REG_DWORD, &px, sizeof px);
+}
+
+// px96 : taille des icônes (VM_ICONS), 0 = inchangée.
+void ApplyViewMode(int mode, int px96, bool save = true) {
+    g_viewMode = mode;
+    if (px96) g_iconPx = std::clamp(px96, 32, 256);
+    const int focus = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED);
+    SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
+    if (BigMode()) {
+        if (!g_bigList || g_bigPx != S(g_iconPx)) ResetBigList();
+        ListView_SetImageList(g_list, g_bigList, LVSIL_NORMAL);
+        ListView_SetIconSpacing(g_list, g_bigPx + S(std::max(28, g_iconPx / 3)), g_bigPx + g_fontH * 2 + S(14));
+    }
+    static const DWORD kViews[] = {LV_VIEW_DETAILS, LV_VIEW_LIST, LV_VIEW_SMALLICON, LV_VIEW_ICON};
+    ListView_SetView(g_list, kViews[mode]);
+    if (focus >= 0) ListView_EnsureVisible(g_list, focus, FALSE);
+    SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_list, nullptr, TRUE);
+    if (save) SaveViewMode();
+}
+
+void LoadViewMode() {
+    DWORD mode = 0, px = 0, cb = sizeof mode;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"ViewMode", RRF_RT_REG_DWORD, nullptr, &mode, &cb) !=
+        ERROR_SUCCESS)
+        return;
+    cb = sizeof px;
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"IconPx", RRF_RT_REG_DWORD, nullptr, &px, &cb);
+    if (mode <= VM_ICONS && mode != VM_DETAILS) ApplyViewMode((int)mode, (int)px, false);
+}
+
+// Ctrl+molette : détails → liste → petites icônes → icônes de 32 à 256 px (et retour).
+void Zoom(int dir) {
+    int level;  // 0 détails, 1 liste, 2 petites icônes, 3… tailles d'icônes
+    if (g_viewMode != VM_ICONS) level = g_viewMode == VM_DETAILS ? 0 : g_viewMode == VM_LIST ? 1 : 2;
+    else {
+        level = 3;
+        for (int i = 0; i < (int)std::size(kZoomPx); ++i)
+            if (kZoomPx[i] <= g_iconPx) level = 3 + i;
+    }
+    level = std::clamp(level + dir, 0, 2 + (int)std::size(kZoomPx));
+    if (level < 3) ApplyViewMode(level == 0 ? VM_DETAILS : level == 1 ? VM_LIST : VM_SMALL, 0);
+    else ApplyViewMode(VM_ICONS, kZoomPx[level - 3]);
+}
+
+// Ctrl+Maj+1…6, comme l'Explorateur.
+void ViewByKey(int k) {
+    switch (k) {
+        case 1: ApplyViewMode(VM_ICONS, 256); break;  // très grandes icônes
+        case 2: ApplyViewMode(VM_ICONS, 96); break;   // grandes icônes
+        case 3: ApplyViewMode(VM_ICONS, 48); break;   // icônes moyennes
+        case 4: ApplyViewMode(VM_SMALL, 0); break;
+        case 5: ApplyViewMode(VM_LIST, 0); break;
+        case 6: ApplyViewMode(VM_DETAILS, 0); break;
+    }
+}
+
+MenuExtra ViewMenu() {
+    MenuExtra m;
+    m.text = L"Affichage";
+    const bool icons = g_viewMode == VM_ICONS;
+    m.sub = {{L"Très grandes icônes\tCtrl+Maj+1", [] { ViewByKey(1); }, false, icons && g_iconPx >= 192},
+             {L"Grandes icônes\tCtrl+Maj+2", [] { ViewByKey(2); }, false, icons && g_iconPx >= 80 && g_iconPx < 192},
+             {L"Icônes moyennes\tCtrl+Maj+3", [] { ViewByKey(3); }, false, icons && g_iconPx < 80},
+             {L"Petites icônes\tCtrl+Maj+4", [] { ViewByKey(4); }, false, g_viewMode == VM_SMALL},
+             {L"Liste\tCtrl+Maj+5", [] { ViewByKey(5); }, false, g_viewMode == VM_LIST},
+             {L"Détails\tCtrl+Maj+6", [] { ViewByKey(6); }, false, g_viewMode == VM_DETAILS}};
+    return m;
+}
+
 void FillDispInfo(LVITEMW& it) {
     const int idx = EntryAt(it.iItem);
     if (idx < 0) return;
@@ -517,11 +716,12 @@ void FillDispInfo(LVITEMW& it) {
                 Icons_Request(g_view.serial, (uint32_t)idx, Join(g_path, NameOf(idx)));
             }
         }
-        it.iImage = g_view.icons[idx];
+        it.iImage = BigMode() ? BigImage(idx, g_view.icons[idx]) : g_view.icons[idx];
     }
     if (it.mask & LVIF_STATE) {  // surimpression (flèche de raccourci, état cloud), élément coupé
         // Élément caché : estompé, comme dans l'Explorateur (même rendu qu'un élément coupé).
         const bool dim = g_view.cut[idx] || (!g_view.data->isRoot() && (e.attr & FILE_ATTRIBUTE_HIDDEN));
+        if (BigMode()) BigOverlay(g_view.overlays[idx]);
         it.state = INDEXTOOVERLAYMASK(g_view.overlays[idx]) | (dim ? LVIS_CUT : 0) |
                    (it.iItem == g_dropRow ? LVIS_DROPHILITED : 0);
         it.stateMask = LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED;
@@ -1057,6 +1257,7 @@ void OnResult(Result* raw) {
     const size_t n = d.entries.size();
     std::vector<int32_t> icons(n, -1);
     std::vector<uint8_t> overlays(n, 0), states(n, ICON_NONE);
+    std::vector<int32_t> thumbs(n, THUMB_UNKNOWN);
     for (size_t i = 0; i < n; ++i)
         if (d.entries[i].icon >= 0) { icons[i] = d.entries[i].icon; states[i] = ICON_OWN; }
     if (refresh && HasView() && g_view.data->path == d.path) {
@@ -1068,6 +1269,8 @@ void OnResult(Result* raw) {
         for (size_t j = 0; j < n; ++j) {
             auto it = oldIdx.find(std::wstring_view(d.name(d.entries[j]), d.entries[j].nameLen));
             if (it == oldIdx.end()) continue;
+            if ((size_t)it->second < g_view.thumb.size() && g_view.thumb[it->second] >= 0)
+                thumbs[j] = g_view.thumb[it->second];
             const uint8_t st = g_view.iconState[it->second];
             if (st != ICON_GENERIC && st != ICON_OWN) continue;  // une demande en vol sera refaite
             icons[j] = g_view.icons[it->second];
@@ -1082,8 +1285,11 @@ void OnResult(Result* raw) {
     g_view.icons = std::move(icons);
     g_view.overlays = std::move(overlays);
     g_view.iconState = std::move(states);
+    g_view.thumb = std::move(thumbs);
     g_view.serial = ++g_viewSerial;
     Icons_SetSerial(g_view.serial);
+    Thumbs_SetSerial(g_view.serial);
+    if (!refresh) TrimBigList();  // miniatures du dossier précédent : place libérée au besoin
     InitDirSizes();
     if (g_sortCol == COL_SIZE && d.entries.size() <= kSyncSortMax &&
         std::any_of(g_view.dirState.begin(), g_view.dirState.end(), [](uint8_t s) { return s != 0; }))
@@ -2231,6 +2437,7 @@ void ShowContextMenu(LPARAM lp) {
     } else if (sel.empty() && !g_path.empty()) {  // fond du dossier : annuler / rétablir, options d'affichage
         if (!g_undo.empty()) extras.push_back({L"Annuler " + StepText(g_undo.back()) + L"\tCtrl+Z", Undo});
         if (!g_redo.empty()) extras.push_back({L"Rétablir " + StepText(g_redo.back()) + L"\tCtrl+Y", Redo});
+        extras.push_back(ViewMenu());
         extras.push_back({L"Afficher les éléments masqués", ToggleHidden, false, g_prefs.showHidden});
         extras.push_back({L"Afficher les extensions de noms de fichiers", ToggleExtensions, false, g_prefs.showExtensions});
     }
@@ -2701,6 +2908,7 @@ void CreateChildren(HWND hwnd) {
     UpdateSortArrow();
     UpdateButtons();
     UpdateTabStrip();
+    LoadViewMode();  // mode d'affichage de la dernière session
     Layout();  // fenêtre encore invisible : aucun repaint
 }
 
@@ -2714,6 +2922,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             CreateChildren(hwnd);
             NavPane_SetViewPrefs(g_prefs);
             Icons_Start(hwnd, WM_APP_ICON);
+            Thumbs_Start(hwnd, WM_APP_THUMB);
             DirSizes_Start(hwnd, WM_APP_DIRSIZE);
             AddClipboardFormatListener(hwnd);
             RegisterDrop();
@@ -2761,6 +2970,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_CAPTURECHANGED: g_splitDrag = false; return 0;
         case WM_APP_ICON: OnIcon((IconResult*)lp); return 0;
+        case WM_APP_THUMB: OnThumb((ThumbResult*)lp); return 0;
         case WM_APP_DIRSIZE: OnDirSize((DirSizeResult*)lp); return 0;
         case WM_APP_DIRCHANGED: OnDirChanged((uintptr_t)wp, lp); return 0;
         case WM_DEVICECHANGE: return OnDeviceChange(wp, lp);
@@ -2834,6 +3044,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_dpi = nd;
             ApplyFont();
             ApplyImageList();
+            if (BigMode()) ApplyViewMode(g_viewMode, 0, false);  // icônes à la nouvelle échelle
             const RECT* r = (const RECT*)lp;
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
@@ -2940,6 +3151,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DESTROY:
             g_target.store(nullptr);
             Icons_Stop();
+            Thumbs_Stop();
             DirSizes_Stop();
             Watch_Stop();
             ShellMenu_Discard(true);
@@ -2966,6 +3178,14 @@ bool HandleGlobalKeys(const MSG& m) {
     // gestionnaires du Shell), sans rien coûter à l'interface. Au clic droit,
     // il ne reste qu'à l'afficher.
     // (Minuteur à nous : la liste redéfinit elle-même TrackMouseEvent.)
+    // Ctrl+molette sur la liste : taille des icônes / mode d'affichage.
+    if (m.message == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(m.wParam) & MK_CONTROL) &&
+        (m.hwnd == g_list || GetParent(m.hwnd) == g_list)) {
+        g_wheelAcc += GET_WHEEL_DELTA_WPARAM(m.wParam);
+        while (g_wheelAcc >= WHEEL_DELTA) { g_wheelAcc -= WHEEL_DELTA; Zoom(1); }
+        while (g_wheelAcc <= -WHEEL_DELTA) { g_wheelAcc += WHEEL_DELTA; Zoom(-1); }
+        return true;
+    }
     if (m.hwnd == g_list && m.message == WM_MOUSEMOVE) {
         if (!(m.wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))) SetTimer(g_hwnd, TIMER_HOVER, kMenuHoverMs, nullptr);
         return false;
@@ -3070,6 +3290,10 @@ bool HandleGlobalKeys(const MSG& m) {
             case VK_TAB: SwitchTab((g_tab + (sh ? n - 1 : 1)) % n); return true;
             case VK_PRIOR: SwitchTab((g_tab + n - 1) % n); return true;
             case VK_NEXT: SwitchTab((g_tab + 1) % n); return true;
+        }
+        if (sh && m.wParam >= '1' && m.wParam <= '6') {  // Ctrl+Maj+1…6 : mode d'affichage
+            ViewByKey((int)(m.wParam - '0'));
+            return true;
         }
         if (m.wParam >= '1' && m.wParam <= '9' && !sh) {
             SwitchTab(m.wParam == '9' ? n - 1 : std::min<size_t>(m.wParam - '1', n - 1));
