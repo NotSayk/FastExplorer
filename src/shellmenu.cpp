@@ -115,20 +115,116 @@ bool Invoke(IContextMenu* cm, HWND owner, UINT offset, const char* verb, const s
     return SUCCEEDED(cm->InvokeCommand((LPCMINVOKECOMMANDINFO)&ici));
 }
 
-}  // namespace
+struct Built {
+    ComPtr<IContextMenu> cm;
+    HMENU menu = nullptr;
+};
 
-bool ShellMenu_Show(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, POINT pt,
-                    bool extended, const VerbFilter& filter) {
+Built Build(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, bool extended) {
+    Built b;
     ComPtr<IContextMenu> cm = BuildMenu(owner, folder, names);
-    if (!cm) return false;
+    if (!cm) return b;
     HMENU menu = CreatePopupMenu();
-    if (!menu) return false;
+    if (!menu) return b;
     const UINT flags = CMF_NORMAL | (extended ? CMF_EXTENDEDVERBS : 0);
     if (FAILED(cm->QueryContextMenu(menu, 0, kFirst, kLast, flags))) {
         DestroyMenu(menu);
-        return false;
+        return b;
     }
     RemoveDuplicates(menu);
+    b.cm = std::move(cm);
+    b.menu = menu;
+    return b;
+}
+
+// Menu préparé au bouton enfoncé, en attente du WM_CONTEXTMENU.
+struct Prepared {
+    std::wstring folder;
+    std::vector<std::wstring> names;
+    bool extended = false;
+    ULONGLONG tick = 0;
+    Built built;
+} g_prep;
+
+constexpr ULONGLONG kPrepMaxAgeMs = 3000;  // au-delà, le menu peut ne plus refléter le disque
+
+void DropPrepared() {
+    if (g_prep.built.menu) DestroyMenu(g_prep.built.menu);
+    g_prep = Prepared{};
+}
+
+}  // namespace
+
+bool ShellMenu_Prepare(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, bool extended) {
+    DropPrepared();
+    Built b = Build(owner, folder, names, extended);
+    if (!b.menu) return false;
+    g_prep.folder = folder;
+    g_prep.names = names;
+    g_prep.extended = extended;
+    g_prep.tick = GetTickCount64();
+    g_prep.built = std::move(b);
+    return true;
+}
+
+void ShellMenu_Discard() { DropPrepared(); }
+
+void ShellMenu_WarmUp(const std::wstring& folder, const std::vector<std::wstring>& names) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    struct Args {
+        std::wstring folder;
+        std::vector<std::wstring> names;
+    };
+    auto* a = new Args{folder, names};
+    HANDLE th = CreateThread(
+        nullptr, 0,
+        [](void* p) -> DWORD {
+            std::unique_ptr<Args> args((Args*)p);
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            if (FAILED(OleInitialize(nullptr))) return 0;
+            HWND w = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
+            std::vector<std::vector<std::wstring>> targets{{}};  // fond du dossier d'abord (Nouveau ▸)
+            for (const auto& n : args->names) targets.push_back({n});
+            for (const auto& t : targets) {
+                Built b = Build(w, args->folder, t, false);
+                if (!b.menu) continue;
+                // Sous-menus remplis à l'ouverture (Nouveau ▸, Ouvrir avec ▸) : les plus lents à froid.
+                ComPtr<IContextMenu3> cm3;
+                b.cm.As(&cm3);
+                for (int i = 0; cm3 && i < GetMenuItemCount(b.menu); ++i) {
+                    if (HMENU s = GetSubMenu(b.menu, i)) {
+                        LRESULT lr = 0;
+                        cm3->HandleMenuMsg2(WM_INITMENUPOPUP, (WPARAM)s, (LPARAM)i, &lr);
+                    }
+                }
+                cm3.Reset();
+                DestroyMenu(b.menu);
+            }
+            if (w) DestroyWindow(w);
+            // Les DLL chargées restent en mémoire : le thread de l'interface en profite.
+            OleUninitialize();
+            return 0;
+        },
+        a, 0, nullptr);
+    if (th) CloseHandle(th);
+    else delete a;
+}
+
+bool ShellMenu_Show(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, POINT pt,
+                    bool extended, const VerbFilter& filter) {
+    Built b;
+    if (g_prep.built.menu && g_prep.folder == folder && g_prep.names == names && g_prep.extended == extended &&
+        GetTickCount64() - g_prep.tick < kPrepMaxAgeMs) {
+        b = std::move(g_prep.built);
+        g_prep.built = Built{};
+    }
+    DropPrepared();
+    if (!b.menu) b = Build(owner, folder, names, extended);
+    if (!b.menu) return false;
+    ComPtr<IContextMenu> cm = std::move(b.cm);
+    HMENU menu = b.menu;
     cm.As(&g_cm3);
     if (!g_cm3) cm.As(&g_cm2);
     const UINT cmd = (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, owner, nullptr);

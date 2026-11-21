@@ -405,6 +405,24 @@ void Resort(int col) {
     });
 }
 
+// Premier vrai dossier affiché : préchauffe les menus contextuels (une fois)
+// avec le fond du dossier, un sous-dossier et un fichier présents sur le disque.
+void WarmUpMenus(const DirData& d) {
+    constexpr DWORD kNotLocal =
+        FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE;
+    std::vector<std::wstring> names;
+    bool dir = false, file = false;
+    for (const Entry& e : d.entries) {
+        if (e.attr & kNotLocal) continue;  // ne jamais provoquer de téléchargement cloud
+        bool& got = e.isDir() ? dir : file;
+        if (got) continue;
+        got = true;
+        names.emplace_back(d.name(e), e.nameLen);
+        if (dir && file) break;
+    }
+    ShellMenu_WarmUp(d.path, names);
+}
+
 void OnResult(Result* raw) {
     std::unique_ptr<Result> r(raw);
     if (r->gen != Jobs_Current()) return;  // périmé
@@ -515,6 +533,7 @@ void OnResult(Result* raw) {
     UpdateButtons();
     if (g_startupMs < 0) g_startupMs = MsSinceProcessStart();  // premier affichage réellement peint
     ShowSummary();
+    if (!g_path.empty()) WarmUpMenus(d);
 }
 
 void GoBack() { if (!g_back.empty()) Navigate(g_back.back(), Nav::Back); }
@@ -604,6 +623,25 @@ void ShowContextMenu(LPARAM lp) {
                                        return false;
                                    });
     if (!ok) SetStatus(L"Menu contextuel indisponible pour cet emplacement.");
+}
+
+// Bouton droit enfoncé : on construit le menu pendant que l'utilisateur relâche
+// (un clic dure ~100 ms, autant que les gestionnaires du Shell). La sélection
+// est celle que la liste aura au WM_CONTEXTMENU : l'élément cliqué s'il n'était
+// pas sélectionné, la sélection entière sinon, le fond du dossier dans le vide.
+// Si la prédiction se révèle fausse, ShellMenu_Show reconstruit simplement.
+void PrepareContextMenu(LPARAM lp, bool shift) {
+    if (!HasView()) return;
+    LVHITTESTINFO hit{};
+    hit.pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+    const int row = ListView_HitTest(g_list, &hit);
+    std::vector<int> sel;
+    if (row >= 0) {
+        if (ListView_GetItemState(g_list, row, LVIS_SELECTED) & LVIS_SELECTED) sel = SelectedEntries();
+        else if (int e = EntryAt(row); e >= 0) sel = {e};
+        else return;
+    }
+    ShellMenu_Prepare(g_hwnd, g_path, NamesOf(sel), shift);
 }
 
 // Alt+Entrée : propriétés de la sélection, ou du dossier courant si rien n'est sélectionné.
@@ -839,6 +877,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_target.store(nullptr);
             Icons_Stop();
             Watch_Stop();
+            ShellMenu_Discard();
             Jobs_NewGeneration();  // périme et interrompt la tâche en cours
             PostQuitMessage(0);
             return 0;
@@ -848,6 +887,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // Raccourcis globaux, traités avant TranslateMessage (pas de bip, pas de WM_CHAR parasite).
 bool HandleGlobalKeys(const MSG& m) {
+    if (m.message == WM_RBUTTONDOWN && m.hwnd == g_list) {
+        PrepareContextMenu(m.lParam, (m.wParam & MK_SHIFT) != 0);
+        return false;  // la liste traite ensuite le clic normalement (sélection)
+    }
     const HWND focus = GetFocus();
     if (m.message == WM_XBUTTONUP) {
         if (GET_XBUTTON_WPARAM(m.wParam) == XBUTTON1) GoBack(); else GoForward();

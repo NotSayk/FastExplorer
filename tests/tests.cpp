@@ -342,6 +342,17 @@ void TestShortcut() {
     CHECK(!ResolveShortcut(Join(g_root, L"a2.txt"), none));  // pas un raccourci
 }
 
+void TestPrepareMenu() {
+    // Menu préparé au bouton enfoncé : construit pour un fichier, un dossier et
+    // le fond ; refusé pour un élément absent ; libéré sans fuite (ASan).
+    CHECK(ShellMenu_Prepare(nullptr, g_root, {L"a2.txt"}, false));
+    CHECK(ShellMenu_Prepare(nullptr, g_root, {L"zdir"}, true));
+    CHECK(ShellMenu_Prepare(nullptr, g_root, {}, false));
+    CHECK(!ShellMenu_Prepare(nullptr, g_root, {L"absent.txt"}, false));
+    ShellMenu_Discard();
+    ShellMenu_Discard();  // deux fois : sans effet
+}
+
 void TestEnumerateFileIsNotDirectory() {
     DirData d;
     d.path = Join(g_root, L"a2.txt");
@@ -413,6 +424,7 @@ int wmain() {
     TestCancelHungNetworkPath();
     TestShortcut();
     TestEnumerateFileIsNotDirectory();
+    TestPrepareMenu();
     TestWatch();
     RemoveTree(g_root);
     printf("\n%d verifications OK, %d echec(s)\n", g_pass, g_fail);

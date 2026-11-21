@@ -21,6 +21,20 @@ using VerbFilter = std::function<bool(const std::wstring& verb)>;
 bool ShellMenu_Show(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, POINT pt,
                     bool extended, const VerbFilter& filter);
 
+// Construit le menu à l'avance (≈100 ms de gestionnaires Shell), au moment où
+// le bouton droit s'enfonce : ShellMenu_Show le réutilise s'il vise les mêmes
+// éléments, et l'affiche donc dès le relâchement.
+bool ShellMenu_Prepare(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, bool extended);
+
+// Libère un menu préparé et non affiché (avant OleUninitialize).
+void ShellMenu_Discard();
+
+// Une fois par processus, sur un thread de fond : charge les gestionnaires du
+// Shell (DLL d'extensions, associations, sous-menu Nouveau ▸) en construisant
+// les menus du fond du dossier et des éléments donnés. Le premier clic droit
+// passe ainsi de ~1,5 s à ~0,1 s.
+void ShellMenu_WarmUp(const std::wstring& folder, const std::vector<std::wstring>& names);
+
 // Exécute directement un verbe ("properties", "delete"…) sur des éléments.
 bool ShellMenu_Invoke(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names,
                       const char* verb);
