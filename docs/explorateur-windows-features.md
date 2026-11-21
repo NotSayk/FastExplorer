@@ -28,7 +28,7 @@ De haut en bas :
 | **Barre d'onglets** (barre de titre) | Onglets, bouton « + », boutons fenêtre | P1 |
 | **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅🟡 P0 |
 | **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | P1 |
-| **Volet de navigation** (gauche) | Accueil, Galerie, OneDrive, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | P0 |
+| **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | P0 |
 | **Zone de contenu** | La liste des éléments | ✅ P0 |
 | **Volet d'aperçu / de détails** (droite) | Aperçu du fichier, ou métadonnées | P1 |
 | **Barre d'état** (bas) | Nombre d'éléments, nombre et taille de la sélection, boutons Détails / Grandes icônes | ✅🟡 P0 |
@@ -77,8 +77,7 @@ De haut en bas :
 | Emplacement | Ce que c'est | Prio |
 |---|---|---|
 | **Accueil** (Home) | Page d'accueil : *Accès rapide* (dossiers épinglés et fréquents), *Favoris* (fichiers épinglés), *Récents*, *Recommandés* (2025 : aussi pour les comptes locaux et Microsoft), *Partagés* (comptes pro). Colonne « Activité » avec avatars pour les comptes Entra ID. Depuis 2026 : « Ouvrir l'emplacement du fichier » et « Demander à Copilot » (comptes pro/scolaires) | P1 (Accès rapide), P3 (le reste) |
-| **Galerie** | Mosaïque chronologique de toutes les photos (dossier Images + sources ajoutées, OneDrive, iCloud), regroupées par mois, filtre de collection | P2 |
-| **OneDrive** / autres clouds | Racine du fournisseur cloud, avec états de synchronisation | P2 |
+| **Galerie** | Mosaïque chronologique de toutes les photos (dossier Images + sources ajoutées), regroupées par mois, filtre de collection | P2 |
 | **Dossiers épinglés** | Bureau, Téléchargements, Documents, Images, Musique, Vidéos + vos épingles (« Épingler à Accès rapide ») | **P0** |
 | **Ce PC** | Lecteurs (avec jauge d'espace libre), dossiers de l'utilisateur, emplacements réseau, appareils (téléphones MTP, appareils photo) | ✅🟡 P0 (jauge et libellé de volume manquants) |
 | **Réseau** | Machines découvertes (SMB, WSD), serveurs multimédia (DLNA), routeurs (UPnP) | P2 |
@@ -380,8 +379,8 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | États de synchro | Nuage (en ligne uniquement), coche verte creuse (disponible localement), coche pleine (toujours conserver), flèches (synchro en cours), croix rouge (erreur) | P2 ⚙️ attributs `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` / `PINNED` / `UNPINNED` + Cloud Files API |
 | Toujours conserver / Libérer de l'espace | Menu contextuel | P2 |
 | **Ne pas déclencher de téléchargement** | Lire les métadonnées d'un fichier « en ligne uniquement » ne doit **jamais** le télécharger (miniatures et aperçus compris) | **P0** (piège de performance majeur) |
-| Partager | Lien OneDrive/SharePoint, ou partage proche (Nearby Share), envoi par mail ou application | P3 |
-| Autres fournisseurs | Dropbox, Google Drive, iCloud, Box : mêmes mécanismes (Cloud Files API) | P2 |
+| Partager | Partage proche (Nearby Share), envoi par mail ou application | P3 |
+| Fournisseurs | Dropbox, Google Drive, iCloud, Box : mêmes mécanismes (Cloud Files API) | P2 |
 | Colonne État / Disponibilité | Vue Détails | P2 |
 
 ---
@@ -437,7 +436,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 Accès : « … » ▸ Options. Trois onglets. Une ⭐ signale les options que nous devrions reprendre.
 
 ### Général
-- Ouvrir l'Explorateur sur : **Accueil** / **Ce PC** / OneDrive ⭐
+- Ouvrir l'Explorateur sur : **Accueil** / **Ce PC** ⭐
 - Parcourir les dossiers : même fenêtre / nouvelle fenêtre
 - Cliquer : **simple clic** (souligner les titres : toujours ou au survol) / double-clic ⭐
 - Confidentialité : fichiers récemment utilisés, dossiers fréquents, fichiers Office.com, recommandations ; **Effacer** l'historique ⭐
@@ -576,7 +575,7 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | Sujet | Comment ça marche |
 |---|---|
 | **Espace de noms Shell** | Tout est un `IShellItem` / PIDL : fichiers, mais aussi Ce PC, Réseau, téléphone, Corbeille, Panneau de configuration. Les emplacements virtuels **n'ont pas de chemin Win32**. FastExplorer lit les dossiers Win32 par l'API NT (rapide) et devra passer par le Shell pour les emplacements virtuels (MTP, Corbeille, Réseau, Galerie). |
-| **Known Folders** | Emplacements standard (Documents, Téléchargements…) via `SHGetKnownFolderPath(FOLDERID_*)`, jamais en dur (ils peuvent être déplacés ou redirigés vers OneDrive). Noms localisés via `desktop.ini` (`LocalizedResourceName`). |
+| **Known Folders** | Emplacements standard (Documents, Téléchargements…) via `SHGetKnownFolderPath(FOLDERID_*)`, jamais en dur (ils peuvent être déplacés ou redirigés vers un cloud ou un serveur). Noms localisés via `desktop.ini` (`LocalizedResourceName`). |
 | **Extensions Shell** | Menus contextuels (`IContextMenu`, `IExplorerCommand`), propriétés (`IPropertyStore` + property handlers), miniatures (`IThumbnailProvider`), aperçus (`IPreviewHandler`), surimpressions (`IShellIconOverlayIdentifier`), feuilles de propriétés, gestionnaires de glisser-déposer, copy hooks. Code tiers chargé **dans le processus** : un plantage ou une lenteur d'extension affecte l'application. Les héberger avec prudence (hors du thread de l'interface, délai maximal). |
 | **Moteur de copie** | `IFileOperation` : conflits, progression, annulation, élévation, Corbeille ; s'intègre à l'historique d'annulation de l'Explorateur. |
 | **Notifications de changement** | `ReadDirectoryChangesW` (par dossier, précis) et `SHChangeNotifyRegister` (événements Shell : lecteurs, renommages par d'autres applications). Il faut fusionner les rafales d'événements (copie de 10 000 fichiers). |
