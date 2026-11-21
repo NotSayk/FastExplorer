@@ -48,6 +48,9 @@ constexpr UINT WM_APP_SHELLNOTIFY = WM_APP + 8; // lecteur ou média ajouté / r
 constexpr UINT_PTR TIMER_LOADING = 1;
 constexpr UINT_PTR TIMER_WATCH = 2;
 constexpr UINT_PTR TIMER_AFTEROP = 3;
+constexpr UINT_PTR TIMER_HOVER = 6;   // souris immobile sur la liste : préparer le menu contextuel
+constexpr UINT kMenuHoverMs = 100;
+constexpr UINT_PTR TIMER_PROGRESS = 7;  // progression des copies de notre moteur
 constexpr UINT_PTR TIMER_DRIVES = 4;  // Ce PC : regroupe les annonces d'arrivée / retrait de lecteurs
 constexpr UINT_PTR TIMER_EJECT = 5;   // éjection demandée : si elle échoue, on reprend la surveillance  // resélection après une opération, différée pendant un renommage
 constexpr UINT kLoadingDelayMs = 150;   // en dessous, aucun « Chargement… » (évite le clignotement)
@@ -114,6 +117,8 @@ double g_startupMs = -1;  // -1 = pas encore mesuré, 0 = déjà affiché
 uint64_t g_viewSerial = 0;
 uintptr_t g_watchId = 0;
 std::wstring g_watchPath;
+bool g_progressShown = false;  // la barre d'état montre une copie en cours
+ITaskbarList3* g_taskbar = nullptr;
 std::wstring g_goneNote;  // « X n'est plus accessible » : reste affiché tant qu'on ne navigue pas ailleurs
 std::wstring g_watchFailed;  // surveillance impossible ici (droits, réseau) : pas de boucle de relances
 bool g_watchPending = false;  // un rafraîchissement est programmé
@@ -172,7 +177,7 @@ void OpenWithShell(const std::wstring& full) {
 }
 
 void ShowSummary() {
-    if (!HasView()) return;
+    if (!HasView() || g_progressShown) return;
     const DirData& d = *g_view.data;
     wchar_t s[512];
     int k = swprintf_s(s, L"%zu éléments  (%zu dossiers, %zu fichiers)   •   lecture %.2f ms, clés %.2f ms, tri %.2f ms",
@@ -597,6 +602,7 @@ void OnResult(Result* raw) {
     RedrawWindow(g_list, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
     UpdateButtons();
     if (g_startupMs < 0) g_startupMs = MsSinceProcessStart();  // premier affichage réellement peint
+    ShellMenu_Discard();  // contenu du dossier relu : le menu préparé peut ne plus être exact
     if (!d.vanished.empty()) g_goneNote = L"« " + d.vanished + L" » n'est plus accessible";
     else if (p.nav != Nav::Refresh) g_goneNote.clear();
     ShowSummary();
@@ -697,7 +703,57 @@ std::vector<std::wstring> NamesOf(const std::vector<int>& entries) {
 
 bool CanModify() { return HasView() && !g_view.data->isRoot(); }
 
-void StartOp(FileOp op) { FileOps_Start(g_hwnd, g_hwnd, WM_APP_FILEOP, std::move(op)); }
+void StartOp(FileOp op) {
+    FileOps_Start(g_hwnd, g_hwnd, WM_APP_FILEOP, std::move(op));
+    SetTimer(g_hwnd, TIMER_PROGRESS, 200, nullptr);
+}
+
+void TaskbarProgress(TBPFLAG state, uint64_t done = 0, uint64_t total = 0) {
+    if (!g_taskbar) {
+        if (state == TBPF_NOPROGRESS ||
+            FAILED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_taskbar))))
+            return;
+        if (FAILED(g_taskbar->HrInit())) {
+            g_taskbar->Release();
+            g_taskbar = nullptr;
+            return;
+        }
+    }
+    g_taskbar->SetProgressState(g_hwnd, state);
+    if (state == TBPF_NORMAL) g_taskbar->SetProgressValue(g_hwnd, done, total);
+}
+
+std::wstring SizeText(uint64_t bytes) {
+    wchar_t b[64];
+    StrFormatByteSizeEx(bytes, SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, b, _countof(b));
+    return b;
+}
+
+// Copies de notre moteur : progression dans la barre d'état et sur le bouton de
+// la barre des tâches (rien pour une opération de moins d'une demi-seconde).
+void OnProgressTimer() {
+    FileOpsProgress p;
+    if (!FileOps_Progress(p)) {
+        if (FileOps_Running() == 0) KillTimer(g_hwnd, TIMER_PROGRESS);
+        if (g_progressShown) {
+            g_progressShown = false;
+            TaskbarProgress(TBPF_NOPROGRESS);
+            ShowSummary();
+        }
+        return;
+    }
+    if (GetTickCount64() - p.start < 500) return;
+    g_progressShown = true;
+    const bool bytes = p.bytesTotal > 0;
+    const uint64_t done = bytes ? p.bytesDone : p.filesDone, total = bytes ? p.bytesTotal : p.filesTotal;
+    std::wstring s = p.move ? L"Déplacement : " : L"Copie : ";
+    s += std::to_wstring(p.filesDone) + L" / " + std::to_wstring(p.filesTotal) + L" fichiers";
+    if (bytes) s += L"   •   " + SizeText(p.bytesDone) + L" / " + SizeText(p.bytesTotal);
+    if (total) s += L"   •   " + std::to_wstring(done * 100 / total) + L" %";
+    s += L"   •   Échap pour annuler";
+    SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)s.c_str());
+    TaskbarProgress(TBPF_NORMAL, done, total ? total : 1);
+}
 
 // Rafraîchit le dossier en sélectionnant `names` (et renomme `edit`), dès
 // qu'aucun renommage ni aucune navigation n'est en cours.
@@ -764,6 +820,7 @@ void CopyNames(const std::vector<std::wstring>& names, bool cut) {
 }
 
 void OnClipboardUpdate() {
+    ShellMenu_Discard();  // « Coller » du menu préparé n'est plus à jour
     if (g_cut.names.empty() || Clipboard_IsOurs()) return;
     g_cut.names.clear();  // le presse-papiers a changé : plus rien n'est « coupé »
     ApplyCutMarks();
@@ -944,6 +1001,13 @@ void RegisterDrop() {
     h.dropped = [](bool intoFolder) {
         if (intoFolder && HasView()) g_expectNew = {g_view.data, GetTickCount64() + 15000, true};
     };
+    h.transfer = [](const std::wstring& dest, std::vector<std::wstring> paths, bool move) {
+        FileOp op;
+        op.kind = move ? FileOpKind::Move : FileOpKind::Copy;
+        op.folder = dest;
+        op.paths = std::move(paths);
+        StartOp(std::move(op));
+    };
     DragDrop_RegisterTarget(g_list, std::move(h));
 }
 
@@ -1079,7 +1143,7 @@ LRESULT OnDeviceChange(WPARAM wp, LPARAM lp) {
         // (sinon Windows répond « périphérique en cours d'utilisation »).
         Watch_Stop(true);
         g_watchPath.clear();
-        ShellMenu_Discard();
+        ShellMenu_Discard(true);
         SetTimer(g_hwnd, TIMER_EJECT, 3000, nullptr);  // éjection refusée ailleurs : on reprendra la surveillance
         return TRUE;
     }
@@ -1312,6 +1376,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (wp == TIMER_WATCH) { OnWatchTimer(); return 0; }
             if (wp == TIMER_AFTEROP) { ApplyAfterOp(); return 0; }
+            if (wp == TIMER_PROGRESS) { OnProgressTimer(); return 0; }
+            if (wp == TIMER_HOVER) {
+                KillTimer(hwnd, wp);
+                POINT c;
+                if (!g_editing && GetCursorPos(&c) && WindowFromPoint(c) == g_list && ScreenToClient(g_list, &c))
+                    PrepareContextMenu(MAKELPARAM(c.x, c.y), GetKeyState(VK_SHIFT) < 0);
+                return 0;
+            }
             if (wp == TIMER_DRIVES || wp == TIMER_EJECT) {
                 if (g_pending.active || g_editing) return 0;  // le minuteur reste armé : on réessaie
                 KillTimer(hwnd, wp);
@@ -1346,7 +1418,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_target.store(nullptr);
             Icons_Stop();
             Watch_Stop();
-            ShellMenu_Discard();
+            ShellMenu_Discard(true);
+            if (g_taskbar) g_taskbar->Release();
+            g_taskbar = nullptr;
             RemoveClipboardFormatListener(hwnd);
             DragDrop_RevokeTarget(g_list);
             if (g_shellNotify) SHChangeNotifyDeregister(g_shellNotify);
@@ -1363,6 +1437,14 @@ bool HandleGlobalKeys(const MSG& m) {
     if (m.message == WM_RBUTTONDOWN && m.hwnd == g_list) {
         PrepareContextMenu(m.lParam, (m.wParam & MK_SHIFT) != 0);
         return false;  // la liste traite ensuite le clic normalement (sélection)
+    }
+    // Survol : le menu contextuel se construit déjà sur son thread (≈100 ms de
+    // gestionnaires du Shell), sans rien coûter à l'interface. Au clic droit,
+    // il ne reste qu'à l'afficher.
+    // (Minuteur à nous : la liste redéfinit elle-même TrackMouseEvent.)
+    if (m.hwnd == g_list && m.message == WM_MOUSEMOVE) {
+        if (!(m.wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))) SetTimer(g_hwnd, TIMER_HOVER, kMenuHoverMs, nullptr);
+        return false;
     }
     if (g_editing) return false;  // saisie d'un nom : toutes les touches vont à la zone d'édition
     const HWND focus = GetFocus();
@@ -1400,9 +1482,15 @@ bool HandleGlobalKeys(const MSG& m) {
             if (focus == g_addr) { NavigateAddress(); return true; }
             if (focus == g_list) { Activate(ListView_GetNextItem(g_list, -1, LVNI_FOCUSED)); return true; }
             return false;
-        case VK_ESCAPE:
+        case VK_ESCAPE: {
             if (focus == g_addr) { SetWindowTextW(g_addr, g_path.c_str()); SetFocus(g_list); return true; }
+            FileOpsProgress p;
+            if (FileOps_Progress(p)) {  // copie en cours : on l'arrête (ce qui est copié reste)
+                FileOps_Cancel();
+                return true;
+            }
             return false;
+        }
         case VK_BACK:
             if (focus == g_list) { GoUp(); return true; }
             return false;

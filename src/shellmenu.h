@@ -8,7 +8,12 @@
 
 // Menus contextuels et verbes du Shell (IContextMenu) : exactement le menu de
 // l'Explorateur, extensions tierces comprises (7-Zip, Git, antivirus…).
-// Thread de l'interface uniquement (COM STA, OLE initialisé).
+// Fonctions appelées depuis le thread de l'interface (COM STA, OLE initialisé).
+//
+// Les objets du Shell vivent sur un thread STA dédié : un menu se construit à
+// l'avance (survol, bouton droit enfoncé) sans jamais bloquer l'interface ;
+// le menu s'affiche sur le thread de l'interface, ses messages et la commande
+// choisie sont relayés au thread des menus.
 //
 // folder : dossier courant ("" = Ce PC). names : éléments de ce dossier ;
 // une liste vide désigne le fond du dossier (Nouveau ▸, Coller, Propriétés…).
@@ -22,13 +27,16 @@ using VerbFilter = std::function<bool(const std::wstring& verb)>;
 bool ShellMenu_Show(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, POINT pt,
                     bool extended, const VerbFilter& filter);
 
-// Construit le menu à l'avance (≈100 ms de gestionnaires Shell), au moment où
-// le bouton droit s'enfonce : ShellMenu_Show le réutilise s'il vise les mêmes
-// éléments, et l'affiche donc dès le relâchement.
-bool ShellMenu_Prepare(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, bool extended);
+// Construit le menu à l'avance (≈100 ms de gestionnaires Shell), sur le thread
+// des menus : au survol d'un élément, puis au bouton droit enfoncé. ShellMenu_Show
+// le réutilise s'il vise les mêmes éléments et l'affiche aussitôt. Seule la
+// dernière demande compte. wait : attend le résultat (false si impossible).
+bool ShellMenu_Prepare(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, bool extended,
+                       bool wait = false);
 
-// Libère un menu préparé et non affiché (avant OleUninitialize).
-void ShellMenu_Discard();
+// Oublie le menu préparé (le dossier ou le presse-papiers a changé).
+// wait : attend que ses objets soient libérés (éjection d'un lecteur, fermeture).
+void ShellMenu_Discard(bool wait = false);
 
 // Une fois par processus, sur un thread de fond : charge les gestionnaires du
 // Shell (DLL d'extensions, associations, sous-menu Nouveau ▸) en construisant

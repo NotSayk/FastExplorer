@@ -1,5 +1,7 @@
 #include "dragdrop.h"
 
+#include "fileops.h"
+#include "paths.h"
 #include "shellmenu.h"
 
 #include <commctrl.h>
@@ -22,6 +24,31 @@ bool DragDrop_ShellTarget(HWND owner, const std::wstring& folder, const std::wst
 }
 
 namespace {
+
+void SetDword(IDataObject* d, const wchar_t* format, DWORD v) {
+    FORMATETC fe{(CLIPFORMAT)RegisterClipboardFormatW(format), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM m{};
+    m.tymed = TYMED_HGLOBAL;
+    m.hGlobal = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+    if (!m.hGlobal) return;
+    *(DWORD*)GlobalLock(m.hGlobal) = v;
+    GlobalUnlock(m.hGlobal);
+    if (FAILED(d->SetData(&fe, &m, TRUE))) ReleaseStgMedium(&m);
+}
+
+// Chemins de fichiers de l'objet glissé (false : éléments virtuels, etc.).
+bool FsPaths(IDataObject* data, std::vector<std::wstring>& out) {
+    std::vector<Pidl> items;
+    bool cut = false;
+    if (!ItemsFromDataObject(data, items, cut) || items.empty()) return false;
+    for (const auto& p : items) {
+        std::wstring buf(32768, L'\0');
+        if (!SHGetPathFromIDListEx(p.get(), buf.data(), (DWORD)buf.size(), GPFIDL_DEFAULT)) return false;
+        buf.resize(wcslen(buf.c_str()));
+        out.push_back(std::move(buf));
+    }
+    return true;
+}
 
 constexpr int kNoRow = -2;     // aucune cible choisie
 constexpr int kBlocked = -3;   // survol d'un élément glissé lui-même : interdit
@@ -51,6 +78,7 @@ public:
 
     IFACEMETHODIMP DragEnter(IDataObject* data, DWORD keys, POINTL pt, DWORD* effect) override {
         data_ = data;
+        right_ = (keys & MK_RBUTTON) != 0;
         row_ = kNoRow;
         folder_ = host_.folder();
         if (helper_) {
@@ -58,12 +86,14 @@ public:
             helper_->DragEnter(list_, data, &p, *effect);
         }
         Track(keys, pt, effect);
+        last_ = *effect;
         return S_OK;
     }
 
     IFACEMETHODIMP DragOver(DWORD keys, POINTL pt, DWORD* effect) override {
         AutoScroll(pt);
         Track(keys, pt, effect);
+        last_ = *effect;
         if (helper_) {
             POINT p{pt.x, pt.y};
             helper_->DragOver(&p, *effect);
@@ -83,16 +113,40 @@ public:
             helper_->Drop(data, &p, *effect);
         }
         const DWORD allowed = *effect;
+        // Effet du dernier survol, comme la cible du Shell : au dépôt, Ctrl ou Maj
+        // ont souvent déjà été relâchés.
+        const DWORD chosen = last_;
         Track(keys, pt, effect);
         const bool intoFolder = !item_;
         // La même cible Shell reçoit le Drop : elle se souvient du bouton utilisé
         // (bouton droit → son menu « Copier ici / Déplacer ici… »).
         ComPtr<IDropTarget> t = std::move(target_);
         const bool accepted = t && *effect != DROPEFFECT_NONE;
+        const std::wstring dest = item_ ? Join(folder_, name_.c_str()) : folder_;
         data_.Reset();
         item_ = false;
         row_ = kNoRow;
         host_.highlight(-1);  // surbrillance retirée avant un éventuel menu
+        // Bouton gauche, copier ou déplacer, fichiers ordinaires vers un dossier
+        // ordinaire : notre moteur (10 à 15 fois plus rapide sur beaucoup de fichiers).
+        std::vector<std::wstring> paths;
+        const DWORD da = dest.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(ToNtPath(dest).c_str());
+        if (accepted && !right_ && host_.transfer && (chosen == DROPEFFECT_COPY || chosen == DROPEFFECT_MOVE) &&
+            da != INVALID_FILE_ATTRIBUTES && (da & FILE_ATTRIBUTE_DIRECTORY) && FsPaths(data, paths)) {
+            t->DragLeave();
+            const bool move = chosen == DROPEFFECT_MOVE;
+            host_.transfer(dest, std::move(paths), move);
+            if (move) {
+                // Déplacement optimisé : la cible a déplacé, la source n'a rien à supprimer.
+                SetDword(data, CFSTR_PERFORMEDDROPEFFECT, DROPEFFECT_NONE);
+                SetDword(data, CFSTR_LOGICALPERFORMEDDROPEFFECT, DROPEFFECT_MOVE);
+                *effect = DROPEFFECT_NONE;
+            } else {
+                *effect = DROPEFFECT_COPY;
+            }
+            host_.dropped(intoFolder);
+            return S_OK;
+        }
         if (accepted) {
             DWORD e = allowed;
             t->Drop(data, keys, pt, &e);
@@ -113,6 +167,7 @@ private:
         ScreenToClient(list_, &c);
         std::wstring name;
         int row = host_.hit(c, name);
+        if (keys & MK_RBUTTON) right_ = true;
         if (row >= 0 && host_.dragged(name)) row = kBlocked;
 
         if (row != row_) {
@@ -122,6 +177,7 @@ private:
             host_.highlight(-1);
             row_ = row;
             if (row >= 0 && DragDrop_ShellTarget(nullptr, folder_, name, &target_)) item_ = true;
+            name_ = item_ ? name : std::wstring();
             if (!target_ && row != kBlocked) DragDrop_ShellTarget(nullptr, folder_, L"", &target_);  // dossier affiché
             DWORD e = allowed;
             if (target_ && SUCCEEDED(target_->DragEnter(data_.Get(), keys, pt, &e))) {
@@ -184,6 +240,9 @@ private:
     std::wstring folder_;
     int row_ = kNoRow;
     bool item_ = false;           // cible = un élément (sinon le dossier affiché)
+    std::wstring name_;           // son nom
+    bool right_ = false;          // glisser du bouton droit : le menu du Shell décide
+    DWORD last_ = DROPEFFECT_NONE;  // effet du dernier survol
     ULONGLONG lastScroll_ = 0;
 };
 

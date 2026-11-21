@@ -16,6 +16,11 @@
 // volume = déplacer, autre volume = copier, Ctrl / Maj / Alt, menu « Copier ici /
 // Déplacer ici / Créer un raccourci » au glisser du bouton droit, fichiers
 // virtuels, déplacement optimisé, conflits.
+//
+// Exception, pour la vitesse : un glisser du bouton gauche de fichiers ordinaires
+// sur un dossier ordinaire (copier ou déplacer, tel que choisi par la cible du
+// Shell) est confié à `transfer`, donc à notre moteur de copie. La source est
+// prévenue d'un déplacement optimisé : elle ne supprime rien elle-même.
 
 struct DropHost {
     std::function<std::wstring()> folder;                    // dossier affiché ("" = Ce PC)
@@ -23,6 +28,8 @@ struct DropHost {
     std::function<bool(const std::wstring& name)> dragged;   // élément en cours de glissement (depuis nous)
     std::function<void(int row)> highlight;                  // ligne cible en surbrillance (-1 = aucune)
     std::function<void(bool intoFolder)> dropped;            // dépôt fait ; intoFolder : dans le dossier affiché
+    // Copier (move = false) ou déplacer `paths` dans `dest` ; vide = toujours le Shell.
+    std::function<void(const std::wstring& dest, std::vector<std::wstring> paths, bool move)> transfer;
 };
 
 bool DragDrop_RegisterTarget(HWND list, DropHost host);

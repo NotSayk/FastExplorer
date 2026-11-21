@@ -1,5 +1,6 @@
 #include "fileops.h"
 
+#include "fastcopy.h"
 #include "paths.h"
 #include "shellmenu.h"
 
@@ -8,13 +9,70 @@
 #include <shobjidl.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
+#include <mutex>
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
 std::atomic<int> g_running{0};
+
+// Copies rapides en cours (progression affichée par l'interface).
+std::mutex g_fastLock;
+std::vector<FastProgress*> g_fast;
+
+struct FastReg {
+    FastProgress& p;
+    explicit FastReg(FastProgress& prog) : p(prog) {
+        std::lock_guard<std::mutex> l(g_fastLock);
+        g_fast.push_back(&p);
+    }
+    ~FastReg() {
+        std::lock_guard<std::mutex> l(g_fastLock);
+        g_fast.erase(std::find(g_fast.begin(), g_fast.end(), &p));
+    }
+};
+
+// Copie / déplacement par notre moteur (voir fastcopy.h). true : terminé ;
+// sinon `left` reçoit ce qui reste à confier au Shell (tout, s'il a refusé).
+bool TryFast(const FileOp& op, FileOpResult& r, HRESULT& hr, std::vector<std::wstring>& left) {
+    if ((op.kind != FileOpKind::Copy && op.kind != FileOpKind::Move) || op.folder.empty()) return false;
+    std::vector<std::wstring> src = op.paths;
+    for (const auto& p : op.items) {
+        std::wstring buf(32768, L'\0');
+        if (!SHGetPathFromIDListEx(p.get(), buf.data(), (DWORD)buf.size(), GPFIDL_DEFAULT)) return false;
+        buf.resize(wcslen(buf.c_str()));
+        src.push_back(std::move(buf));
+    }
+    if (op.kind == FileOpKind::Move)  // déjà dans la destination : rien à faire
+        src.erase(std::remove_if(src.begin(), src.end(),
+                                 [&](const std::wstring& s) {
+                                     std::wstring parent, child;
+                                     return ParentOf(s, parent, child) && _wcsicmp(parent.c_str(), op.folder.c_str()) == 0;
+                                 }),
+                  src.end());
+    if (src.empty()) {
+        hr = S_OK;  // tout était déjà dans la destination
+        return true;
+    }
+    FastProgress prog;
+    prog.move = op.kind == FileOpKind::Move;
+    prog.start = GetTickCount64();
+    FastOutcome out;
+    {
+        FastReg reg(prog);
+        if (!FastTransfer(src, op.folder, prog.move, prog, out)) return false;
+    }
+    r.created = std::move(out.created);
+    r.aborted = out.cancelled;
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, op.folder.c_str(), nullptr);
+    hr = out.error ? HRESULT_FROM_WIN32(out.error) : S_OK;
+    if (out.cancelled || out.shellLeft.empty()) return true;
+    left = std::move(out.shellLeft);
+    return false;
+}
 
 // Recueille les noms des éléments créés directement dans le dossier visé
 // (pas ceux créés à l'intérieur des sous-dossiers copiés).
@@ -128,8 +186,13 @@ HRESULT NewFolder(const FileOp& op, HWND owner, FileOpResult& r) {
 HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r) {
     if (op.kind == FileOpKind::NewFolder) return NewFolder(op, owner, r);
 
+    HRESULT hr = S_OK;
+    std::vector<std::wstring> left;  // éléments que notre moteur rend au Shell
+    if (TryFast(op, r, hr, left)) return hr;
+    const bool rest = !left.empty();
+
     ComPtr<IFileOperation> fo;
-    HRESULT hr = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&fo));
+    hr = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&fo));
     if (FAILED(hr)) return hr;
     if (owner) fo->SetOwnerWindow(owner);
 
@@ -151,11 +214,11 @@ HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r) {
     sink->Release();
 
     std::vector<ComPtr<IShellItem>> sources;
-    for (const auto& p : op.paths)
+    for (const auto& p : rest ? left : op.paths)
         if (auto it = ItemFromPath(p)) sources.push_back(it);
     for (const auto& p : op.items) {
         ComPtr<IShellItem> it;
-        if (SUCCEEDED(SHCreateItemFromIDList(p.get(), IID_PPV_ARGS(&it)))) sources.push_back(it);
+        if (!rest && SUCCEEDED(SHCreateItemFromIDList(p.get(), IID_PPV_ARGS(&it)))) sources.push_back(it);
     }
 
     // Coller dans le dossier d'origine : un double « - Copie », comme l'Explorateur
@@ -250,6 +313,25 @@ void FileOps_Start(HWND owner, HWND target, UINT msg, FileOp op) {
 }
 
 int FileOps_Running() { return g_running.load(); }
+
+bool FileOps_Progress(FileOpsProgress& p) {
+    p = FileOpsProgress{};
+    std::lock_guard<std::mutex> l(g_fastLock);
+    for (const FastProgress* f : g_fast) {
+        p.bytesDone += f->bytesDone;
+        p.bytesTotal += f->bytesTotal;
+        p.filesDone += f->filesDone;
+        p.filesTotal += f->filesTotal;
+        p.move |= f->move;
+        if (!p.start || f->start < p.start) p.start = f->start;
+    }
+    return !g_fast.empty();
+}
+
+void FileOps_Cancel() {
+    std::lock_guard<std::mutex> l(g_fastLock);
+    for (FastProgress* f : g_fast) f->cancel = true;
+}
 
 bool ConfirmDelete(HWND owner, const std::vector<std::wstring>& names, bool permanent) {
     if (names.empty()) return false;

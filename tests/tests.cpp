@@ -4,6 +4,7 @@
 #include "win.h"
 
 #include "dragdrop.h"
+#include "fastcopy.h"
 #include "fileops.h"
 #include "icons.h"
 #include "jobs.h"
@@ -347,12 +348,22 @@ void TestShortcut() {
 void TestPrepareMenu() {
     // Menu préparé au bouton enfoncé : construit pour un fichier, un dossier et
     // le fond ; refusé pour un élément absent ; libéré sans fuite (ASan).
-    CHECK(ShellMenu_Prepare(nullptr, g_root, {L"a2.txt"}, false));
-    CHECK(ShellMenu_Prepare(nullptr, g_root, {L"zdir"}, true));
-    CHECK(ShellMenu_Prepare(nullptr, g_root, {}, false));
-    CHECK(!ShellMenu_Prepare(nullptr, g_root, {L"absent.txt"}, false));
+    CHECK(ShellMenu_Prepare(nullptr, g_root, {L"a2.txt"}, false, true));
+    CHECK(ShellMenu_Prepare(nullptr, g_root, {L"zdir"}, true, true));
+    CHECK(ShellMenu_Prepare(nullptr, g_root, {}, false, true));
+    CHECK(!ShellMenu_Prepare(nullptr, g_root, {L"absent.txt"}, false, true));
+    // Survols successifs (asynchrones) : seul le dernier compte, et il est
+    // ensuite remis sans être reconstruit.
+    ShellMenu_Prepare(nullptr, g_root, {L"a2.txt"}, false);
+    ShellMenu_Prepare(nullptr, g_root, {L"zdir"}, false);
+    CHECK(ShellMenu_Prepare(nullptr, g_root, {L"zdir"}, false, true));
+    const double t0 = NowMs();
+    CHECK(ShellMenu_Prepare(nullptr, g_root, {L"zdir"}, false, true));
+    const double reuse = NowMs() - t0;
+    CHECK(reuse < 10);
+    printf("  menu prepare : remis en %.2f ms\n", reuse);
     ShellMenu_Discard();
-    ShellMenu_Discard();  // deux fois : sans effet
+    ShellMenu_Discard(true);  // deux fois : sans effet
 }
 
 void TestEnumerateFileIsNotDirectory() {
@@ -468,8 +479,108 @@ void TestFileNames() {
 
 bool Exists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
-void TestFileOps() {
-    HWND sink = CreateWindowW(L"FeTestSink", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+DWORD Attrs(const std::wstring& p) { return GetFileAttributesW(ToNtPath(p).c_str()); }
+
+void TestFastCopy() {
+    const std::wstring base = Join(g_root, L"fast");
+    const std::wstring src = Join(base, L"src"), dst = Join(base, L"dst");
+    CreateDirectoryW(base.c_str(), nullptr);
+    CreateDirectoryW(src.c_str(), nullptr);
+    CreateDirectoryW(dst.c_str(), nullptr);
+    const std::wstring tree = Join(src, L"Arbre");
+    CreateDirectoryW(tree.c_str(), nullptr);
+    CreateDirectoryW(Join(tree, L"sous").c_str(), nullptr);
+    CreateDirectoryW(Join(tree, L"masqué").c_str(), nullptr);
+    SetFileAttributesW(Join(tree, L"masqué").c_str(), FILE_ATTRIBUTE_HIDDEN);
+    CreateDirectoryW(Join(tree, L"vide").c_str(), nullptr);
+    for (int i = 0; i < 300; ++i) MakeFile(Join(Join(tree, L"sous"), (L"f" + std::to_wstring(i) + L".bin").c_str()), 1000);
+    MakeFile(Join(Join(tree, L"masqué"), L"lecture seule.txt"), 5);
+    SetFileAttributesW(Join(Join(tree, L"masqué"), L"lecture seule.txt").c_str(), FILE_ATTRIBUTE_READONLY);
+    MakeFile(Join(src, L"seul.txt"), 70000);
+
+    // Copie : arbre complet, attributs conservés, noms créés renvoyés.
+    {
+        FastProgress p;
+        FastOutcome o;
+        const double t0 = NowMs();
+        CHECK(FastTransfer({tree, Join(src, L"seul.txt")}, dst, false, p, o));
+        printf("  copie rapide : 302 fichiers en %.0f ms\n", NowMs() - t0);
+        CHECK(o.created.size() == 2 && o.shellLeft.empty() && !o.cancelled);
+        CHECK(p.filesDone == 302 && p.filesTotal == 302);
+        CHECK(p.bytesDone == 300 * 1000 + 5 + 70000);
+        CHECK(Exists(Join(Join(Join(dst, L"Arbre"), L"sous"), L"f299.bin")));
+        CHECK(Exists(Join(Join(dst, L"Arbre"), L"vide")));
+        CHECK(Attrs(Join(Join(dst, L"Arbre"), L"masqué")) & FILE_ATTRIBUTE_HIDDEN);
+        CHECK(Attrs(Join(Join(Join(dst, L"Arbre"), L"masqué"), L"lecture seule.txt")) & FILE_ATTRIBUTE_READONLY);
+        CHECK(Exists(Join(tree, L"sous")));  // copie : la source reste
+    }
+    // Ce que le Shell doit faire lui-même : rien n'est touché.
+    {
+        FastProgress p;
+        FastOutcome o;
+        CHECK(!FastTransfer({tree}, dst, false, p, o));                  // conflit de nom
+        CHECK(!FastTransfer({Join(src, L"seul.txt")}, src, false, p, o));  // même dossier : « - Copie »
+        CHECK(!FastTransfer({tree}, Join(tree, L"sous"), false, p, o));    // dossier copié dans lui-même
+        CHECK(!FastTransfer({Join(src, L"absent")}, base, false, p, o));
+        CHECK(!FastTransfer({tree}, L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", false, p, o));  // pas un chemin
+        // Jonction dans l'arbre : le Shell sait quoi en faire, pas nous.
+        const std::wstring withLink = Join(base, L"AvecLien");
+        CreateDirectoryW(withLink.c_str(), nullptr);
+        const std::wstring cmd = L"cmd /c mklink /J \"" + Join(withLink, L"lien") + L"\" \"" + src + L"\" >nul";
+        _wsystem(cmd.c_str());
+        CHECK(Attrs(Join(withLink, L"lien")) & FILE_ATTRIBUTE_REPARSE_POINT);
+        CHECK(!FastTransfer({withLink}, dst, false, p, o));
+        CHECK(!Exists(Join(dst, L"AvecLien")));
+        RemoveDirectoryW(Join(withLink, L"lien").c_str());  // la jonction seule, pas sa cible
+        RemoveDirectoryW(withLink.c_str());
+    }
+    // Un fichier verrouillé : l'élément est retiré de la destination et rendu au Shell.
+    {
+        const std::wstring locked = Join(Join(tree, L"sous"), L"f150.bin");
+        HANDLE h = CreateFileW(locked.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        CHECK(h != INVALID_HANDLE_VALUE);
+        const std::wstring d2 = Join(base, L"dst2");
+        CreateDirectoryW(d2.c_str(), nullptr);
+        FastProgress p;
+        FastOutcome o;
+        CHECK(FastTransfer({tree, Join(src, L"seul.txt")}, d2, false, p, o));
+        CHECK(o.shellLeft.size() == 1 && o.shellLeft[0] == tree);
+        CHECK(o.created.size() == 1 && o.created[0] == L"seul.txt");
+        CHECK(!Exists(Join(d2, L"Arbre")));  // rien de partiel ne reste
+        CloseHandle(h);
+    }
+    // Annulation : rien n'est copié, c'est signalé.
+    {
+        const std::wstring d3 = Join(base, L"dst3");
+        CreateDirectoryW(d3.c_str(), nullptr);
+        FastProgress p;
+        p.cancel = true;
+        FastOutcome o;
+        FastTransfer({tree}, d3, false, p, o);
+        CHECK(o.cancelled && o.shellLeft.empty() && p.filesDone == 0);
+    }
+    // Déplacement sur le même volume : un renommage, la source disparaît.
+    {
+        const std::wstring d4 = Join(base, L"dst4");
+        CreateDirectoryW(d4.c_str(), nullptr);
+        FastProgress p;
+        FastOutcome o;
+        const double t0 = NowMs();
+        CHECK(FastTransfer({tree}, d4, true, p, o));
+        printf("  deplacement (meme volume) : %.1f ms\n", NowMs() - t0);
+        CHECK(o.created.size() == 1 && o.shellLeft.empty());
+        CHECK(!Exists(tree));
+        CHECK(Exists(Join(Join(Join(d4, L"Arbre"), L"sous"), L"f0.bin")));
+    }
+    CHECK(FastCopyThreads(src, dst) >= 1);
+    // Ménage : retirer les attributs lecture seule avant de supprimer.
+    for (const wchar_t* d : {L"dst", L"dst4"})
+        SetFileAttributesW(Join(Join(Join(Join(base, d), L"Arbre"), L"masqué"), L"lecture seule.txt").c_str(),
+                           FILE_ATTRIBUTE_NORMAL);
+    RemoveTree(base);
+}
+
+void TestFileOps() {    HWND sink = CreateWindowW(L"FeTestSink", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
     CHECK(sink != nullptr);
     if (!sink) return;
     constexpr UINT kMsg = WM_APP + 10;
@@ -698,6 +809,7 @@ int wmain() {
     TestFileNames();
     TestWatch();
     TestEnumerateNearest();
+    TestFastCopy();
     TestFileOps();
     TestDrop();
     RemoveTree(g_root);

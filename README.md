@@ -24,8 +24,9 @@ Mesurer un dossier : `FastExplorer.exe --bench <dossier> [--seq|--par]`
 | `shellmenu.*` | menus contextuels et verbes du Shell, raccourcis `.lnk` |
 | `icons.*` | icônes propres (exe, lnk…) et surimpressions, thread dédié |
 | `watch.*` | surveillance du dossier affiché |
-| `fileops.*` | copier, déplacer, supprimer, renommer, nouveau dossier (`IFileOperation`, thread par opération) ; presse-papiers |
-| `dragdrop.*` | glisser-déposer OLE : source (objet de données du Shell) et cible (relais vers la cible du Shell) |
+| `fileops.*` | copier, déplacer, supprimer, renommer, nouveau dossier (thread par opération ; `IFileOperation` pour ce que `fastcopy` ne fait pas) ; presse-papiers |
+| `fastcopy.*` | copie / déplacement rapides (`CopyFileExW` sur 8 threads, `MoveFileExW`) : 12 fois plus rapide que le moteur du Shell sur 15 000 fichiers |
+| `dragdrop.*` | glisser-déposer OLE : source (objet de données du Shell) et cible (relais vers la cible du Shell ; fichiers ordinaires vers un dossier : `fastcopy`) |
 | `ui.*` | fenêtre, ListView virtuelle, raccourcis |
 | `main.cpp` | entrée, mode benchmark |
 

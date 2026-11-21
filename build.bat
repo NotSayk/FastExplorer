@@ -40,7 +40,7 @@ if /i "%MODE%"=="asan" call :copyasan
 goto :ok
 
 :test
-cl %COMMON% %OPT% /Isrc tests\tests.cpp src\paths.cpp src\listing.cpp src\nt.cpp src\jobs.cpp src\shellmenu.cpp src\icons.cpp src\watch.cpp src\fileops.cpp src\dragdrop.cpp /Fo%OUT%\ /Fd%OUT%\ /Fe%OUT%\tests.exe /link /SUBSYSTEM:CONSOLE %LOPT% || goto :fail
+cl %COMMON% %OPT% /Isrc tests\tests.cpp src\paths.cpp src\listing.cpp src\nt.cpp src\jobs.cpp src\shellmenu.cpp src\icons.cpp src\watch.cpp src\fileops.cpp src\fastcopy.cpp src\dragdrop.cpp /Fo%OUT%\ /Fd%OUT%\ /Fe%OUT%\tests.exe /link /SUBSYSTEM:CONSOLE %LOPT% || goto :fail
 call :copyasan
 "%OUT%\tests.exe" || goto :fail
 goto :ok

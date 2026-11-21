@@ -11,7 +11,8 @@
 //   shellmenu.* menus contextuels et verbes du Shell, raccourcis .lnk
 //   icons.*    icônes propres aux fichiers (exe, lnk…), thread dédié
 //   watch.*    surveillance du dossier affiché
-//   fileops.*  opérations sur les fichiers (moteur du Shell), presse-papiers
+//   fileops.*  opérations sur les fichiers, presse-papiers
+//   fastcopy.* copie rapide (CopyFileExW en parallèle), le Shell en secours
 //   dragdrop.* glisser-déposer (source et cible OLE)
 //   ui.*       fenêtre, ListView virtuelle, raccourcis
 

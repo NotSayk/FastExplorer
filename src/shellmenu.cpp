@@ -7,6 +7,9 @@
 #include <shobjidl.h>
 #include <wrl/client.h>
 
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <unordered_set>
 
 using Microsoft::WRL::ComPtr;
@@ -43,10 +46,6 @@ bool ShellObjectOf(HWND owner, const std::wstring& folder, const std::vector<std
 namespace {
 
 constexpr UINT kFirst = 1, kLast = 0x7FFF;
-
-// Interfaces du menu affiché, le temps de TrackPopupMenuEx (sous-menus dynamiques).
-ComPtr<IContextMenu2> g_cm2;
-ComPtr<IContextMenu3> g_cm3;
 
 ComPtr<IContextMenu> BuildMenu(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names) {
     ComPtr<IContextMenu> cm;
@@ -94,12 +93,12 @@ void RemoveDuplicates(HMENU m) {
 }
 
 bool Invoke(IContextMenu* cm, HWND owner, UINT offset, const char* verb, const std::wstring& folder, POINT pt,
-            bool hasPt) {
+            bool hasPt, bool ctrl, bool shift) {
     CMINVOKECOMMANDINFOEX ici{};
     ici.cbSize = sizeof ici;
     ici.fMask = CMIC_MASK_UNICODE | CMIC_MASK_ASYNCOK | (hasPt ? CMIC_MASK_PTINVOKE : 0);
-    if (GetKeyState(VK_CONTROL) < 0) ici.fMask |= CMIC_MASK_CONTROL_DOWN;
-    if (GetKeyState(VK_SHIFT) < 0) ici.fMask |= CMIC_MASK_SHIFT_DOWN;
+    if (ctrl) ici.fMask |= CMIC_MASK_CONTROL_DOWN;
+    if (shift) ici.fMask |= CMIC_MASK_SHIFT_DOWN;
     ici.hwnd = owner;
     std::wstring verbW;
     if (verb) {
@@ -140,38 +139,265 @@ Built Build(HWND owner, const std::wstring& folder, const std::vector<std::wstri
     return b;
 }
 
-// Menu préparé au bouton enfoncé, en attente du WM_CONTEXTMENU.
-struct Prepared {
+// ── Thread des menus ──
+// Les IContextMenu sont créés, utilisés et libérés sur ce thread STA uniquement.
+// Le HMENU, objet du processus, s'affiche sur le thread de l'interface.
+
+constexpr UINT WM_MT_PREPARE = WM_APP + 1;  // posté : construire la dernière cible demandée
+constexpr UINT WM_MT_HAS = WM_APP + 2;      // envoyé ; lParam = Target* : préparé ?
+constexpr UINT WM_MT_TAKE = WM_APP + 3;     // envoyé ; lParam = Take*
+constexpr UINT WM_MT_MENUMSG = WM_APP + 4;  // envoyé ; lParam = MenuMsg*
+constexpr UINT WM_MT_VERB = WM_APP + 5;     // envoyé ; lParam = VerbReq*
+constexpr UINT WM_MT_INVOKE = WM_APP + 6;   // posté ; lParam = InvokeReq* (libéré par le thread)
+constexpr UINT WM_MT_RELEASE = WM_APP + 7;  // posté ; lParam = Shown* : menu refermé
+constexpr UINT WM_MT_DISCARD = WM_APP + 8;  // posté ou envoyé
+
+struct Target {
+    HWND owner = nullptr;
     std::wstring folder;
     std::vector<std::wstring> names;
     bool extended = false;
+};
+
+bool Same(const Target& a, const Target& b) {
+    return a.folder == b.folder && a.names == b.names && a.extended == b.extended;
+}
+
+// Menu remis à l'interface : vit jusqu'au WM_MT_RELEASE (après l'éventuelle commande).
+struct Shown {
+    Built b;
+    ComPtr<IContextMenu2> cm2;
+    ComPtr<IContextMenu3> cm3;
+};
+
+struct Take {
+    Target t;
+    Shown* shown = nullptr;
+};
+
+struct MenuMsg {
+    Shown* s;
+    UINT msg;
+    WPARAM wp;
+    LPARAM lp;
+    LRESULT result = 0;
+    bool handled = false;
+};
+
+struct VerbReq {
+    Shown* s;
+    UINT offset;
+    std::wstring verb;
+};
+
+struct InvokeReq {
+    Shown* s;
+    HWND owner;
+    UINT offset;
+    std::wstring folder;
+    POINT pt;
+    bool ctrl, shift;
+};
+
+// Au-delà, le menu peut ne plus refléter le disque (on l'oublie aussi à chaque
+// rafraîchissement du dossier et à chaque changement du presse-papiers).
+constexpr ULONGLONG kPrepMaxAgeMs = 10000;
+
+// ── État propre au thread des menus ──
+struct Prepared {
+    Target t;
     ULONGLONG tick = 0;
     Built built;
 } g_prep;
-
-constexpr ULONGLONG kPrepMaxAgeMs = 3000;  // au-delà, le menu peut ne plus refléter le disque
 
 void DropPrepared() {
     if (g_prep.built.menu) DestroyMenu(g_prep.built.menu);
     g_prep = Prepared{};
 }
 
-}  // namespace
+bool PrepFresh(const Target& t) {
+    return g_prep.built.menu && Same(g_prep.t, t) && GetTickCount64() - g_prep.tick < kPrepMaxAgeMs;
+}
 
-bool ShellMenu_Prepare(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, bool extended) {
+void PrepareOn(const Target& t) {
+    if (PrepFresh(t)) return;
     DropPrepared();
-    Built b = Build(owner, folder, names, extended);
-    if (!b.menu) return false;
-    g_prep.folder = folder;
-    g_prep.names = names;
-    g_prep.extended = extended;
+    Built b = Build(t.owner, t.folder, t.names, t.extended);
+    if (!b.menu) return;
+    g_prep.t = t;
     g_prep.tick = GetTickCount64();
     g_prep.built = std::move(b);
+}
+
+// Dernière cible demandée par l'interface : les survols successifs se remplacent,
+// le thread ne construit jamais un menu déjà dépassé.
+std::mutex g_wantLock;
+std::unique_ptr<Target> g_want;
+bool g_wantPosted = false;
+
+LRESULT CALLBACK MenuThreadProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_MT_PREPARE: {
+            std::unique_ptr<Target> t;
+            {
+                std::lock_guard<std::mutex> l(g_wantLock);
+                t = std::move(g_want);
+                g_wantPosted = false;
+            }
+            if (t) PrepareOn(*t);
+            return 0;
+        }
+        case WM_MT_HAS: {
+            const Target& t = *(const Target*)lp;
+            PrepareOn(t);
+            return PrepFresh(t);
+        }
+        case WM_MT_TAKE: {
+            auto* tk = (Take*)lp;
+            Built b;
+            if (PrepFresh(tk->t)) {
+                b = std::move(g_prep.built);
+                g_prep.built = Built{};
+            }
+            DropPrepared();
+            if (!b.menu) b = Build(tk->t.owner, tk->t.folder, tk->t.names, tk->t.extended);
+            if (!b.menu) return 0;
+            auto* s = new Shown{std::move(b)};
+            s->b.cm.As(&s->cm3);
+            if (!s->cm3) s->b.cm.As(&s->cm2);
+            tk->shown = s;
+            return 1;
+        }
+        case WM_MT_MENUMSG: {
+            auto* m = (MenuMsg*)lp;
+            if (m->s->cm3) {
+                LRESULT lr = 0;
+                if (SUCCEEDED(m->s->cm3->HandleMenuMsg2(m->msg, m->wp, m->lp, &lr))) {
+                    m->result = lr;
+                    m->handled = true;
+                }
+            } else if (m->s->cm2 && m->msg != WM_MENUCHAR &&
+                       SUCCEEDED(m->s->cm2->HandleMenuMsg(m->msg, m->wp, m->lp))) {
+                m->result = (m->msg == WM_INITMENUPOPUP) ? 0 : TRUE;
+                m->handled = true;
+            }
+            return 0;
+        }
+        case WM_MT_VERB: {
+            auto* v = (VerbReq*)lp;
+            wchar_t verb[80] = {};
+            if (FAILED(v->s->b.cm->GetCommandString(v->offset, GCS_VERBW, nullptr, (LPSTR)verb, _countof(verb))))
+                verb[0] = 0;
+            verb[_countof(verb) - 1] = 0;
+            v->verb = verb;
+            return 0;
+        }
+        case WM_MT_INVOKE: {
+            std::unique_ptr<InvokeReq> r((InvokeReq*)lp);
+            Invoke(r->s->b.cm.Get(), r->owner, r->offset, nullptr, r->folder, r->pt, true, r->ctrl, r->shift);
+            return 0;
+        }
+        case WM_MT_RELEASE: {
+            auto* s = (Shown*)lp;
+            s->cm2.Reset();
+            s->cm3.Reset();
+            DestroyMenu(s->b.menu);
+            delete s;
+            return 0;
+        }
+        case WM_MT_DISCARD:
+            DropPrepared();
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+std::atomic<HWND> g_mtWnd{nullptr};
+
+// Fenêtre du thread des menus, créé à la première demande.
+HWND MenuThread() {
+    static const HWND w = [] {
+        struct Start {
+            HANDLE ready;
+            HWND w = nullptr;
+        } s{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        if (!s.ready) return (HWND) nullptr;
+        HANDLE th = CreateThread(
+            nullptr, 0,
+            [](void* p) -> DWORD {
+                auto* s = (Start*)p;
+                const bool ole = SUCCEEDED(OleInitialize(nullptr));
+                WNDCLASSW wc{};
+                wc.lpfnWndProc = MenuThreadProc;
+                wc.hInstance = GetModuleHandleW(nullptr);
+                wc.lpszClassName = L"FastExplorerMenuThread";
+                RegisterClassW(&wc);
+                HWND wnd = ole ? CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+                                               wc.hInstance, nullptr)
+                               : nullptr;
+                s->w = wnd;
+                SetEvent(s->ready);  // `s` appartient à l'appelant : plus d'accès après ceci
+                if (!wnd) {
+                    if (ole) OleUninitialize();
+                    return 0;
+                }
+                MSG m;
+                while (GetMessageW(&m, nullptr, 0, 0) > 0) {  // fenêtres créées par les extensions
+                    TranslateMessage(&m);
+                    DispatchMessageW(&m);
+                }
+                return 0;
+            },
+            &s, 0, nullptr);
+        if (th) {
+            WaitForSingleObject(s.ready, INFINITE);
+            CloseHandle(th);
+        }
+        CloseHandle(s.ready);
+        g_mtWnd = s.w;
+        return s.w;
+    }();
+    return w;
+}
+
+// ── Côté interface : menu en cours d'affichage ──
+Shown* g_showing = nullptr;
+
+}  // namespace
+
+bool ShellMenu_Prepare(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, bool extended,
+                       bool wait) {
+    HWND mt = MenuThread();
+    if (!mt) return false;
+    if (wait) {
+        Target t{owner, folder, names, extended};
+        return SendMessageW(mt, WM_MT_HAS, 0, (LPARAM)&t) != 0;
+    }
+    bool post = false;
+    {
+        std::lock_guard<std::mutex> l(g_wantLock);
+        g_want = std::make_unique<Target>(Target{owner, folder, names, extended});
+        post = !g_wantPosted;
+        g_wantPosted = true;
+    }
+    if (post && !PostMessageW(mt, WM_MT_PREPARE, 0, 0)) {
+        std::lock_guard<std::mutex> l(g_wantLock);
+        g_wantPosted = false;
+        return false;
+    }
     return true;
 }
 
-void ShellMenu_Discard() { DropPrepared(); }
-
+void ShellMenu_Discard(bool wait) {
+    HWND mt = g_mtWnd;
+    if (!mt) return;  // thread jamais créé : rien à libérer
+    {
+        std::lock_guard<std::mutex> l(g_wantLock);
+        g_want.reset();
+    }
+    if (wait) SendMessageW(mt, WM_MT_DISCARD, 0, 0);
+    else PostMessageW(mt, WM_MT_DISCARD, 0, 0);
+}
 void ShellMenu_WarmUp(const std::wstring& folder, const std::vector<std::wstring>& names) {
     static bool done = false;
     if (done) return;
@@ -217,35 +443,28 @@ void ShellMenu_WarmUp(const std::wstring& folder, const std::vector<std::wstring
 
 bool ShellMenu_Show(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, POINT pt,
                     bool extended, const VerbFilter& filter) {
-    Built b;
-    if (g_prep.built.menu && g_prep.folder == folder && g_prep.names == names && g_prep.extended == extended &&
-        GetTickCount64() - g_prep.tick < kPrepMaxAgeMs) {
-        b = std::move(g_prep.built);
-        g_prep.built = Built{};
-    }
-    DropPrepared();
-    if (!b.menu) b = Build(owner, folder, names, extended);
-    if (!b.menu) return false;
-    ComPtr<IContextMenu> cm = std::move(b.cm);
-    HMENU menu = b.menu;
-    cm.As(&g_cm3);
-    if (!g_cm3) cm.As(&g_cm2);
-    const UINT cmd = (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, owner, nullptr);
-    g_cm2.Reset();
-    g_cm3.Reset();
-
-    bool ok = true;
+    HWND mt = MenuThread();
+    if (!mt) return false;
+    // Menu préparé au survol ou au bouton enfoncé : remis aussitôt (sinon construit maintenant).
+    Take tk{Target{owner, folder, names, extended}};
+    if (!SendMessageW(mt, WM_MT_TAKE, 0, (LPARAM)&tk) || !tk.shown) return false;
+    Shown* s = tk.shown;
+    g_showing = s;
+    const UINT cmd = (UINT)TrackPopupMenuEx(s->b.menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, owner, nullptr);
+    g_showing = nullptr;
     if (cmd >= kFirst) {
-        const UINT offset = cmd - kFirst;
-        wchar_t verb[80] = {};
-        if (FAILED(cm->GetCommandString(offset, GCS_VERBW, nullptr, (LPSTR)verb, _countof(verb)))) verb[0] = 0;
-        verb[_countof(verb) - 1] = 0;
-        if (!(filter && filter(verb))) ok = Invoke(cm.Get(), owner, offset, nullptr, folder, pt, true);
+        VerbReq v{s, cmd - kFirst};
+        SendMessageW(mt, WM_MT_VERB, 0, (LPARAM)&v);
+        if (!(filter && filter(v.verb))) {
+            // Exécutée sur le thread des menus : l'interface ne gèle pas pendant le lancement.
+            auto* r = new InvokeReq{s, owner, cmd - kFirst, folder, pt, GetKeyState(VK_CONTROL) < 0,
+                                    GetKeyState(VK_SHIFT) < 0};
+            if (!PostMessageW(mt, WM_MT_INVOKE, 0, (LPARAM)r)) delete r;
+        }
     }
-    DestroyMenu(menu);
-    return ok;
+    PostMessageW(mt, WM_MT_RELEASE, 0, (LPARAM)s);
+    return true;
 }
-
 bool ShellMenu_Invoke(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names,
                       const char* verb) {
     ComPtr<IContextMenu> cm = BuildMenu(owner, folder, names);
@@ -254,13 +473,14 @@ bool ShellMenu_Invoke(HWND owner, const std::wstring& folder, const std::vector<
     if (!menu) return false;
     // Certains gestionnaires exigent QueryContextMenu avant un verbe nommé.
     cm->QueryContextMenu(menu, 0, kFirst, kLast, CMF_NORMAL);
-    const bool ok = Invoke(cm.Get(), owner, 0, verb, folder, POINT{}, false);
+    const bool ok = Invoke(cm.Get(), owner, 0, verb, folder, POINT{}, false, GetKeyState(VK_CONTROL) < 0,
+                           GetKeyState(VK_SHIFT) < 0);
     DestroyMenu(menu);
     return ok;
 }
 
 bool ShellMenu_HandleMessage(UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
-    if (!g_cm2 && !g_cm3) return false;
+    if (!g_showing || (!g_showing->cm3 && !g_showing->cm2)) return false;
     switch (msg) {
         case WM_INITMENUPOPUP:
         case WM_MENUCHAR:
@@ -271,18 +491,12 @@ bool ShellMenu_HandleMessage(UINT msg, WPARAM wp, LPARAM lp, LRESULT* result) {
             break;
         default: return false;
     }
-    if (g_cm3) {
-        LRESULT lr = 0;
-        if (FAILED(g_cm3->HandleMenuMsg2(msg, wp, lp, &lr))) return false;
-        *result = lr;
-        return true;
-    }
-    if (msg == WM_MENUCHAR) return false;
-    if (FAILED(g_cm2->HandleMenuMsg(msg, wp, lp))) return false;
-    *result = (msg == WM_INITMENUPOPUP) ? 0 : TRUE;
+    MenuMsg m{g_showing, msg, wp, lp};
+    SendMessageW(MenuThread(), WM_MT_MENUMSG, 0, (LPARAM)&m);
+    if (!m.handled) return false;
+    *result = m.result;
     return true;
 }
-
 bool ResolveShortcut(const std::wstring& lnk, std::wstring& target) {
     ComPtr<IShellLinkW> sl;
     if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl)))) return false;
