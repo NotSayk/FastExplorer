@@ -14,6 +14,7 @@
 //   fileops.*  opérations sur les fichiers, presse-papiers
 //   fastcopy.* copie rapide (CopyFileExW en parallèle), le Shell en secours
 //   dragdrop.* glisser-déposer (source et cible OLE)
+//   navpane.*  volet de navigation : Accès rapide, arborescence de Ce PC
 //   ui.*       fenêtre, ListView virtuelle, raccourcis
 
 #include "win.h"

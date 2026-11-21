@@ -22,6 +22,13 @@ struct Entry {
     bool isDir() const { return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0; }
 };
 
+// Ce PC : nom et occupation d'un lecteur (lus avec un délai maximal : un
+// lecteur de DVD qui démarre ou un réseau muet ne retardent pas l'affichage).
+struct DriveInfo {
+    std::wstring label;      // nom de volume (ou partage, pour un lecteur réseau)
+    uint64_t total = 0, free = 0;  // 0 : inconnu (pas de média, délai dépassé)
+};
+
 // Contenu d'un dossier. Construit par le thread de travail puis immuable :
 // l'interface et les tâches de tri le partagent sans verrou.
 struct DirData {
@@ -33,6 +40,7 @@ struct DirData {
     DWORD error = 0;
     double enumMs = 0, keyMs = 0;
     std::wstring vanished;  // EnumerateNearest : dossier demandé, disparu (sinon vide)
+    std::vector<DriveInfo> drives;  // Ce PC : une par entrée
 
     bool isRoot() const { return path.empty(); }
     const wchar_t* name(const Entry& e) const { return pool.data() + e.nameOff; }
@@ -41,6 +49,13 @@ struct DirData {
 // Parallélisme des clés de tri et du tri (Auto = seulement pour les gros dossiers).
 enum class Parallel { Auto, Never, Always };
 void SetParallel(Parallel p);
+
+// Texte du type de lecteur (DRIVE_*).
+const wchar_t* DriveTypeText(UINT type);
+// Nom affiché d'un lecteur, comme l'Explorateur : « Données (D:) », « Disque local (C:) ».
+std::wstring DriveDisplayName(const std::wstring& root, UINT type, const DriveInfo& info);
+// Nom et occupation de lecteurs (« C:\ »…), en parallèle, au plus `timeoutMs`.
+std::vector<DriveInfo> QueryDrives(const std::vector<std::wstring>& roots, DWORD timeoutMs);
 
 // Lit le dossier (ou les lecteurs si d.path est vide) et calcule les clés de tri.
 void Enumerate(DirData& d, const CancelToken& ct = {});

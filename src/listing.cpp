@@ -5,11 +5,17 @@
 #include "util.h"
 
 #include <shellapi.h>
+#include <winnetwk.h>
+
+#pragma comment(lib, "mpr")
 
 #include <algorithm>
 #include <cstring>
 #include <execution>
 #include <memory>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 namespace {
@@ -94,6 +100,33 @@ void EnumerateDir(DirData& d, const CancelToken& ct) {
     CloseHandle(h);
 }
 
+DriveInfo QueryDrive(const std::wstring& root) {
+    DriveInfo di;
+    const UINT type = GetDriveTypeW(root.c_str());
+    if (type == DRIVE_REMOTE && root.size() >= 2) {  // « partage (\\serveur) », comme l'Explorateur
+        wchar_t remote[512];
+        DWORD n = _countof(remote);
+        const std::wstring dev = root.substr(0, 2);
+        if (WNetGetConnectionW(dev.c_str(), remote, &n) == NO_ERROR) {
+            std::wstring r = remote, server, share;
+            if (ParentOf(r, server, share) && !share.empty()) di.label = share + L" (" + server + L")";
+        }
+    }
+    wchar_t label[MAX_PATH + 1] = {};
+    // SEM_FAILCRITICALERRORS : pas de « Insérez un disque » pour un lecteur vide.
+    const UINT old = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    if (di.label.empty() && GetVolumeInformationW(root.c_str(), label, _countof(label), nullptr, nullptr, nullptr,
+                                                  nullptr, 0))
+        di.label = label;
+    ULARGE_INTEGER freeToUs{}, total{}, freeAll{};
+    if (GetDiskFreeSpaceExW(root.c_str(), &freeToUs, &total, &freeAll)) {
+        di.total = total.QuadPart;
+        di.free = freeToUs.QuadPart;
+    }
+    SetErrorMode(old);
+    return di;
+}
+
 void EnumerateDrives(DirData& d) {
     wchar_t buf[512];
     const DWORD n = GetLogicalDriveStringsW(_countof(buf), buf);
@@ -107,6 +140,9 @@ void EnumerateDrives(DirData& d) {
         SHFILEINFOW sfi{};
         if (SHGetFileInfoW(drv, 0, &sfi, sizeof sfi, SHGFI_SYSICONINDEX | SHGFI_SMALLICON)) e.icon = sfi.iIcon;
     }
+    std::vector<std::wstring> roots;
+    for (const Entry& e : d.entries) roots.emplace_back(d.name(e));
+    d.drives = QueryDrives(roots, 400);
 }
 
 // Ajoute la clé de tri de `nm` à `out`, renvoie sa longueur en octets.
@@ -231,6 +267,53 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc) {
     return order;
 }
 
+const wchar_t* DriveTypeText(UINT t) {
+    switch (t) {
+        case DRIVE_FIXED: return L"Disque local";
+        case DRIVE_REMOVABLE: return L"Disque amovible";
+        case DRIVE_REMOTE: return L"Lecteur réseau";
+        case DRIVE_CDROM: return L"Lecteur CD/DVD";
+        case DRIVE_RAMDISK: return L"Disque RAM";
+        default: return L"Lecteur";
+    }
+}
+
+std::wstring DriveDisplayName(const std::wstring& root, UINT type, const DriveInfo& info) {
+    const std::wstring letter = root.size() >= 2 ? root.substr(0, 2) : root;
+    return (info.label.empty() ? std::wstring(DriveTypeText(type)) : info.label) + L" (" + letter + L")";
+}
+
+std::vector<DriveInfo> QueryDrives(const std::vector<std::wstring>& roots, DWORD timeoutMs) {
+    // Un thread par lecteur ; ceux qui dépassent le délai finissent seuls
+    // (l'état est partagé, aucun ne référence la pile de l'appelant).
+    struct Shared {
+        std::mutex m;
+        std::condition_variable cv;
+        std::vector<DriveInfo> out;
+        std::vector<bool> done;
+        size_t left = 0;
+    };
+    if (roots.empty()) return {};
+    auto s = std::make_shared<Shared>();
+    s->out.resize(roots.size());
+    s->done.resize(roots.size());
+    s->left = roots.size();
+    for (size_t i = 0; i < roots.size(); ++i) {
+        std::thread([s, i, root = roots[i]] {
+            DriveInfo di = QueryDrive(root);
+            std::lock_guard<std::mutex> l(s->m);
+            s->out[i] = std::move(di);
+            s->done[i] = true;
+            if (--s->left == 0) s->cv.notify_all();
+        }).detach();
+    }
+    std::unique_lock<std::mutex> l(s->m);
+    s->cv.wait_for(l, std::chrono::milliseconds(timeoutMs), [&] { return s->left == 0; });
+    std::vector<DriveInfo> r(roots.size());
+    for (size_t i = 0; i < roots.size(); ++i)
+        if (s->done[i]) r[i] = s->out[i];
+    return r;
+}
 bool IsGoneError(DWORD err) {
     switch (err) {
         case ERROR_FILE_NOT_FOUND:

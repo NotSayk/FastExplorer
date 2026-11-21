@@ -9,6 +9,7 @@
 #include "icons.h"
 #include "jobs.h"
 #include "listing.h"
+#include "navpane.h"
 #include "nt.h"
 #include "shellmenu.h"
 #include "watch.h"
@@ -481,8 +482,50 @@ bool Exists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INV
 
 DWORD Attrs(const std::wstring& p) { return GetFileAttributesW(ToNtPath(p).c_str()); }
 
-void TestFastCopy() {
-    const std::wstring base = Join(g_root, L"fast");
+void TestNavPane() {
+    // Sous-dossiers : ordre naturel, fichiers exclus, dossiers protégés du système exclus.
+    const std::wstring base = Join(g_root, L"nav");
+    CreateDirectoryW(base.c_str(), nullptr);
+    for (const wchar_t* n : {L"b10", L"b2", L"A", L"protégé", L"caché"}) CreateDirectoryW(Join(base, n).c_str(), nullptr);
+    CreateDirectoryW(Join(Join(base, L"A"), L"enfant").c_str(), nullptr);
+    MakeFile(Join(base, L"fichier.txt"), 3);
+    SetFileAttributesW(Join(base, L"protégé").c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+    SetFileAttributesW(Join(base, L"caché").c_str(), FILE_ATTRIBUTE_HIDDEN);
+    const auto kids = NavPane_ReadChildren(base);
+    std::vector<std::wstring> names;
+    for (const auto& k : kids) names.push_back(k.text);
+    CHECK(names.size() == 4);
+    if (names.size() == 4) {
+        CHECK_STR(names[0], L"A");
+        CHECK_STR(names[1], L"b2");  // ordre naturel : b2 avant b10
+        CHECK_STR(names[2], L"b10");
+        CHECK_STR(names[3], L"caché");  // simplement caché : affiché (comme la liste)
+        CHECK(kids[0].hasChildren && !kids[1].hasChildren);
+        CHECK_STR(kids[0].path, Join(base, L"A"));
+    }
+    CHECK(NavPane_ReadChildren(Join(base, L"absent")).empty());
+    SetFileAttributesW(Join(base, L"protégé").c_str(), FILE_ATTRIBUTE_NORMAL);
+
+    // Ce PC : lecteurs nommés comme dans l'Explorateur.
+    const auto drives = NavPane_ReadChildren(L"");
+    CHECK(!drives.empty());
+    bool sawC = false;
+    for (const auto& d : drives) sawC |= d.path == L"C:\\" && d.text.find(L"(C:)") != std::wstring::npos;
+    CHECK(sawC);
+    CHECK_STR(DriveDisplayName(L"D:\\", DRIVE_FIXED, DriveInfo{L"Données"}), L"Données (D:)");
+    CHECK_STR(DriveDisplayName(L"E:\\", DRIVE_REMOVABLE, DriveInfo{}), L"Disque amovible (E:)");
+    const auto info = QueryDrives({L"C:\\", L"Q:\\"}, 2000);
+    CHECK(info.size() == 2 && info[0].total > 0 && info[0].free <= info[0].total);
+    CHECK(info.size() == 2 && info[1].total == 0);  // lecteur absent : inconnu, sans erreur
+
+    // Accès rapide : ce sont de vrais dossiers (le contenu dépend de la machine).
+    const auto pinned = NavPane_ReadPinned();
+    printf("  acces rapide : %zu dossier(s) epingle(s)\n", pinned.size());
+    for (const auto& p : pinned) CHECK(GetFileAttributesW(p.path.c_str()) != INVALID_FILE_ATTRIBUTES);
+    RemoveTree(base);
+}
+
+void TestFastCopy() {    const std::wstring base = Join(g_root, L"fast");
     const std::wstring src = Join(base, L"src"), dst = Join(base, L"dst");
     CreateDirectoryW(base.c_str(), nullptr);
     CreateDirectoryW(src.c_str(), nullptr);
@@ -809,6 +852,7 @@ int wmain() {
     TestFileNames();
     TestWatch();
     TestEnumerateNearest();
+    TestNavPane();
     TestFastCopy();
     TestFileOps();
     TestDrop();

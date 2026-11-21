@@ -27,6 +27,7 @@ Mesurer un dossier : `FastExplorer.exe --bench <dossier> [--seq|--par]`
 | `fileops.*` | copier, déplacer, supprimer, renommer, nouveau dossier (thread par opération ; `IFileOperation` pour ce que `fastcopy` ne fait pas) ; presse-papiers |
 | `fastcopy.*` | copie / déplacement rapides (`CopyFileExW` sur 8 threads, `MoveFileExW`) : 12 fois plus rapide que le moteur du Shell sur 15 000 fichiers |
 | `dragdrop.*` | glisser-déposer OLE : source (objet de données du Shell) et cible (relais vers la cible du Shell ; fichiers ordinaires vers un dossier : `fastcopy`) |
+| `navpane.*` | volet de navigation : Accès rapide (épingles de l'Explorateur) et arborescence de Ce PC chargée à la demande, sans accès disque sur le thread de l'interface |
 | `ui.*` | fenêtre, ListView virtuelle, raccourcis |
 | `main.cpp` | entrée, mode benchmark |
 

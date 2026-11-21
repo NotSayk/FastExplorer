@@ -28,7 +28,7 @@ De haut en bas :
 | **Barre d'onglets** (barre de titre) | Onglets, bouton « + », boutons fenêtre | P1 |
 | **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅🟡 P0 |
 | **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | P1 |
-| **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | P0 |
+| **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accès rapide épinglé + arborescence de Ce PC, séparateur ; Accueil, Galerie, Réseau, Linux à venir) |
 | **Zone de contenu** | La liste des éléments | ✅ P0 |
 | **Volet d'aperçu / de détails** (droite) | Aperçu du fichier, ou métadonnées | P1 |
 | **Barre d'état** (bas) | Nombre d'éléments, nombre et taille de la sélection, boutons Détails / Grandes icônes | ✅🟡 P0 |
@@ -79,7 +79,7 @@ De haut en bas :
 | **Accueil** (Home) | Page d'accueil : *Accès rapide* (dossiers épinglés et fréquents), *Favoris* (fichiers épinglés), *Récents*, *Recommandés* (2025 : aussi pour les comptes locaux et Microsoft), *Partagés* (comptes pro). Colonne « Activité » avec avatars pour les comptes Entra ID. Depuis 2026 : « Ouvrir l'emplacement du fichier » et « Demander à Copilot » (comptes pro/scolaires) | P1 (Accès rapide), P3 (le reste) |
 | **Galerie** | Mosaïque chronologique de toutes les photos (dossier Images + sources ajoutées), regroupées par mois, filtre de collection | P2 |
 | **Dossiers épinglés** | Bureau, Téléchargements, Documents, Images, Musique, Vidéos + vos épingles (« Épingler à Accès rapide ») | **P0** |
-| **Ce PC** | Lecteurs (avec jauge d'espace libre), dossiers de l'utilisateur, emplacements réseau, appareils (téléphones MTP, appareils photo) | ✅🟡 P0 (jauge et libellé de volume manquants) |
+| **Ce PC** | Lecteurs (avec jauge d'espace libre), dossiers de l'utilisateur, emplacements réseau, appareils (téléphones MTP, appareils photo) | ✅ P0 (lecteurs : libellé, jauge, espace libre ; réseau et appareils à venir) |
 | **Réseau** | Machines découvertes (SMB, WSD), serveurs multimédia (DLNA), routeurs (UPnP) | P2 |
 | **Linux** | Distributions WSL via `\\wsl.localhost\<distro>` | P2 |
 | **Téléphone mobile Android** | Accès sans fil aux fichiers du téléphone via « Lien avec Windows » (2025) | P3 |
@@ -131,7 +131,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 
 | Option | Prio |
 |---|---|
-| Volet de navigation | P0 |
+| Volet de navigation | ✅ P0 |
 | Volet de détails (Alt+Maj+P) | P1 |
 | Volet d'aperçu (Alt+P) | P1 |
 | Cases à cocher des éléments | P2 |
@@ -403,7 +403,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 
 | Fonction | Prio |
 |---|---|
-| Jauge d'espace libre, libellé du volume (« Windows (C:) ») | **P0** |
+| Jauge d'espace libre, libellé du volume (« Windows (C:) ») | ✅ **P0** |
 | Éjecter (clés USB, disques externes) | P1 ⚙️ `CM_Request_Device_Eject` |
 | Formater (FAT32, exFAT, NTFS, ReFS) | P2 (déléguer au dialogue `SHFormatDrive`) |
 | Renommer le volume | P2 |
@@ -604,7 +604,7 @@ Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre
 2. ✅ **Opérations de fichiers** : nouveau dossier, renommer (F2, validation), copier/couper/coller (presse-papiers interopérable), supprimer (Corbeille et définitif), moteur de copie avec progression et conflits.
 3. ✅ **Glisser-déposer** OLE, dans les deux sens.
 4. ✅ **Rafraîchissement automatique** : dossier affiché, arrivée / retrait des lecteurs dans Ce PC, dossier ou lecteur disparu → plus proche parent, éjection USB non bloquée.
-5. **Volet de navigation** : dossiers épinglés + arborescence de Ce PC ; libellés et jauges des lecteurs.
+5. ✅ **Volet de navigation** : dossiers épinglés + arborescence de Ce PC ; libellés et jauges des lecteurs.
 6. **Fil d'Ariane** dans la barre d'adresse.
 7. **Affichage** : éléments cachés et système, masquage des extensions (en respectant les préférences de l'utilisateur).
 8. **Barre d'état** : résumé de la sélection (nombre, taille).

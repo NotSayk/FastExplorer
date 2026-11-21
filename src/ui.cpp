@@ -11,6 +11,7 @@
 #include "icons.h"
 #include "jobs.h"
 #include "listing.h"
+#include "navpane.h"
 #include "paths.h"
 #include "shellmenu.h"
 #include "util.h"
@@ -45,12 +46,14 @@ constexpr UINT WM_APP_EDITSEL = WM_APP + 5;     // renommage : sélection du nom
 constexpr UINT WM_APP_REEDIT = WM_APP + 6;      // renommage refusé : on rouvre la saisie
 constexpr UINT WM_APP_RECLAIM = WM_APP + 7;     // reprendre le premier plan au moteur de copie
 constexpr UINT WM_APP_SHELLNOTIFY = WM_APP + 8; // lecteur ou média ajouté / retiré (SHChangeNotifyRegister)
+constexpr UINT WM_APP_NAV = WM_APP + 9;         // résultat d'une lecture du volet de navigation
 constexpr UINT_PTR TIMER_LOADING = 1;
 constexpr UINT_PTR TIMER_WATCH = 2;
 constexpr UINT_PTR TIMER_AFTEROP = 3;
 constexpr UINT_PTR TIMER_HOVER = 6;   // souris immobile sur la liste : préparer le menu contextuel
 constexpr UINT kMenuHoverMs = 100;
 constexpr UINT_PTR TIMER_PROGRESS = 7;  // progression des copies de notre moteur
+constexpr UINT_PTR TIMER_PINNED = 8;    // après un menu contextuel : relire l'Accès rapide (épinglage)
 constexpr UINT_PTR TIMER_DRIVES = 4;  // Ce PC : regroupe les annonces d'arrivée / retrait de lecteurs
 constexpr UINT_PTR TIMER_EJECT = 5;   // éjection demandée : si elle échoue, on reprend la surveillance  // resélection après une opération, différée pendant un renommage
 constexpr UINT kLoadingDelayMs = 150;   // en dessous, aucun « Chargement… » (évite le clignotement)
@@ -59,7 +62,7 @@ constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-
 // d'événements (copie de milliers de fichiers) et s'espace sur les gros dossiers.
 constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
-enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS };
+enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV };
 enum class Nav { Normal, Back, Forward, Refresh };
 enum class JobKind { Navigate, Sort };
 
@@ -100,7 +103,10 @@ struct View {
 };
 
 HINSTANCE g_inst;
-HWND g_hwnd, g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp;
+HWND g_hwnd, g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav;
+int g_navW96 = 240;            // largeur du volet de navigation (à 96 ppp)
+bool g_splitDrag = false;      // séparateur volet / liste en cours de déplacement
+RECT g_split{};                // zone du séparateur (coordonnées client)
 HFONT g_font;
 int g_fontH = 16;
 UINT g_dpi = 96;
@@ -264,6 +270,7 @@ void ApplySelection(const std::vector<int>& sel, int focus, bool scroll) {
 
 int IconFor(int idx) {
     const Entry& e = E(idx);
+    if (e.icon >= 0) return e.icon;  // déjà résolue par le thread de travail (lecteurs de Ce PC)
     std::wstring key, probe;
     DWORD attr;
     if (e.isDir()) {
@@ -288,16 +295,6 @@ int IconFor(int idx) {
     return icon;
 }
 
-const wchar_t* DriveTypeText(UINT t) {
-    switch (t) {
-        case DRIVE_FIXED: return L"Disque local";
-        case DRIVE_REMOVABLE: return L"Disque amovible";
-        case DRIVE_REMOTE: return L"Lecteur réseau";
-        case DRIVE_CDROM: return L"Lecteur CD/DVD";
-        case DRIVE_RAMDISK: return L"Disque RAM";
-        default: return L"Lecteur";
-    }
-}
 
 void FormatDate(int64_t t, wchar_t* out, int cch) {
     out[0] = 0;
@@ -310,6 +307,18 @@ void FormatDate(int64_t t, wchar_t* out, int cch) {
         out[n - 1] = L' ';
         GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &sl, nullptr, out + n, cch - n);
     }
+}
+
+// Ce PC : informations du lecteur de l'entrée (nom, occupation).
+const DriveInfo* DriveOfEntry(int idx) {
+    if (!HasView() || !g_view.data->isRoot() || idx < 0 || (size_t)idx >= g_view.data->drives.size()) return nullptr;
+    return &g_view.data->drives[idx];
+}
+
+std::wstring BytesText(uint64_t bytes) {
+    wchar_t b[64];
+    StrFormatByteSizeEx(bytes, SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, b, _countof(b));
+    return b;
 }
 
 void FillDispInfo(LVITEMW& it) {
@@ -339,9 +348,16 @@ void FillDispInfo(LVITEMW& it) {
     const int cch = it.cchTextMax;
     out[0] = 0;
     switch (it.iSubItem) {
-        case COL_NAME: wcsncpy_s(out, cch, NameOf(idx), _TRUNCATE); break;
+        case COL_NAME:
+            if (const DriveInfo* di = DriveOfEntry(idx))
+                wcsncpy_s(out, cch, DriveDisplayName(NameOf(idx), e.extra, *di).c_str(), _TRUNCATE);
+            else wcsncpy_s(out, cch, NameOf(idx), _TRUNCATE);
+            break;
         case COL_SIZE:
-            if (!e.isDir()) StrFormatKBSizeW((LONGLONG)e.size, out, (UINT)cch);
+            if (const DriveInfo* di = DriveOfEntry(idx)) {
+                if (di->total)
+                    wcsncpy_s(out, cch, (BytesText(di->free) + L" libres sur " + BytesText(di->total)).c_str(), _TRUNCATE);
+            } else if (!e.isDir()) StrFormatKBSizeW((LONGLONG)e.size, out, (UINT)cch);
             break;
         case COL_TYPE:
             if (g_view.data->isRoot()) wcsncpy_s(out, cch, DriveTypeText(e.extra), _TRUNCATE);
@@ -351,8 +367,71 @@ void FillDispInfo(LVITEMW& it) {
                 CharUpperBuffW(out + 8, (DWORD)wcslen(out + 8));
             } else wcsncpy_s(out, cch, L"Fichier", _TRUNCATE);
             break;
-        case COL_DATE: FormatDate(e.mtime, out, cch); break;
+        case COL_DATE:
+            if (!g_view.data->isRoot()) FormatDate(e.mtime, out, cch);  // Ce PC : jauge dessinée à la place
+            break;
     }
+}
+
+// Ce PC : en-têtes adaptés aux lecteurs, colonne d'espace libre assez large.
+void UpdateColumnsForView() {
+    static bool rootCols = false;
+    static int savedSizeW = 0;
+    const bool root = HasView() && g_view.data->isRoot();
+    if (root == rootCols) return;
+    rootCols = root;
+    const wchar_t* names[COL_COUNT] = {L"Nom", L"Taille", L"Type", L"Modifié le"};
+    if (root) {
+        names[COL_SIZE] = L"Espace libre";
+        names[COL_DATE] = L"Utilisation";
+    }
+    for (int i = 0; i < COL_COUNT; ++i) {
+        LVCOLUMNW c{};
+        c.mask = LVCF_TEXT;
+        c.pszText = (LPWSTR)names[i];
+        ListView_SetColumn(g_list, i, &c);
+    }
+    const int w = ListView_GetColumnWidth(g_list, COL_SIZE);
+    if (root && w < S(200)) {
+        savedSizeW = w;
+        ListView_SetColumnWidth(g_list, COL_SIZE, S(200));
+    } else if (!root && savedSizeW) {
+        ListView_SetColumnWidth(g_list, COL_SIZE, savedSizeW);
+        savedSizeW = 0;
+    }
+}
+
+// Ce PC : jauge d'occupation de chaque lecteur (rouge au-delà de 90 %, comme l'Explorateur).
+LRESULT OnListCustomDraw(NMLVCUSTOMDRAW* cd) {
+    if (!HasView() || !g_view.data->isRoot()) return CDRF_DODEFAULT;
+    switch (cd->nmcd.dwDrawStage) {
+        case CDDS_PREPAINT: return CDRF_NOTIFYITEMDRAW;
+        case CDDS_ITEMPREPAINT: return CDRF_NOTIFYPOSTPAINT;
+        case CDDS_ITEMPOSTPAINT: {
+            const int row = (int)cd->nmcd.dwItemSpec;
+            const DriveInfo* di = DriveOfEntry(EntryAt(row));
+            RECT r;
+            if (!di || !di->total || !ListView_GetSubItemRect(g_list, row, COL_DATE, LVIR_BOUNDS, &r)) break;
+            const int h = std::max(S(6), (int)(r.bottom - r.top) / 2);
+            RECT bar{r.left + S(6), r.top + (r.bottom - r.top - h) / 2, r.right - S(6), 0};
+            bar.bottom = bar.top + h;
+            if (bar.right - bar.left < S(20)) break;
+            const double used = 1.0 - (double)di->free / (double)di->total;
+            RECT fill = bar;
+            fill.right = bar.left + (LONG)((bar.right - bar.left) * used + 0.5);
+            HBRUSH back = CreateSolidBrush(RGB(230, 230, 230));
+            HBRUSH front = CreateSolidBrush(used >= 0.9 ? RGB(218, 38, 38) : RGB(38, 160, 218));
+            HBRUSH edge = CreateSolidBrush(RGB(188, 188, 188));
+            FillRect(cd->nmcd.hdc, &bar, back);
+            FillRect(cd->nmcd.hdc, &fill, front);
+            FrameRect(cd->nmcd.hdc, &bar, edge);
+            DeleteObject(back);
+            DeleteObject(front);
+            DeleteObject(edge);
+            break;
+        }
+    }
+    return CDRF_DODEFAULT;
 }
 
 // Marque les éléments coupés de la vue courante.
@@ -602,6 +681,9 @@ void OnResult(Result* raw) {
     RedrawWindow(g_list, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
     UpdateButtons();
     if (g_startupMs < 0) g_startupMs = MsSinceProcessStart();  // premier affichage réellement peint
+    UpdateColumnsForView();
+    NavPane_ShowPath(g_path);
+    NavPane_FolderListed(d);  // sous-dossiers affichés dans le volet : à jour sans relecture
     ShellMenu_Discard();  // contenu du dossier relu : le menu préparé peut ne plus être exact
     if (!d.vanished.empty()) g_goneNote = L"« " + d.vanished + L" » n'est plus accessible";
     else if (p.nav != Nav::Refresh) g_goneNote.clear();
@@ -1049,6 +1131,39 @@ void ShowContextMenu(LPARAM lp) {
         return false;
     });
     if (!ok) SetStatus(L"Menu contextuel indisponible pour cet emplacement.");
+    SetTimer(g_hwnd, TIMER_PINNED, 800, nullptr);  // « Épingler à Accès rapide » a pu être choisi
+}
+
+// Menu contextuel d'un dossier du volet de navigation.
+void ShowNavMenu(const std::wstring& path, POINT pt) {
+    std::wstring parent, leaf;
+    std::vector<std::wstring> names;
+    if (!path.empty()) {
+        if (!ParentOf(path, parent, leaf) || leaf.empty()) {  // lecteur : élément de Ce PC
+            parent.clear();
+            leaf = path;
+        }
+        names = {leaf};
+    }
+    const bool ok = ShellMenu_Show(g_hwnd, parent, names, pt, GetKeyState(VK_SHIFT) < 0,
+                                   [path, parent, leaf](const std::wstring& verb) {
+        auto is = [&](const wchar_t* v) { return _wcsicmp(verb.c_str(), v) == 0; };
+        if (is(L"open") || is(L"explore")) { Navigate(path, Nav::Normal); return true; }
+        if (leaf.empty() || parent.empty()) return false;  // Ce PC, lecteurs : le Shell
+        if (is(L"rename")) {  // dans la liste du dossier parent, comme un renommage ordinaire
+            g_editAfter = leaf;
+            Navigate(parent, Nav::Normal, leaf, {leaf});
+            return true;
+        }
+        if (is(L"copy") || is(L"cut")) {
+            if (!Clipboard_Put(g_hwnd, parent, {leaf}, is(L"cut"))) SetStatus(L"Impossible d'utiliser le presse-papiers.");
+            return true;
+        }
+        if (is(L"paste")) { Paste(path); return true; }
+        return false;
+    });
+    if (!ok) SetStatus(L"Menu contextuel indisponible pour cet emplacement.");
+    SetTimer(g_hwnd, TIMER_PINNED, 800, nullptr);
 }
 
 // Bouton droit enfoncé : on construit le menu pendant que l'utilisateur relâche
@@ -1124,6 +1239,7 @@ wchar_t DriveOf(const std::wstring& p) {
 // Lecteurs annoncés (masque : bit 0 = A:). Ce PC se met à jour ; si le dossier
 // affiché était sur un lecteur retiré, on remonte (jusqu'à Ce PC).
 void OnDrivesChanged(DWORD removedMask) {
+    NavPane_RefreshDrives();
     if (!HasView()) return;
     const wchar_t d = DriveOf(g_path);
     if (d && (removedMask & (1u << (d - L'A')))) {
@@ -1204,7 +1320,7 @@ void ApplyFont() {
         SelectObject(dc, old);
         ReleaseDC(g_hwnd, dc);
     }
-    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp})
+    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav})
         SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
 }
 
@@ -1222,6 +1338,7 @@ void ApplyImageList() {
     const int want = S(16);
     HIMAGELIST pick = (g_imgLarge && std::abs(cl - want) < std::abs(cs - want)) ? g_imgLarge : g_imgSmall;
     if (pick) ListView_SetImageList(g_list, pick, LVSIL_SMALL);
+    if (pick) NavPane_SetImageList(pick);
 }
 
 void Layout() {
@@ -1235,7 +1352,7 @@ void Layout() {
     const int editH = g_fontH + S(10);  // texte centré verticalement
     const int h = std::max(S(30), editH);
     // Un seul lot de déplacements : un repaint au lieu d'un par contrôle.
-    HDWP dwp = BeginDeferWindowPos(5);
+    HDWP dwp = BeginDeferWindowPos(6);
     auto place = [&](HWND w, int x, int y, int cx, int cy) {
         if (dwp) dwp = DeferWindowPos(dwp, w, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
         else MoveWindow(w, x, y, cx, cy, TRUE);
@@ -1248,7 +1365,13 @@ void Layout() {
     x += S(4);
     place(g_addr, x, m + (h - editH) / 2, std::max(0, (int)rc.right - x - m), editH);
     const int top = m + h + m;
-    place(g_list, 0, top, rc.right, std::max(0, (int)rc.bottom - top - statusH));
+    const int bodyH = std::max(0, (int)rc.bottom - top - statusH);
+    // Volet de navigation, séparateur (déplaçable à la souris), liste.
+    const int split = S(5);
+    const int navW = std::clamp(S(g_navW96), S(120), std::max(S(120), (int)rc.right / 2));
+    place(g_nav, 0, top, navW, bodyH);
+    g_split = {navW, top, navW + split, top + bodyH};
+    place(g_list, navW + split, top, std::max(0, (int)rc.right - navW - split), bodyH);
     if (dwp) EndDeferWindowPos(dwp);
 }
 
@@ -1306,6 +1429,11 @@ void CreateChildren(HWND hwnd) {
         ListView_InsertColumn(g_list, i, &c);
     }
 
+    NavHost nav;
+    nav.navigate = [](const std::wstring& path) { Navigate(path, Nav::Normal); };
+    nav.contextMenu = ShowNavMenu;
+    g_nav = NavPane_Create(hwnd, ID_NAV, WM_APP_NAV, std::move(nav));
+
     g_status = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd,
                                (HMENU)ID_STATUS, g_inst, nullptr);
     ApplyFont();
@@ -1329,7 +1457,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_CONTEXTMENU:
             if ((HWND)wp == g_list) { ShowContextMenu(lp); return 0; }
+            if ((HWND)wp == g_nav) { NavPane_ContextMenu(lp); return 0; }
             break;
+        case WM_APP_NAV: NavPane_OnResult(lp); return 0;
+        case WM_SETCURSOR:
+            if ((HWND)wp == hwnd && LOWORD(lp) == HTCLIENT) {
+                POINT p;
+                GetCursorPos(&p);
+                ScreenToClient(hwnd, &p);
+                if (PtInRect(&g_split, p)) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                    return TRUE;
+                }
+            }
+            break;
+        case WM_LBUTTONDOWN:
+            if (POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}; PtInRect(&g_split, p)) {
+                g_splitDrag = true;
+                SetCapture(hwnd);
+            }
+            return 0;
+        case WM_MOUSEMOVE:
+            if (g_splitDrag) {
+                g_navW96 = MulDiv(std::max(0, (int)GET_X_LPARAM(lp)), 96, (int)g_dpi);
+                Layout();
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (g_splitDrag) ReleaseCapture();
+            return 0;
+        case WM_CAPTURECHANGED: g_splitDrag = false; return 0;
         case WM_APP_ICON: OnIcon((IconResult*)lp); return 0;
         case WM_APP_DIRCHANGED: OnDirChanged((uintptr_t)wp, lp); return 0;
         case WM_DEVICECHANGE: return OnDeviceChange(wp, lp);
@@ -1341,6 +1498,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ACTIVATE:
             // (y compris juste après la fin d'une opération : la fenêtre du moteur peut encore s'activer)
             if (LOWORD(wp) == WA_INACTIVE) PostMessageW(hwnd, WM_APP_RECLAIM, 0, 0);
+            else NavPane_RefreshPinned();  // épinglé depuis l'Explorateur entre-temps ?
             break;
         case WM_CLIPBOARDUPDATE: OnClipboardUpdate(); return 0;
         case WM_CLOSE:
@@ -1377,6 +1535,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_WATCH) { OnWatchTimer(); return 0; }
             if (wp == TIMER_AFTEROP) { ApplyAfterOp(); return 0; }
             if (wp == TIMER_PROGRESS) { OnProgressTimer(); return 0; }
+            if (wp == TIMER_PINNED) { KillTimer(hwnd, wp); NavPane_RefreshPinned(true); return 0; }
             if (wp == TIMER_HOVER) {
                 KillTimer(hwnd, wp);
                 POINT c;
@@ -1400,9 +1559,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_NOTIFY: {
             auto* hdr = (NMHDR*)lp;
+            if (LRESULT r = 0; NavPane_Notify(hdr, &r)) return r;
             if (hdr->hwndFrom != g_list) break;
             switch (hdr->code) {
                 case LVN_GETDISPINFOW: FillDispInfo(((NMLVDISPINFOW*)lp)->item); return 0;
+                case NM_CUSTOMDRAW: return OnListCustomDraw((NMLVCUSTOMDRAW*)lp);
                 case LVN_ODFINDITEMW: return FindItem((NMLVFINDITEMW*)lp);
                 case LVN_COLUMNCLICK: Resort(((NMLISTVIEW*)lp)->iSubItem); return 0;
                 case NM_DBLCLK: Activate(((NMITEMACTIVATE*)lp)->iItem); return 0;
@@ -1516,7 +1677,7 @@ bool Ui_Create(HINSTANCE inst, int show, const std::wstring& start) {
     g_inst = inst;
     Navigate(start, Nav::Normal);  // la lecture démarre pendant qu'on construit la fenêtre
     WarmUpShell();
-    INITCOMMONCONTROLSEX icc{sizeof icc, ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
+    INITCOMMONCONTROLSEX icc{sizeof icc, ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
     WNDCLASSEXW wc{sizeof wc};
