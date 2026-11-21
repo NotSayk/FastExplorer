@@ -6,6 +6,7 @@
 
 #include "ui.h"
 
+#include "fileops.h"
 #include "icons.h"
 #include "jobs.h"
 #include "listing.h"
@@ -37,8 +38,13 @@ namespace {
 constexpr UINT WM_APP_RESULT = WM_APP + 1;
 constexpr UINT WM_APP_ICON = WM_APP + 2;        // lParam = IconResult*
 constexpr UINT WM_APP_DIRCHANGED = WM_APP + 3;  // wParam = id de surveillance
+constexpr UINT WM_APP_FILEOP = WM_APP + 4;      // lParam = FileOpResult*
+constexpr UINT WM_APP_EDITSEL = WM_APP + 5;     // renommage : sélection du nom sans l'extension
+constexpr UINT WM_APP_REEDIT = WM_APP + 6;      // renommage refusé : on rouvre la saisie
+constexpr UINT WM_APP_RECLAIM = WM_APP + 7;     // reprendre le premier plan au moteur de copie
 constexpr UINT_PTR TIMER_LOADING = 1;
 constexpr UINT_PTR TIMER_WATCH = 2;
+constexpr UINT_PTR TIMER_AFTEROP = 3;  // resélection après une opération, différée pendant un renommage
 constexpr UINT kLoadingDelayMs = 150;   // en dessous, aucun « Chargement… » (évite le clignotement)
 constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-plan
 // Rafraîchissement après un changement sur disque : regroupe les rafales
@@ -80,6 +86,7 @@ struct View {
     std::vector<int32_t> icons;     // par index d'entrée
     std::vector<uint8_t> overlays;  // surimpression par index d'entrée
     std::vector<uint8_t> iconState;
+    std::vector<uint8_t> cut;       // 1 = coupé (affiché estompé)
     uint64_t serial = 0;            // identifie la vue auprès du thread d'icônes
     double sortMs = 0;
 };
@@ -103,6 +110,33 @@ uint64_t g_viewSerial = 0;
 uintptr_t g_watchId = 0;
 std::wstring g_watchPath;
 bool g_watchPending = false;  // un rafraîchissement est programmé
+
+// ── Opérations sur les fichiers ──
+bool g_editing = false;      // saisie d'un nom en cours : aucun rafraîchissement ne doit l'interrompre
+std::wstring g_editName;     // élément en cours de renommage
+std::wstring g_editAfter;    // après le prochain rafraîchissement : renommer cet élément (nouveau dossier)
+bool g_quitWhenIdle = false; // fermeture demandée pendant une copie : on attend sa fin
+struct Reedit {
+    std::wstring name, text;
+    const wchar_t* error = nullptr;
+} g_reedit;
+// Éléments coupés (estompés tant que le presse-papiers les contient).
+struct {
+    std::wstring folder;
+    std::unordered_set<std::wstring> names;
+} g_cut;
+// Resélection demandée par une opération terminée.
+struct AfterOp {
+    bool active = false;
+    std::wstring folder, focus, edit;
+    std::vector<std::wstring> names;
+} g_afterOp;
+// Commande du fond du dossier (Nouveau ▸ Document texte…) : le nouvel élément,
+// vu au rafraîchissement suivant, passe directement en renommage.
+struct {
+    std::shared_ptr<const DirData> before;
+    ULONGLONG deadline = 0;
+} g_expectNew;
 
 int S(int v) { return MulDiv(v, (int)g_dpi, 96); }
 bool HasView() { return g_view.data != nullptr; }
@@ -275,9 +309,9 @@ void FillDispInfo(LVITEMW& it) {
         }
         it.iImage = g_view.icons[idx];
     }
-    if (it.mask & LVIF_STATE) {  // surimpression (flèche de raccourci, état cloud)
-        it.state = INDEXTOOVERLAYMASK(g_view.overlays[idx]);
-        it.stateMask = LVIS_OVERLAYMASK;
+    if (it.mask & LVIF_STATE) {  // surimpression (flèche de raccourci, état cloud), élément coupé
+        it.state = INDEXTOOVERLAYMASK(g_view.overlays[idx]) | (g_view.cut[idx] ? LVIS_CUT : 0);
+        it.stateMask = LVIS_OVERLAYMASK | LVIS_CUT;
     }
     if (!(it.mask & LVIF_TEXT) || !it.pszText || it.cchTextMax <= 0) return;
     wchar_t* out = it.pszText;
@@ -298,6 +332,15 @@ void FillDispInfo(LVITEMW& it) {
             break;
         case COL_DATE: FormatDate(e.mtime, out, cch); break;
     }
+}
+
+// Marque les éléments coupés de la vue courante.
+void ApplyCutMarks() {
+    const size_t n = HasView() ? g_view.data->entries.size() : 0;
+    g_view.cut.assign(n, 0);
+    if (g_cut.names.empty() || _wcsicmp(g_cut.folder.c_str(), g_path.c_str()) != 0) return;
+    for (size_t i = 0; i < n; ++i)
+        if (g_cut.names.count(NameOf((int)i))) g_view.cut[i] = 1;
 }
 
 // Recherche au clavier (taper « rap » saute à « rapport.docx »).
@@ -508,6 +551,7 @@ void OnResult(Result* raw) {
     Icons_SetSerial(g_view.serial);
     RebuildRowOf();
     g_path = d.path;
+    ApplyCutMarks();
 
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
     if (g_path.empty()) {
@@ -534,6 +578,33 @@ void OnResult(Result* raw) {
     if (g_startupMs < 0) g_startupMs = MsSinceProcessStart();  // premier affichage réellement peint
     ShowSummary();
     if (!g_path.empty()) WarmUpMenus(d);
+
+    // Nouvel élément créé par une commande du fond du dossier : renommage direct.
+    if (g_expectNew.before) {
+        if (GetTickCount64() > g_expectNew.deadline || _wcsicmp(g_expectNew.before->path.c_str(), d.path.c_str()) != 0) {
+            g_expectNew = {};
+        } else if (refresh && g_editAfter.empty()) {
+            const DirData& old = *g_expectNew.before;
+            std::unordered_set<std::wstring_view> had;
+            had.reserve(old.entries.size());
+            for (const Entry& e : old.entries) had.emplace(old.name(e), e.nameLen);
+            int added = -1, count = 0;
+            for (size_t i = 0; i < d.entries.size() && count < 2; ++i)
+                if (!had.count(std::wstring_view(d.name(d.entries[i]), d.entries[i].nameLen))) { added = (int)i; ++count; }
+            if (count == 1) g_editAfter = NameOf(added);
+            if (count) g_expectNew = {};
+        }
+    }
+    if (!g_editAfter.empty()) {
+        const int e = refresh ? FindEntryByName(g_editAfter) : -1;
+        g_editAfter.clear();
+        if (e >= 0) {
+            const int row = g_view.rowOf[e];
+            ApplySelection({e}, e, true);
+            SetFocus(g_list);
+            ListView_EditLabel(g_list, row);
+        }
+    }
 }
 
 void GoBack() { if (!g_back.empty()) Navigate(g_back.back(), Nav::Back); }
@@ -594,6 +665,217 @@ std::vector<std::wstring> NamesOf(const std::vector<int>& entries) {
     return v;
 }
 
+// ───────────────────────────── Opérations sur les fichiers ─────────────────────────────
+
+bool CanModify() { return HasView() && !g_view.data->isRoot(); }
+
+void StartOp(FileOp op) { FileOps_Start(g_hwnd, g_hwnd, WM_APP_FILEOP, std::move(op)); }
+
+// Rafraîchit le dossier en sélectionnant `names` (et renomme `edit`), dès
+// qu'aucun renommage ni aucune navigation n'est en cours.
+void ApplyAfterOp() {
+    if (!g_afterOp.active) return;
+    if (g_editing || g_pending.active) {
+        SetTimer(g_hwnd, TIMER_AFTEROP, 100, nullptr);
+        return;
+    }
+    KillTimer(g_hwnd, TIMER_AFTEROP);
+    AfterOp a = std::move(g_afterOp);
+    g_afterOp = AfterOp{};
+    if (!HasView() || _wcsicmp(a.folder.c_str(), g_path.c_str()) != 0) return;  // on est allé ailleurs
+    g_editAfter = a.edit;
+    Navigate(g_path, Nav::Refresh, a.focus, std::move(a.names));
+}
+
+void AfterOpSelect(const std::wstring& folder, std::vector<std::wstring> names, std::wstring focus,
+                   std::wstring edit = {}) {
+    g_afterOp = AfterOp{true, folder, std::move(focus), std::move(edit), std::move(names)};
+    ApplyAfterOp();
+}
+
+void OnFileOp(FileOpResult* raw) {
+    std::unique_ptr<FileOpResult> r(raw);
+    if (FileOps_IsFailure(*r)) SetStatus(L"Opération impossible : " + ErrorText((DWORD)r->hr));
+    if (r->clipboardCut && SUCCEEDED(r->hr) && !r->aborted) Clipboard_ClearAfterMove(r->clipSeq);
+    if (g_quitWhenIdle) {
+        if (FileOps_Running() == 0) DestroyWindow(g_hwnd);
+        return;
+    }
+    const auto& c = r->created;
+    switch (r->kind) {
+        case FileOpKind::NewFolder:
+            if (!c.empty()) AfterOpSelect(r->folder, {c[0]}, c[0], c[0]);
+            break;
+        case FileOpKind::Delete:
+            AfterOpSelect(r->folder, r->focusAfter.empty() ? std::vector<std::wstring>{} : std::vector{r->focusAfter},
+                          r->focusAfter);
+            break;
+        case FileOpKind::Rename:
+        case FileOpKind::Copy:
+        case FileOpKind::Move:
+            if (!c.empty()) AfterOpSelect(r->folder, c, c[0]);  // sinon la surveillance suffit
+            break;
+    }
+}
+
+void CopyNames(const std::vector<std::wstring>& names, bool cut) {
+    if (!CanModify() || names.empty()) return;
+    if (!Clipboard_Put(g_hwnd, g_path, names, cut)) {
+        SetStatus(L"Impossible d'utiliser le presse-papiers.");
+        return;
+    }
+    g_cut.folder = cut ? g_path : std::wstring();
+    g_cut.names.clear();
+    if (cut) g_cut.names.insert(names.begin(), names.end());
+    ApplyCutMarks();
+    InvalidateRect(g_list, nullptr, FALSE);
+    wchar_t s[128];
+    swprintf_s(s, L"%zu élément%s %s dans le presse-papiers.", names.size(), names.size() > 1 ? L"s" : L"",
+               cut ? L"coupé(s)" : L"copié(s)");
+    SetStatus(s);
+}
+
+void OnClipboardUpdate() {
+    if (g_cut.names.empty() || Clipboard_IsOurs()) return;
+    g_cut.names.clear();  // le presse-papiers a changé : plus rien n'est « coupé »
+    ApplyCutMarks();
+    InvalidateRect(g_list, nullptr, FALSE);
+}
+
+void Paste(const std::wstring& dest) {
+    if (!CanModify() || dest.empty()) return;
+    FileOp op;
+    if (!Clipboard_Get(op.items, op.clipboardCut, op.clipSeq)) {
+        SetStatus(L"Rien à coller : le presse-papiers ne contient pas de fichiers.");
+        return;
+    }
+    op.kind = op.clipboardCut ? FileOpKind::Move : FileOpKind::Copy;
+    op.folder = dest;
+    StartOp(std::move(op));
+}
+
+// Supprime ; la cible passe ensuite à l'élément suivant (ou précédent), comme dans l'Explorateur.
+void DeleteNames(const std::vector<std::wstring>& names, bool permanent) {
+    if (!CanModify() || names.empty() || !ConfirmDelete(g_hwnd, names, permanent)) return;
+    std::vector<int> rows;
+    for (int e : FindEntriesByNames(names)) rows.push_back(g_view.rowOf[e]);
+    std::sort(rows.begin(), rows.end());
+    std::wstring next;
+    if (!rows.empty()) {
+        const std::unordered_set<int> gone(rows.begin(), rows.end());
+        int r = -1;
+        for (int k = rows.back() + 1; k < RowCount() && r < 0; ++k)
+            if (!gone.count(k)) r = k;
+        for (int k = rows.front() - 1; k >= 0 && r < 0; --k)
+            if (!gone.count(k)) r = k;
+        if (r >= 0) next = NameOf(EntryAt(r));
+    }
+    FileOp op;
+    op.kind = FileOpKind::Delete;
+    op.folder = g_path;
+    op.permanent = permanent;
+    op.focusAfter = next;
+    for (const auto& n : names) op.paths.push_back(Join(g_path, n.c_str()));
+    StartOp(std::move(op));
+}
+
+void NewFolder() {
+    if (!CanModify()) return;
+    FileOp op;
+    op.kind = FileOpKind::NewFolder;
+    op.folder = g_path;
+    op.newName = L"Nouveau dossier";
+    StartOp(std::move(op));
+}
+
+void BeginRename() {
+    if (!CanModify()) return;
+    int row = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED | LVNI_SELECTED);
+    if (row < 0) row = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
+    if (row < 0) return;
+    SetFocus(g_list);
+    ListView_EditLabel(g_list, row);
+}
+
+BOOL OnBeginLabelEdit(const NMLVDISPINFOW* di) {
+    const int idx = EntryAt(di->item.iItem);
+    if (!CanModify() || idx < 0 || g_pending.active) return TRUE;  // refusé
+    g_editing = true;
+    g_editName = NameOf(idx);
+    PostMessageW(g_hwnd, WM_APP_EDITSEL, 0, 0);
+    return FALSE;
+}
+
+// Après l'ouverture de la saisie : nom sans l'extension sélectionné, ou texte
+// refusé remis en place avec la raison dans une bulle.
+void OnEditSel() {
+    HWND ed = ListView_GetEditControl(g_list);
+    if (!ed || !g_editing) return;
+    if (g_reedit.error) {
+        SetWindowTextW(ed, g_reedit.text.c_str());
+        Edit_SetSel(ed, 0, -1);
+        EDITBALLOONTIP bt{sizeof bt, L"Nom incorrect", g_reedit.error, TTI_ERROR};
+        Edit_ShowBalloonTip(ed, &bt);
+        g_reedit = Reedit{};
+        return;
+    }
+    const int idx = FindEntryByName(g_editName);
+    if (idx < 0 || E(idx).isDir()) return;
+    const wchar_t* name = NameOf(idx);
+    const int dot = (int)(PathFindExtensionW(name) - name);
+    if (dot > 0 && name[dot]) Edit_SetSel(ed, 0, dot);
+}
+
+void OnReedit() {
+    const int idx = FindEntryByName(g_reedit.name);
+    if (idx < 0 || !HasView()) { g_reedit = Reedit{}; return; }
+    SetFocus(g_list);
+    ListView_EditLabel(g_list, g_view.rowOf[idx]);
+}
+
+void OnEndLabelEdit(const NMLVDISPINFOW* di) {
+    g_editing = false;
+    const std::wstring old = g_editName;
+    g_editName.clear();
+    if (!di->item.pszText || old.empty()) return;  // Échap
+    const std::wstring typed = di->item.pszText;
+    const std::wstring name = CleanFileName(typed);
+    if (name.empty() || name == old) return;
+    if (const wchar_t* err = FileNameError(name)) {
+        g_reedit = Reedit{old, typed, err};
+        PostMessageW(g_hwnd, WM_APP_REEDIT, 0, 0);
+        return;
+    }
+    const int idx = FindEntryByName(old);
+    if (idx >= 0 && !E(idx).isDir() && _wcsicmp(PathFindExtensionW(old.c_str()), PathFindExtensionW(name.c_str())) != 0 &&
+        MessageBoxW(g_hwnd,
+                    L"Si vous modifiez l'extension du nom de fichier, le fichier risque de devenir inutilisable.\n\n"
+                    L"Voulez-vous vraiment la modifier ?",
+                    L"Renommer", MB_YESNO | MB_ICONWARNING) != IDYES)
+        return;
+    FileOp op;
+    op.kind = FileOpKind::Rename;
+    op.folder = g_path;
+    op.paths.push_back(Join(g_path, old.c_str()));
+    op.newName = name;
+    StartOp(std::move(op));
+}
+
+// Le moteur de copie du Shell active sa fenêtre de progression dès le début,
+// encore invisible (~100 ms, même pour un seul petit fichier) : les touches
+// tapées juste après Ctrl+V ou un renommage partiraient dans le vide. On
+// reprend aussitôt le premier plan tant que cette fenêtre reste invisible ;
+// une fois affichée (longue copie), elle garde la main comme dans l'Explorateur.
+void ReclaimForeground() {
+    HWND fg = GetForegroundWindow();
+    if (!fg || fg == g_hwnd || IsWindowVisible(fg)) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    wchar_t cls[64] = {};
+    GetClassNameW(fg, cls, _countof(cls));
+    if (pid == GetCurrentProcessId() && wcscmp(cls, L"OperationStatusWindow") == 0) SetForegroundWindow(g_hwnd);
+}
+
 void ShowContextMenu(LPARAM lp) {
     if (!HasView()) return;
     POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -611,17 +893,26 @@ void ShowContextMenu(LPARAM lp) {
         hit.pt = c;
         if (ListView_HitTest(g_list, &hit) < 0) sel.clear();  // clic dans le vide : menu du dossier
     }
-    const int single = sel.size() == 1 ? sel[0] : -1;
-    const bool ok = ShellMenu_Show(g_hwnd, g_path, NamesOf(sel), pt, GetKeyState(VK_SHIFT) < 0,
-                                   [single](const std::wstring& verb) {
-                                       // « Ouvrir » sur un dossier ou un raccourci : chez nous, pas dans l'Explorateur.
-                                       if (single >= 0 && (_wcsicmp(verb.c_str(), L"open") == 0 ||
-                                                           _wcsicmp(verb.c_str(), L"explore") == 0)) {
-                                           ActivateEntry(single);
-                                           return true;
-                                       }
-                                       return false;
-                                   });
+    // Les noms (et non des index) : la vue peut être rafraîchie pendant que le menu est ouvert.
+    const std::vector<std::wstring> names = NamesOf(sel);
+    const bool ok = ShellMenu_Show(g_hwnd, g_path, names, pt, GetKeyState(VK_SHIFT) < 0, [names](const std::wstring& verb) {
+        auto is = [&](const wchar_t* v) { return _wcsicmp(verb.c_str(), v) == 0; };
+        const int single = names.size() == 1 ? FindEntryByName(names[0]) : -1;
+        const bool background = names.empty();
+        // « Ouvrir » sur un dossier ou un raccourci : chez nous, pas dans l'Explorateur.
+        if (single >= 0 && (is(L"open") || is(L"explore"))) { ActivateEntry(single); return true; }
+        // Opérations de fichiers : notre moteur (resélection, estompage des éléments coupés…).
+        if (!background && (is(L"copy") || is(L"cut"))) { CopyNames(names, is(L"cut")); return true; }
+        if (is(L"paste")) {
+            Paste(single >= 0 && E(single).isDir() ? Join(g_path, NameOf(single)) : g_path);
+            return true;
+        }
+        if (!background && is(L"delete")) { DeleteNames(names, GetKeyState(VK_SHIFT) < 0); return true; }
+        if (single >= 0 && is(L"rename")) { ListView_EditLabel(g_list, g_view.rowOf[single]); return true; }
+        if (is(L"NewFolder")) { NewFolder(); return true; }
+        if (background) g_expectNew = {g_view.data, GetTickCount64() + 10000};
+        return false;
+    });
     if (!ok) SetStatus(L"Menu contextuel indisponible pour cet emplacement.");
 }
 
@@ -681,7 +972,7 @@ void OnDirChanged(uintptr_t id) {
 
 void OnWatchTimer() {
     KillTimer(g_hwnd, TIMER_WATCH);
-    if (g_pending.active) {  // une navigation est en cours : on réessaie plus tard
+    if (g_pending.active || g_editing) {  // navigation ou renommage en cours : on réessaie plus tard
         SetTimer(g_hwnd, TIMER_WATCH, (UINT)kWatchMinDelayMs, nullptr);
         return;
     }
@@ -781,10 +1072,10 @@ void CreateChildren(HWND hwnd) {
 
     g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_SHAREIMAGELISTS |
-                                 LVS_SHOWSELALWAYS,
+                                 LVS_SHOWSELALWAYS | LVS_EDITLABELS,
                              0, 0, 0, 0, hwnd, (HMENU)ID_LIST, g_inst, nullptr);
     ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
-    ListView_SetCallbackMask(g_list, LVIS_OVERLAYMASK);  // surimpressions fournies par LVN_GETDISPINFO
+    ListView_SetCallbackMask(g_list, LVIS_OVERLAYMASK | LVIS_CUT);  // fournis par LVN_GETDISPINFO
     SetWindowTheme(g_list, L"Explorer", nullptr);
 
     struct {
@@ -822,6 +1113,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_dpi = GetDpiForWindow(hwnd);
             CreateChildren(hwnd);
             Icons_Start(hwnd, WM_APP_ICON);
+            AddClipboardFormatListener(hwnd);
             AttachTarget(hwnd);
             return 0;
         case WM_CONTEXTMENU:
@@ -829,6 +1121,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_APP_ICON: OnIcon((IconResult*)lp); return 0;
         case WM_APP_DIRCHANGED: OnDirChanged((uintptr_t)wp); return 0;
+        case WM_APP_FILEOP: OnFileOp((FileOpResult*)lp); return 0;
+        case WM_APP_EDITSEL: OnEditSel(); return 0;
+        case WM_APP_REEDIT: OnReedit(); return 0;
+        case WM_APP_RECLAIM: ReclaimForeground(); return 0;
+        case WM_ACTIVATE:
+            // (y compris juste après la fin d'une opération : la fenêtre du moteur peut encore s'activer)
+            if (LOWORD(wp) == WA_INACTIVE) PostMessageW(hwnd, WM_APP_RECLAIM, 0, 0);
+            break;
+        case WM_CLIPBOARDUPDATE: OnClipboardUpdate(); return 0;
+        case WM_CLOSE:
+            // Une copie en cours continue jusqu'au bout : on masque la fenêtre et on attend.
+            if (FileOps_Running() > 0) {
+                g_quitWhenIdle = true;
+                ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            }
+            break;
         case WM_SIZE: Layout(); return 0;
         case WM_SETFOCUS: SetFocus(g_list); return 0;
         case WM_DPICHANGED: {
@@ -853,6 +1162,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == TIMER_WATCH) { OnWatchTimer(); return 0; }
+            if (wp == TIMER_AFTEROP) { ApplyAfterOp(); return 0; }
             break;
         case WM_COMMAND:
             switch (LOWORD(wp)) {
@@ -869,6 +1179,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case LVN_ODFINDITEMW: return FindItem((NMLVFINDITEMW*)lp);
                 case LVN_COLUMNCLICK: Resort(((NMLISTVIEW*)lp)->iSubItem); return 0;
                 case NM_DBLCLK: Activate(((NMITEMACTIVATE*)lp)->iItem); return 0;
+                case LVN_BEGINLABELEDITW: return OnBeginLabelEdit((NMLVDISPINFOW*)lp);
+                case LVN_ENDLABELEDITW: OnEndLabelEdit((NMLVDISPINFOW*)lp); return FALSE;  // la liste relira le nom
             }
             break;
         }
@@ -878,6 +1190,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Icons_Stop();
             Watch_Stop();
             ShellMenu_Discard();
+            RemoveClipboardFormatListener(hwnd);
+            Clipboard_Flush();  // ce qui a été copié reste disponible après la fermeture
             Jobs_NewGeneration();  // périme et interrompt la tâche en cours
             PostQuitMessage(0);
             return 0;
@@ -891,6 +1205,7 @@ bool HandleGlobalKeys(const MSG& m) {
         PrepareContextMenu(m.lParam, (m.wParam & MK_SHIFT) != 0);
         return false;  // la liste traite ensuite le clic normalement (sélection)
     }
+    if (g_editing) return false;  // saisie d'un nom : toutes les touches vont à la zone d'édition
     const HWND focus = GetFocus();
     if (m.message == WM_XBUTTONUP) {
         if (GET_XBUTTON_WPARAM(m.wParam) == XBUTTON1) GoBack(); else GoForward();
@@ -932,6 +1247,18 @@ bool HandleGlobalKeys(const MSG& m) {
         case VK_BACK:
             if (focus == g_list) { GoUp(); return true; }
             return false;
+    }
+    if (focus != g_list) return false;
+    const bool shift = GetKeyState(VK_SHIFT) < 0;
+    switch (m.wParam) {
+        case VK_F2: BeginRename(); return true;
+        case VK_DELETE: DeleteNames(NamesOf(SelectedEntries()), shift); return true;
+        case 'C': if (!ctrl) return false; CopyNames(NamesOf(SelectedEntries()), false); return true;
+        case 'X': if (!ctrl) return false; CopyNames(NamesOf(SelectedEntries()), true); return true;
+        case 'V': if (!ctrl) return false; Paste(g_path); return true;
+        case 'A': if (!ctrl) return false; ListView_SetItemState(g_list, -1, LVIS_SELECTED, LVIS_SELECTED); return true;
+        case 'N': if (!ctrl || !shift) return false; NewFolder(); return true;
+        case 'D': if (!ctrl) return false; DeleteNames(NamesOf(SelectedEntries()), false); return true;
     }
     return false;
 }

@@ -65,3 +65,27 @@ std::wstring NormalizePath(std::wstring s, const std::wstring& base) {
     while (s.size() > 3 && s.back() == L'\\') s.pop_back();
     return s;
 }
+
+std::wstring CleanFileName(std::wstring s) {
+    size_t b = 0;
+    while (b < s.size() && s[b] == L' ') ++b;
+    s.erase(0, b);
+    while (!s.empty() && (s.back() == L' ' || s.back() == L'.')) s.pop_back();
+    return s;
+}
+
+const wchar_t* FileNameError(const std::wstring& name) {
+    if (name.empty()) return L"Vous devez entrer un nom.";
+    for (wchar_t c : name)
+        if (c < 32 || wcschr(L"\\/:*?\"<>|", c))
+            return L"Un nom de fichier ne peut pas contenir les caractères suivants :\n\\ / : * ? \" < > |";
+    if (name.size() > 255) return L"Ce nom est trop long (255 caractères au maximum).";
+    // Noms de périphériques : refusés par Windows dans tous les dossiers.
+    static const wchar_t* const kReserved[] = {L"CON", L"PRN", L"AUX", L"NUL"};
+    for (const wchar_t* r : kReserved)
+        if (_wcsicmp(name.c_str(), r) == 0) return L"Ce nom est réservé par Windows.";
+    if (name.size() == 4 && (_wcsnicmp(name.c_str(), L"COM", 3) == 0 || _wcsnicmp(name.c_str(), L"LPT", 3) == 0) &&
+        name[3] >= L'1' && name[3] <= L'9')
+        return L"Ce nom est réservé par Windows.";
+    return nullptr;
+}

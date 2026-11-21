@@ -182,7 +182,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Surimpressions (overlays) | Flèche des raccourcis, cadenas, états de synchro cloud (nuage, coche verte), double flèche bleue (fichier compressé NTFS) | ✅ P1 (via `SHGFI_OVERLAYINDEX`) ⚙️ `IShellIconOverlayIdentifier` (15 emplacements max) |
 | Éléments masqués | Icône semi-transparente | P0 |
 | Couleur des fichiers compressés/chiffrés NTFS | Bleu / vert (option) | P3 |
-| Couper (Ctrl+X) | L'élément coupé devient semi-transparent jusqu'au collage | P1 |
+| Couper (Ctrl+X) | L'élément coupé devient semi-transparent jusqu'au collage | ✅ P1 |
 | **Info-bulles** | Survol : type, taille, date ; pour les dossiers, taille et premiers fichiers (option) | P2 |
 | Mise en évidence des nouveaux éléments | Un élément créé ou collé est sélectionné et rendu visible | P1 |
 
@@ -212,29 +212,29 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Nouveau dossier | Ctrl+Maj+N, Nouveau ▸ Dossier ; nom « Nouveau dossier (2) » si déjà pris ; directement en mode renommage | **P0** |
-| Nouveau fichier | Nouveau ▸ (Document texte, Raccourci, Image bitmap, Dossier compressé, + entrées des applications) | P1 ⚙️ clés `ShellNew` du registre (`NullFile`, `FileName`, `Data`, `Command`) |
-| **Renommer** | F2, clic lent sur un élément sélectionné, bouton | **P0** |
-| Sélection intelligente | À l'édition, seul le nom **sans l'extension** est sélectionné | P0 |
+| Nouveau dossier | Ctrl+Maj+N, Nouveau ▸ Dossier ; nom « Nouveau dossier (2) » si déjà pris ; directement en mode renommage | ✅ P0 |
+| Nouveau fichier | Nouveau ▸ (Document texte, Raccourci, Image bitmap, Dossier compressé, + entrées des applications) | ✅ P1 (menu Shell ; l'élément créé passe en renommage) ⚙️ clés `ShellNew` du registre (`NullFile`, `FileName`, `Data`, `Command`) |
+| **Renommer** | F2, clic lent sur un élément sélectionné, bouton | ✅ P0 (F2, clic lent, menu ; un seul élément) |
+| Sélection intelligente | À l'édition, seul le nom **sans l'extension** est sélectionné | ✅ P0 |
 | Tab / Maj+Tab pendant le renommage | Valide et passe au fichier suivant / précédent | P1 |
 | Renommage multiple | Sélection de N fichiers + F2 : « Vacances (1).jpg », « Vacances (2).jpg »… | P1 |
-| Validation | Caractères interdits `\ / : * ? " < > |` (info-bulle d'erreur), noms réservés (`CON`, `PRN`, `AUX`, `NUL`, `COM1`…`LPT9`), point ou espace final retirés | P0 |
-| Changement d'extension | Avertissement « Si vous modifiez l'extension… » | P0 |
+| Validation | Caractères interdits `\ / : * ? " < > |` (info-bulle d'erreur), noms réservés (`CON`, `PRN`, `AUX`, `NUL`, `COM1`…`LPT9`), point ou espace final retirés | ✅ P0 (bulle d'erreur, la saisie reste ouverte) |
+| Changement d'extension | Avertissement « Si vous modifiez l'extension… » | ✅ P0 |
 | Renommage par la voix | Saisie vocale dans le champ de renommage (26H2) | P3 |
 
 ### 6.2 Copier, couper, coller, déplacer
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Copier / Couper / Coller | Ctrl+C / Ctrl+X / Ctrl+V ; interopérable avec les autres applications via le presse-papiers | **P0** ⚙️ formats `CF_HDROP`, `Shell IDList Array`, `Preferred DropEffect` |
+| Copier / Couper / Coller | Ctrl+C / Ctrl+X / Ctrl+V ; interopérable avec les autres applications via le presse-papiers | ✅ P0 (dans les deux sens, CF_HDROP seul compris) ⚙️ formats `CF_HDROP`, `Shell IDList Array`, `Preferred DropEffect` |
 | Coller en tant que raccourci | Menu contextuel classique | P2 |
 | Copier en tant que chemin d'accès | Ctrl+Maj+C : chemin(s) entre guillemets | P1 |
 | Copier vers / Déplacer vers | Choix d'un dossier de destination | P2 |
 | **Glisser-déposer** | Même volume = déplacer ; autre volume = copier ; Ctrl = forcer la copie ; Maj = forcer le déplacement ; Alt ou Ctrl+Maj = créer un raccourci ; **clic droit + glisser** = menu au dépôt (Copier ici, Déplacer ici, Créer un raccourci ici). Interopérable avec les autres applications | **P0** ⚙️ OLE `IDropTarget` / `IDropSource` / `IDataObject` |
 | Ouverture au survol pendant le glisser | Survoler un dossier ou un onglet ouvre celui-ci après un délai | P2 |
 | Dupliquer sur place | Ctrl+C, Ctrl+V dans le même dossier : « fichier - Copie.txt » | P0 |
-| **Boîte de dialogue de copie** | Progression, débit, **graphique de vitesse** (« Plus de détails »), temps restant, pause, annulation ; plusieurs copies regroupées dans une seule fenêtre | **P0** |
-| **Conflits** | Remplacer, Ignorer, **Comparer** (choix fichier par fichier, avec dates et tailles), « Faire ceci pour les N conflits suivants » ; fusion des dossiers de même nom (option *Masquer les conflits de fusion de dossiers*) | **P0** |
+| **Boîte de dialogue de copie** | Progression, débit, **graphique de vitesse** (« Plus de détails »), temps restant, pause, annulation ; plusieurs copies regroupées dans une seule fenêtre | ✅ P0 (fenêtre du Shell, interface jamais bloquée) |
+| **Conflits** | Remplacer, Ignorer, **Comparer** (choix fichier par fichier, avec dates et tailles), « Faire ceci pour les N conflits suivants » ; fusion des dossiers de même nom (option *Masquer les conflits de fusion de dossiers*) | ✅ P0 (dialogue du Shell) |
 | Fichier en cours d'utilisation | « Le fichier est ouvert dans <Application> » : Réessayer / Ignorer | P1 ⚙️ Restart Manager (`RmGetList`) |
 | Droits insuffisants | « Vous devez disposer d'une autorisation » ▸ Continuer (élévation UAC pour cette opération) | P1 ⚙️ élévation via COM (`IFileOperation` dans un processus élevé) |
 | Perte de propriétés | Copie vers FAT/exFAT ou réseau : avertissement quand les propriétés (flux NTFS…) ne peuvent pas être conservées | P2 |
@@ -245,10 +245,10 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Supprimer vers la Corbeille | Suppr, Ctrl+D, bouton | **P0** |
-| Suppression définitive | Maj+Suppr (avec confirmation) | **P0** |
-| Confirmation | Optionnelle (propriétés de la Corbeille) ; toujours demandée pour une suppression définitive | P0 |
-| Trop gros pour la Corbeille | « Supprimer définitivement ? » | P1 |
+| Supprimer vers la Corbeille | Suppr, Ctrl+D, bouton | ✅ P0 (la cible passe à l'élément suivant) |
+| Suppression définitive | Maj+Suppr (avec confirmation) | ✅ P0 |
+| Confirmation | Optionnelle (propriétés de la Corbeille) ; toujours demandée pour une suppression définitive | ✅ P0 |
+| Trop gros pour la Corbeille | « Supprimer définitivement ? » | ✅ P1 (avertissement du Shell) |
 | **Annuler / Rétablir** | Ctrl+Z / Ctrl+Y : copie, déplacement, renommage, suppression, création, sur plusieurs niveaux | **P1** |
 | Supprimer sur un lecteur réseau ou amovible | Définitif (pas de Corbeille), avec avertissement | P1 |
 
@@ -504,12 +504,12 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 ### Fichiers
 | Raccourci | Action | État |
 |---|---|---|
-| Ctrl+C / Ctrl+X / Ctrl+V | Copier / Couper / Coller | P0 |
+| Ctrl+C / Ctrl+X / Ctrl+V | Copier / Couper / Coller | ✅ |
 | Ctrl+Maj+C | Copier en tant que chemin d'accès | P1 |
 | Ctrl+Z / Ctrl+Y | Annuler / Rétablir | P1 |
-| Suppr, Ctrl+D / Maj+Suppr | Corbeille / suppression définitive | P0 |
-| F2 | Renommer | P0 |
-| Ctrl+Maj+N | Nouveau dossier | P0 |
+| Suppr, Ctrl+D / Maj+Suppr | Corbeille / suppression définitive | ✅ |
+| F2 | Renommer | ✅ |
+| Ctrl+Maj+N | Nouveau dossier | ✅ |
 | Alt+Entrée | Propriétés | P0 |
 | Maj+F10, touche Menu | Menu contextuel | P0 |
 | Ctrl+A | Tout sélectionner | ✅ |
@@ -588,7 +588,7 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | **Corbeille** | `$Recycle.Bin\<SID>\$Rxxxxxx` + `$Ixxxxxx` par volume (voir §11). |
 | **Fichiers cloud** | Fichiers de substitution (placeholders) avec attributs `RECALL_ON_DATA_ACCESS` / `RECALL_ON_OPEN` : **ne jamais lire leur contenu** sans action de l'utilisateur. |
 | **Fichiers verrouillés** | Restart Manager (`RmStartSession`, `RmRegisterResources`, `RmGetList`) pour savoir quel processus tient un fichier. |
-| **Noms réservés et limites** | `CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9` (même avec une extension) ; caractères interdits ; limite de 260 caractères (contournée par `\\?\`) ; 255 caractères par composant. |
+| **Noms réservés et limites** | `CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9` (noms nus : sous Windows 11, `CON.txt` est un fichier ordinaire, vérifié) ; caractères interdits ; limite de 260 caractères (contournée par `\\?\`) ; 255 caractères par composant. |
 | **Tri** | `StrCmpLogicalW` (naturel), ou clés `LCMapStringEx` avec `SORT_DIGITSASNUMBERS` (ce que fait FastExplorer, en plus rapide). |
 | **Processus** | `explorer.exe` héberge aussi la barre des tâches et le bureau ; option « processus séparé » pour les fenêtres de dossiers. FastExplorer est indépendant : s'il plante, la barre des tâches reste en vie. |
 
@@ -599,7 +599,7 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre logique de dépendances :
 
 1. ✅ **Fondations Shell** : menu contextuel Shell complet, propriétés natives, icônes réelles (exe/lnk) en tâche de fond, raccourcis `.lnk`.
-2. **Opérations de fichiers** : nouveau dossier, renommer (F2, validation), copier/couper/coller (presse-papiers interopérable), supprimer (Corbeille et définitif), moteur de copie avec progression et conflits.
+2. ✅ **Opérations de fichiers** : nouveau dossier, renommer (F2, validation), copier/couper/coller (presse-papiers interopérable), supprimer (Corbeille et définitif), moteur de copie avec progression et conflits.
 3. **Glisser-déposer** OLE, dans les deux sens.
 4. 🟡 **Rafraîchissement automatique** : fait pour le dossier affiché ; reste l'arrivée des lecteurs.
 5. **Volet de navigation** : dossiers épinglés + arborescence de Ce PC ; libellés et jauges des lecteurs.

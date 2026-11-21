@@ -11,6 +11,7 @@
 //   shellmenu.* menus contextuels et verbes du Shell, raccourcis .lnk
 //   icons.*    icônes propres aux fichiers (exe, lnk…), thread dédié
 //   watch.*    surveillance du dossier affiché
+//   fileops.*  opérations sur les fichiers (moteur du Shell), presse-papiers
 //   ui.*       fenêtre, ListView virtuelle, raccourcis
 
 #include "win.h"

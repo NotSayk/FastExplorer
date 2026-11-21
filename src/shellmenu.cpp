@@ -7,10 +7,38 @@
 #include <shobjidl.h>
 #include <wrl/client.h>
 
-#include <memory>
 #include <unordered_set>
 
 using Microsoft::WRL::ComPtr;
+
+Pidl ParsePath(const std::wstring& path) {
+    PIDLIST_ABSOLUTE p = nullptr;
+    const HRESULT hr = path.empty() ? SHGetKnownFolderIDList(FOLDERID_ComputerFolder, 0, nullptr, &p)
+                                    : SHParseDisplayName(path.c_str(), nullptr, &p, 0, nullptr);
+    return Pidl(SUCCEEDED(hr) ? (ITEMIDLIST*)p : nullptr);  // retire __unaligned (sans effet sur x64)
+}
+
+bool ShellObjectOf(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, REFIID riid,
+                   void** out) {
+    *out = nullptr;
+    // Les éléments partagent le même parent : on demande au dossier parent
+    // un seul objet pour toute la sélection.
+    std::vector<Pidl> abs;
+    abs.reserve(names.size());
+    for (const auto& n : names) {
+        Pidl p = ParsePath(Join(folder, n.c_str()));
+        if (!p) return false;
+        abs.push_back(std::move(p));
+    }
+    if (abs.empty()) return false;
+    ComPtr<IShellFolder> parent;
+    PCUITEMID_CHILD first = nullptr;
+    if (FAILED(SHBindToParent(abs[0].get(), IID_PPV_ARGS(&parent), &first))) return false;
+    std::vector<PCUITEMID_CHILD> kids;
+    kids.reserve(abs.size());
+    for (const auto& p : abs) kids.push_back((PCUITEMID_CHILD)ILFindLastID(p.get()));
+    return SUCCEEDED(parent->GetUIObjectOf(owner, (UINT)kids.size(), kids.data(), riid, nullptr, out)) && *out;
+}
 
 namespace {
 
@@ -19,18 +47,6 @@ constexpr UINT kFirst = 1, kLast = 0x7FFF;
 // Interfaces du menu affiché, le temps de TrackPopupMenuEx (sous-menus dynamiques).
 ComPtr<IContextMenu2> g_cm2;
 ComPtr<IContextMenu3> g_cm3;
-
-struct PidlFree {
-    void operator()(ITEMIDLIST* p) const { CoTaskMemFree(p); }
-};
-using Pidl = std::unique_ptr<ITEMIDLIST, PidlFree>;
-
-Pidl ParsePath(const std::wstring& path) {
-    PIDLIST_ABSOLUTE p = nullptr;
-    const HRESULT hr = path.empty() ? SHGetKnownFolderIDList(FOLDERID_ComputerFolder, 0, nullptr, &p)
-                                    : SHParseDisplayName(path.c_str(), nullptr, &p, 0, nullptr);
-    return Pidl(SUCCEEDED(hr) ? (ITEMIDLIST*)p : nullptr);  // retire __unaligned (sans effet sur x64)
-}
 
 ComPtr<IContextMenu> BuildMenu(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names) {
     ComPtr<IContextMenu> cm;
@@ -42,22 +58,7 @@ ComPtr<IContextMenu> BuildMenu(HWND owner, const std::wstring& folder, const std
         sf->CreateViewObject(owner, IID_PPV_ARGS(&cm));
         return cm;
     }
-    // Les éléments partagent le même parent : on demande au dossier parent
-    // un seul menu pour toute la sélection.
-    std::vector<Pidl> abs;
-    abs.reserve(names.size());
-    for (const auto& n : names) {
-        Pidl p = ParsePath(Join(folder, n.c_str()));
-        if (!p) return cm;
-        abs.push_back(std::move(p));
-    }
-    ComPtr<IShellFolder> parent;
-    PCUITEMID_CHILD first = nullptr;
-    if (FAILED(SHBindToParent(abs[0].get(), IID_PPV_ARGS(&parent), &first))) return cm;
-    std::vector<PCUITEMID_CHILD> kids;
-    kids.reserve(abs.size());
-    for (const auto& p : abs) kids.push_back((PCUITEMID_CHILD)ILFindLastID(p.get()));
-    parent->GetUIObjectOf(owner, (UINT)kids.size(), kids.data(), IID_IContextMenu, nullptr, (void**)cm.GetAddressOf());
+    ShellObjectOf(owner, folder, names, IID_IContextMenu, (void**)cm.GetAddressOf());
     return cm;
 }
 
@@ -126,7 +127,9 @@ Built Build(HWND owner, const std::wstring& folder, const std::vector<std::wstri
     if (!cm) return b;
     HMENU menu = CreatePopupMenu();
     if (!menu) return b;
-    const UINT flags = CMF_NORMAL | (extended ? CMF_EXTENDEDVERBS : 0);
+    // CMF_CANRENAME : « Renommer » apparaît ; le verbe "rename" est intercepté par l'appli.
+    const UINT flags = CMF_NORMAL | (extended ? CMF_EXTENDEDVERBS : 0) |
+                       (!names.empty() && !folder.empty() ? CMF_CANRENAME : 0);
     if (FAILED(cm->QueryContextMenu(menu, 0, kFirst, kLast, flags))) {
         DestroyMenu(menu);
         return b;

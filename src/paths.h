@@ -18,3 +18,10 @@ bool ParentOf(const std::wstring& p, std::wstring& parent, std::wstring& child);
 // "..", chemin relatif à `base`. Une saisie relative sans base est renvoyée
 // telle quelle (elle échouera proprement à l'ouverture).
 std::wstring NormalizePath(std::wstring s, const std::wstring& base);
+
+// Nom saisi au renommage : retire les espaces en tête et en fin, et les points
+// finaux (Windows les ignorerait de toute façon).
+std::wstring CleanFileName(std::wstring s);
+
+// nullptr si le nom (déjà nettoyé) est acceptable, sinon le message à afficher.
+const wchar_t* FileNameError(const std::wstring& name);

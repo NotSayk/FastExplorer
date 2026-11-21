@@ -1,4 +1,5 @@
 #pragma once
+#include "pidl.h"
 #include "win.h"
 
 #include <functional>
@@ -42,6 +43,10 @@ bool ShellMenu_Invoke(HWND owner, const std::wstring& folder, const std::vector<
 // À appeler en tête de WndProc : relaie aux extensions les messages des
 // sous-menus dessinés par elles (Ouvrir avec ▸, Envoyer vers ▸, Nouveau ▸).
 bool ShellMenu_HandleMessage(UINT msg, WPARAM wp, LPARAM lp, LRESULT* result);
+
+// Objet Shell (IContextMenu, IDataObject…) pour des éléments d'un même dossier.
+bool ShellObjectOf(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, REFIID riid,
+                   void** out);
 
 // Cible d'un raccourci .lnk, sans le « résoudre » (ni recherche, ni réseau).
 // false si la cible n'est pas un chemin du système de fichiers.

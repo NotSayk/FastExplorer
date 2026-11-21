@@ -3,6 +3,7 @@
 
 #include "win.h"
 
+#include "fileops.h"
 #include "icons.h"
 #include "jobs.h"
 #include "listing.h"
@@ -404,6 +405,177 @@ void TestWatch() {
     DestroyWindow(sink);
 }
 
+void TestFileNames() {
+    CHECK_STR(CleanFileName(L"  rapport.txt  "), L"rapport.txt");
+    CHECK_STR(CleanFileName(L"note..."), L"note");
+    CHECK_STR(CleanFileName(L"a. . "), L"a");
+    CHECK_STR(CleanFileName(L"   "), L"");
+    CHECK(FileNameError(L"rapport final.docx") == nullptr);
+    CHECK(FileNameError(L".gitignore") == nullptr);
+    CHECK(FileNameError(L"CON.txt") == nullptr);  // accepté par Windows 11 ; seul le nom nu est refusé
+    CHECK(FileNameError(L"") != nullptr);
+    CHECK(FileNameError(L"a/b") != nullptr);
+    CHECK(FileNameError(L"quoi?") != nullptr);
+    CHECK(FileNameError(L"x\ty") != nullptr);
+    CHECK(FileNameError(L"con") != nullptr);
+    CHECK(FileNameError(L"LPT1") != nullptr);
+    CHECK(FileNameError(L"COM0") == nullptr);
+    CHECK(FileNameError(std::wstring(256, L'a')) != nullptr);
+    CHECK(FileNameError(std::wstring(255, L'a')) == nullptr);
+}
+
+bool Exists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+void TestFileOps() {
+    HWND sink = CreateWindowW(L"FeTestSink", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    CHECK(sink != nullptr);
+    if (!sink) return;
+    constexpr UINT kMsg = WM_APP + 10;
+    const std::wstring ops = Join(g_root, L"ops");
+    CreateDirectoryW(ops.c_str(), nullptr);
+
+    auto run = [&](FileOp op) -> std::unique_ptr<FileOpResult> {
+        op.silent = true;  // aucune fenêtre pendant les tests
+        FileOps_Start(nullptr, sink, kMsg, std::move(op));
+        const double t0 = NowMs();
+        MSG m;
+        while (NowMs() - t0 < 15000) {
+            if (PeekMessageW(&m, sink, kMsg, kMsg, PM_REMOVE)) return std::unique_ptr<FileOpResult>((FileOpResult*)m.lParam);
+            Sleep(2);
+        }
+        return nullptr;
+    };
+    auto created = [](const std::unique_ptr<FileOpResult>& r) {
+        return r && r->created.size() == 1 ? r->created[0] : std::wstring(L"<aucun>");
+    };
+
+    FileOp nf;
+    nf.kind = FileOpKind::NewFolder;
+    nf.folder = ops;
+    nf.newName = L"Nouveau dossier";
+    auto r = run(FileOp{nf.kind, nf.folder, {}, {}, nf.newName});
+    CHECK(r && SUCCEEDED(r->hr));
+    CHECK_STR(created(r), L"Nouveau dossier");
+    r = run(FileOp{nf.kind, nf.folder, {}, {}, nf.newName});
+    CHECK_STR(created(r), L"Nouveau dossier (2)");  // numérotation comme l'Explorateur
+    CHECK(Exists(Join(ops, L"Nouveau dossier (2)")));
+
+    FileOp rn;
+    rn.kind = FileOpKind::Rename;
+    rn.folder = ops;
+    rn.paths = {Join(ops, L"Nouveau dossier (2)")};
+    rn.newName = L"renommé";
+    r = run(std::move(rn));
+    CHECK(r && SUCCEEDED(r->hr));
+    CHECK_STR(created(r), L"renommé");
+    CHECK(Exists(Join(ops, L"renommé")) && !Exists(Join(ops, L"Nouveau dossier (2)")));
+
+    MakeFile(Join(ops, L"f.txt"), 10);
+    FileOp cp;
+    cp.kind = FileOpKind::Copy;
+    cp.folder = Join(ops, L"renommé");
+    cp.paths = {Join(ops, L"f.txt")};
+    r = run(std::move(cp));
+    CHECK(r && SUCCEEDED(r->hr));
+    CHECK_STR(created(r), L"f.txt");
+    CHECK(Exists(Join(ops, L"renommé\\f.txt")) && Exists(Join(ops, L"f.txt")));
+
+    FileOp same;  // copie dans son propre dossier : un double, pas un écrasement
+    same.kind = FileOpKind::Copy;
+    same.folder = ops;
+    same.paths = {Join(ops, L"f.txt")};
+    r = run(std::move(same));
+    CHECK(r && SUCCEEDED(r->hr));
+    const std::wstring dup = created(r);
+    printf("  copie dans le meme dossier : [%ls]\n", dup.c_str());
+    CHECK(dup != L"f.txt" && dup != L"<aucun>" && Exists(Join(ops, dup.c_str())));
+
+    FileOp mv;
+    mv.kind = FileOpKind::Move;
+    mv.folder = Join(ops, L"Nouveau dossier");
+    mv.paths = {Join(ops, L"renommé\\f.txt")};
+    r = run(std::move(mv));
+    CHECK(r && SUCCEEDED(r->hr));
+    CHECK_STR(created(r), L"f.txt");
+    CHECK(Exists(Join(ops, L"Nouveau dossier\\f.txt")) && !Exists(Join(ops, L"renommé\\f.txt")));
+
+    FileOp stay;  // déplacer là où il est déjà : rien à faire, pas d'erreur
+    stay.kind = FileOpKind::Move;
+    stay.folder = ops;
+    stay.paths = {Join(ops, L"f.txt")};
+    r = run(std::move(stay));
+    CHECK(r && SUCCEEDED(r->hr) && r->created.empty());
+    CHECK(Exists(Join(ops, L"f.txt")));
+
+    FileOp del;
+    del.kind = FileOpKind::Delete;
+    del.folder = ops;
+    del.permanent = true;
+    del.paths = {Join(ops, L"Nouveau dossier"), Join(ops, dup.c_str())};
+    del.focusAfter = L"f.txt";
+    r = run(std::move(del));
+    CHECK(r && SUCCEEDED(r->hr));
+    CHECK(r && r->focusAfter == L"f.txt");
+    CHECK(!Exists(Join(ops, L"Nouveau dossier")) && !Exists(Join(ops, dup.c_str())));
+
+    FileOp gone;
+    gone.kind = FileOpKind::Delete;
+    gone.folder = ops;
+    gone.permanent = true;
+    gone.paths = {Join(ops, L"absent.txt")};
+    r = run(std::move(gone));
+    CHECK(r && FileOps_IsFailure(*r));
+    CHECK(FileOps_Running() == 0);
+
+    // Collage depuis une application qui ne fournit que des chemins (CF_HDROP),
+    // et depuis un « Couper » de l'Explorateur (format Shell + effet DÉPLACER).
+    {
+        const std::wstring src = Join(ops, L"f.txt");
+        const size_t bytes = sizeof(DROPFILES) + (src.size() + 2) * sizeof(wchar_t);
+        HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+        auto* df = (DROPFILES*)GlobalLock(g);
+        df->pFiles = sizeof(DROPFILES);
+        df->fWide = TRUE;
+        memcpy((char*)df + sizeof(DROPFILES), src.c_str(), src.size() * sizeof(wchar_t));
+        GlobalUnlock(g);
+        IDataObject* dobj = nullptr;
+        CHECK(SUCCEEDED(SHCreateDataObject(nullptr, 0, nullptr, nullptr, IID_PPV_ARGS(&dobj))));
+        if (dobj) {
+            FORMATETC fe{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+            STGMEDIUM sm{};
+            sm.tymed = TYMED_HGLOBAL;
+            sm.hGlobal = g;
+            CHECK(SUCCEEDED(dobj->SetData(&fe, &sm, TRUE)));
+            std::vector<Pidl> items;
+            bool cut = true;
+            CHECK(ItemsFromDataObject(dobj, items, cut));
+            CHECK(items.size() == 1 && !cut);
+            wchar_t back[MAX_PATH] = {};
+            CHECK(!items.empty() && SHGetPathFromIDListW(items[0].get(), back) && _wcsicmp(back, src.c_str()) == 0);
+            dobj->Release();
+        }
+        IDataObject* shellObj = nullptr;
+        CHECK(ShellObjectOf(nullptr, ops, {L"f.txt"}, IID_IDataObject, (void**)&shellObj));
+        if (shellObj) {
+            HGLOBAL e = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+            *(DWORD*)GlobalLock(e) = DROPEFFECT_MOVE;
+            GlobalUnlock(e);
+            FORMATETC fe{(CLIPFORMAT)RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT), nullptr, DVASPECT_CONTENT, -1,
+                         TYMED_HGLOBAL};
+            STGMEDIUM sm{};
+            sm.tymed = TYMED_HGLOBAL;
+            sm.hGlobal = e;
+            shellObj->SetData(&fe, &sm, TRUE);
+            std::vector<Pidl> items;
+            bool cut = false;
+            CHECK(ItemsFromDataObject(shellObj, items, cut));
+            CHECK(items.size() == 1 && cut);
+            shellObj->Release();
+        }
+    }
+    DestroyWindow(sink);
+}
+
 }  // namespace
 
 int wmain() {
@@ -425,7 +597,9 @@ int wmain() {
     TestShortcut();
     TestEnumerateFileIsNotDirectory();
     TestPrepareMenu();
+    TestFileNames();
     TestWatch();
+    TestFileOps();
     RemoveTree(g_root);
     printf("\n%d verifications OK, %d echec(s)\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
