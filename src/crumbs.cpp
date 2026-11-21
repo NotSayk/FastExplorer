@@ -325,6 +325,12 @@ LRESULT CALLBACK CrumbsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
+        case WM_MBUTTONUP: {
+            const int hit = HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            if (hit >= 0 && g_hits[hit].part == Part::Text && g_host.openNewTab)
+                g_host.openNewTab(std::wstring(g_crumbs[g_hits[hit].index].path));
+            return 0;
+        }
         case WM_LBUTTONUP: {
             const int hit = HitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             const int was = g_pressed;  // avant ReleaseCapture : son WM_CAPTURECHANGED l'efface

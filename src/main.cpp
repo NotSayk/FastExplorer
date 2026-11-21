@@ -32,6 +32,7 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <string>
 
 namespace {
@@ -97,6 +98,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         return RunBench(NormalizePath(argv[2], L""));
     }
+    RECT at{};
+    bool haveAt = false;  // « --at x,y,l,h » : nouvelle fenêtre placée près de celle qui l'ouvre (Ctrl+N)
+    if (argc >= 4 && _wcsicmp(argv[2], L"--at") == 0)
+        haveAt = swscanf_s(argv[3], L"%ld,%ld,%ld,%ld", &at.left, &at.top, &at.right, &at.bottom) == 4;
     if (argc >= 2) {
         wchar_t cwd[MAX_PATH];
         const DWORD n = GetCurrentDirectoryW(MAX_PATH, cwd);
@@ -111,7 +116,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     // menu Shell, et plus tard glisser-déposer.
     OleInitialize(nullptr);
     int rc = 1;
-    if (Ui_Create(inst, show, start)) rc = Ui_Run();
+    if (Ui_Create(inst, show, start, haveAt ? &at : nullptr)) rc = Ui_Run();
     OleUninitialize();
     return rc;
 }

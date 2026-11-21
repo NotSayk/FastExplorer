@@ -19,6 +19,8 @@ struct Crumb {
 struct CrumbHost {
     std::function<void(const std::wstring& path)> navigate;
     std::function<void()> edit;
+    // Clic du milieu sur un segment : ouvrir ce dossier dans un nouvel onglet.
+    std::function<void(const std::wstring& path)> openNewTab;
     // Nom d'un lecteur (« Disque local (C:) ») s'il est connu, sinon "".
     std::function<std::wstring(const std::wstring& root)> driveText;
 };

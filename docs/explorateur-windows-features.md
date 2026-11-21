@@ -25,7 +25,7 @@ De haut en bas :
 
 | Zone | Contenu | Prio |
 |---|---|---|
-| **Barre d'onglets** (barre de titre) | Onglets, bouton « + », boutons fenêtre | P1 |
+| **Barre d'onglets** (barre de titre) | Onglets, bouton « + », boutons fenêtre | ✅ P1 (barre sous la barre de titre) |
 | **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅ (bouton Actualiser : bloc 10) |
 | **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | P1 |
 | **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accès rapide épinglé + arborescence de Ce PC, séparateur ; Accueil, Galerie, Réseau, Linux à venir) |
@@ -48,8 +48,8 @@ De haut en bas :
 | Dossier parent | Bouton ↑, Alt+↑ | ✅ |
 | Actualiser | F5, Ctrl+R, bouton | ✅ |
 | Rafraîchissement automatique | Le dossier se met à jour seul quand des fichiers sont créés, supprimés ou renommés | ✅ P0 (dossier affiché, lecteurs de Ce PC, dossier disparu → parent, éjection libérée) ⚙️ `ReadDirectoryChangesW` / `SHChangeNotifyRegister` |
-| Ouvrir dans une nouvelle fenêtre | Ctrl+N, Ctrl+double-clic, Ctrl+Entrée | P1 |
-| Ouvrir dans un nouvel onglet | Clic milieu sur un dossier (contenu, volet de navigation, et depuis 2026 barre d'adresse et Accueil), menu contextuel | P1 |
+| Ouvrir dans une nouvelle fenêtre | Ctrl+N, Ctrl+double-clic, Ctrl+Entrée | ✅ P1 |
+| Ouvrir dans un nouvel onglet | Clic milieu sur un dossier (contenu, volet de navigation, et depuis 2026 barre d'adresse et Accueil), menu contextuel | ✅ P1 (contenu, volet, fil d'Ariane, menus) |
 | Développer l'arborescence jusqu'au dossier courant | Ctrl+Maj+E (option « Développer jusqu'au dossier ouvert ») | P2 |
 
 ### 2.2 Barre d'adresse
@@ -86,7 +86,7 @@ De haut en bas :
 | **Bibliothèques** | Masquées par défaut. Vues agrégées de plusieurs dossiers (Documents, Musique, Images, Vidéos) | P3 |
 | **Corbeille** | Voir §11 | P1 |
 | **Panneau de configuration** | Visible si « Afficher tous les dossiers » est coché | P3 |
-| Clic droit sur le volet | Épingler, détacher, développer, ouvrir dans un nouvel onglet, propriétés | ✅🟡 P1 (menu du Shell + épingler / désépingler ; développer et nouvel onglet à venir) |
+| Clic droit sur le volet | Épingler, détacher, développer, ouvrir dans un nouvel onglet, propriétés | ✅🟡 P1 (menu du Shell + épingler / désépingler, nouvel onglet ; développer à venir) |
 
 Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*, *Afficher tous les dossiers*,
 *Développer jusqu'au dossier ouvert*, *Afficher Réseau / Ce PC*.
@@ -97,13 +97,13 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 
 | Fonction | Raccourci / geste | Prio |
 |---|---|---|
-| Nouvel onglet | Ctrl+T, bouton « + », clic milieu sur un dossier | P1 |
-| Fermer l'onglet | Ctrl+W, Ctrl+F4, clic milieu sur l'onglet | P1 |
-| Onglet suivant / précédent | Ctrl+Tab / Ctrl+Maj+Tab | P1 |
-| Aller à l'onglet N | Ctrl+1 … Ctrl+9 ⚠️ | P2 |
-| Réorganiser | Glisser l'onglet dans la barre | P1 |
+| Nouvel onglet | Ctrl+T, bouton « + », clic milieu sur un dossier | ✅ P1 |
+| Fermer l'onglet | Ctrl+W, Ctrl+F4, clic milieu sur l'onglet | ✅ P1 |
+| Onglet suivant / précédent | Ctrl+Tab / Ctrl+Maj+Tab | ✅ P1 (+ Ctrl+Pg préc. / Pg suiv.) |
+| Aller à l'onglet N | Ctrl+1 … Ctrl+9 ⚠️ | ✅ P2 (Ctrl+9 : le dernier) |
+| Réorganiser | Glisser l'onglet dans la barre | ✅ P1 |
 | Détacher / fusionner | Glisser un onglet hors de la fenêtre = nouvelle fenêtre ; dans une autre = fusion | P2 |
-| Menu de l'onglet | Dupliquer, Fermer, Fermer les autres, Fermer à droite, Déplacer vers une nouvelle fenêtre | P2 |
+| Menu de l'onglet | Dupliquer, Fermer, Fermer les autres, Fermer à droite, Déplacer vers une nouvelle fenêtre | ✅ P2 (« ouvrir » dans une nouvelle fenêtre) |
 | Déposer des fichiers sur un onglet | Survoler un onglet pendant un glisser l'active, pour y déposer | P2 |
 | Restaurer à la réouverture | Option *Restaurer les fenêtres de dossiers précédentes à l'ouverture de session* | P2 |
 | Clic milieu dans la barre d'onglets vide | ⚠️ selon la version | P3 |
@@ -481,9 +481,9 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Raccourci | Action | État |
 |---|---|---|
 | Win+E | Ouvrir l'Explorateur | P2 (remplacement par défaut, voir §20) |
-| Ctrl+N | Nouvelle fenêtre | P1 |
-| Ctrl+T / Ctrl+W / Ctrl+F4 | Nouvel onglet / fermer l'onglet | P1 |
-| Ctrl+Tab / Ctrl+Maj+Tab | Onglet suivant / précédent | P1 |
+| Ctrl+N | Nouvelle fenêtre | ✅ P1 |
+| Ctrl+T / Ctrl+W / Ctrl+F4 | Nouvel onglet / fermer l'onglet | ✅ P1 |
+| Ctrl+Tab / Ctrl+Maj+Tab | Onglet suivant / précédent | ✅ P1 |
 | F11 | Plein écran | P2 |
 
 ### Navigation
@@ -498,7 +498,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Ctrl+Maj+E | Développer le volet de navigation jusqu'au dossier courant | P2 |
 | Pavé num. * / + / − , ← / → (volet de navigation) | Tout développer / développer / réduire | ✅ (natif) |
 | Entrée | Ouvrir | ✅ |
-| Ctrl+Entrée | Ouvrir le dossier dans une nouvelle fenêtre ⚠️ | P2 |
+| Ctrl+Entrée | Ouvrir le dossier dans une nouvelle fenêtre ⚠️ | ✅ P2 |
 
 ### Fichiers
 | Raccourci | Action | État |
@@ -529,10 +529,10 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 |---|---|---|
 | Double-clic (ou simple clic selon l'option) | Ouvrir | ✅ (double) |
 | Clic lent sur un élément sélectionné | Renommer | ✅ |
-| Clic milieu sur un dossier | Nouvel onglet | P1 |
+| Clic milieu sur un dossier | Nouvel onglet | ✅ P1 |
 | Boutons 4/5 | Précédent / Suivant | ✅ |
 | Alt+double-clic | Propriétés | P2 |
-| Ctrl+double-clic | Nouvelle fenêtre | P2 |
+| Ctrl+double-clic | Nouvelle fenêtre | ✅ P2 |
 | Glisser (et ses variantes avec modificateurs) | Voir §6.2 | ✅ |
 | Glisser **depuis** l'application vers d'autres (mail, navigateur, éditeur) | ✅ P0 (objet de données du Shell, image de glissement) |
 | Glisser **vers** l'application depuis d'autres (navigateur, Outlook : fichiers virtuels `CFSTR_FILEDESCRIPTOR`) | ✅ P1 (via la cible du Shell) |
@@ -623,7 +623,7 @@ dossiers avant l'index…) :
 12. ✅ **Annuler / Rétablir** (Ctrl+Z / Ctrl+Y) et **opérations robustes** : fichier en cours d'utilisation
     (Restart Manager : quelle application le bloque), droits insuffisants (élévation), espace insuffisant,
     chemin trop long, suppression définitive sur un lecteur réseau ou amovible.
-13. **Onglets et fenêtres** : Ctrl+T / Ctrl+W / Ctrl+Tab, réorganiser, clic milieu sur un dossier,
+13. ✅ **Onglets et fenêtres** : Ctrl+T / Ctrl+W / Ctrl+Tab, réorganiser, clic milieu sur un dossier,
     Ctrl+N, ouvrir dans un nouvel onglet depuis le volet et le fil d'Ariane.
 14. **Taille des dossiers** ⭐ : calculée en arrière-plan (colonne Taille), sans ralentir la navigation.
 15. **Recherche instantanée sur tout le disque** ⭐ : index MFT + journal USN (à la *Everything*), puis

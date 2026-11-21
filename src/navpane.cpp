@@ -485,6 +485,18 @@ void StartPinnedRead(const std::wstring& unpinFirst) {
 }
 }  // namespace
 
+bool NavPane_PathAt(POINT screen, std::wstring& path) {
+    if (!g_tree) return false;
+    TVHITTESTINFO hit{};
+    hit.pt = screen;
+    ScreenToClient(g_tree, &hit.pt);
+    HTREEITEM h = TreeView_HitTest(g_tree, &hit);
+    Node* n = (hit.flags & TVHT_ONITEM) ? NodeOf(h) : nullptr;
+    if (!n || n->kind == Kind::Quick) return false;
+    path = n->path;
+    return true;
+}
+
 void NavPane_RefreshPinned(bool force) {
     if (!g_tree) return;
     if (g_pinnedLoading) {

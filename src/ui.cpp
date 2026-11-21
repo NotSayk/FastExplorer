@@ -70,7 +70,7 @@ constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-
 // d'événements (copie de milliers de fichiers) et s'espace sur les gros dossiers.
 constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
-enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH };
+enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH, ID_TABS };
 enum class Nav { Normal, Back, Forward, Refresh };
 enum class JobKind { Navigate, Sort };
 
@@ -96,6 +96,7 @@ struct Pending {
     std::wstring query;             // recherche dans `path` ("" : simple lecture)
     size_t steps = 1;               // Précédent / Suivant : pas d'historique franchis (liste déroulante)
     std::wstring command;           // barre d'adresse : si ce n'est pas un dossier, lancer ceci (« cmd », « wt »…)
+    int top = -1;                   // retour sur un onglet : première ligne visible à rétablir
 };
 
 enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
@@ -114,7 +115,7 @@ struct View {
 };
 
 HINSTANCE g_inst;
-HWND g_hwnd, g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_btnRefresh, g_nav, g_crumbs, g_searchBox;
+HWND g_hwnd, g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_btnRefresh, g_nav, g_crumbs, g_searchBox, g_tabBar;
 std::wstring g_tabNext;         // renommage validé par Tab / Maj+Tab : élément à renommer ensuite
 std::wstring g_tabEdit;         // … saisie à ouvrir (WM_APP_TABEDIT, ou après le renommage en cours)
 std::wstring g_tabTyped;        // touches tapées avant que cette saisie ne s'ouvre : remises dedans
@@ -754,6 +755,8 @@ void WarmUpMenus(const DirData& d) {
     ShellMenu_WarmUp(d.path, names);
 }
 
+void SyncTab();
+
 void OnResult(Result* raw) {
     std::unique_ptr<Result> r(raw);
     if (r->gen != Jobs_Current()) return;  // périmé
@@ -886,6 +889,9 @@ void OnResult(Result* raw) {
     ListView_SetItemCountEx(g_list, (int)g_view.order.size(), refresh ? LVSICF_NOSCROLL : 0);
     if (refresh) {
         ApplySelection(FindEntriesByNames(p.selected), FindEntryByName(p.focus), false);
+        RECT rc{};
+        if (p.top > 0 && RowCount() > 0 && ListView_GetItemRect(g_list, 0, &rc, LVIR_BOUNDS))
+            ListView_Scroll(g_list, 0, (std::min(p.top, RowCount() - 1) - ListView_GetTopIndex(g_list)) * (rc.bottom - rc.top));
     } else {
         const int f = FindEntryByName(p.focus);
         ApplySelection(f >= 0 ? std::vector<int>{f} : std::vector<int>{}, f, true);
@@ -894,6 +900,7 @@ void OnResult(Result* raw) {
     if (freeze) SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(g_list, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
     UpdateButtons();
+    SyncTab();
     if (g_startupMs < 0) g_startupMs = MsSinceProcessStart();  // premier affichage réellement peint
     UpdateColumnsForView();
     NavPane_ShowPath(g_path);
@@ -1686,12 +1693,273 @@ void RegisterDrop() {
     DragDrop_RegisterTarget(g_list, std::move(h));
 }
 
+// ───────────────────────────── Onglets, fenêtres ─────────────────────────────
+//
+// Chaque onglet garde son dossier, son historique, son tri, son filtre, sa
+// sélection, sa position et le contenu déjà lu : y revenir l'affiche aussitôt,
+// puis le dossier est relu en arrière-plan (comme F5). Seul l'onglet affiché
+// est surveillé.
+
+struct Tab {
+    std::wstring path, query, filter, focus;
+    std::vector<std::wstring> back, fwd, selected;
+    int sortCol = COL_NAME;
+    bool sortAsc = true;
+    int top = 0;
+    std::shared_ptr<const DirData> data;
+};
+std::vector<Tab> g_tabList(1);
+size_t g_tab = 0;
+int g_tabDrag = -1;  // onglet que l'on fait glisser (réorganisation)
+
+std::wstring TabText(const Tab& t) {
+    std::wstring s = t.query.empty() ? HistoryText(t.path) : L"Recherche « " + t.query + L" »";
+    if (s.size() > 32) s = s.substr(0, 31) + L"…";
+    return s;
+}
+
+void UpdateTabStrip() {
+    if (!g_tabBar) return;
+    SendMessageW(g_tabBar, WM_SETREDRAW, FALSE, 0);
+    TabCtrl_DeleteAllItems(g_tabBar);
+    TCITEMW it{};
+    it.mask = TCIF_TEXT;
+    for (size_t i = 0; i < g_tabList.size(); ++i) {
+        std::wstring t = TabText(g_tabList[i]);
+        it.pszText = t.data();
+        TabCtrl_InsertItem(g_tabBar, (int)i, &it);
+    }
+    it.pszText = (LPWSTR)L"  +  ";  // dernier faux onglet : en ouvrir un nouveau
+    TabCtrl_InsertItem(g_tabBar, (int)g_tabList.size(), &it);
+    TabCtrl_SetCurSel(g_tabBar, (int)g_tab);
+    SendMessageW(g_tabBar, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_tabBar, nullptr, TRUE);
+}
+
+// L'onglet affiché suit ce que montre la liste (appelé à chaque résultat).
+void SyncTab() {
+    Tab& t = g_tabList[g_tab];
+    const std::wstring before = TabText(t);
+    t.path = g_path;
+    t.query = g_query;
+    t.data = g_view.data;
+    if (std::wstring now = TabText(t); now != before && g_tabBar) {
+        TCITEMW it{};
+        it.mask = TCIF_TEXT;
+        it.pszText = now.data();
+        TabCtrl_SetItem(g_tabBar, (int)g_tab, &it);
+    }
+}
+
+// Mémorise l'état affiché dans l'onglet courant, avant d'en changer.
+void SaveTab() {
+    Tab& t = g_tabList[g_tab];
+    t.path = g_pending.active ? g_pending.path : g_path;  // navigation en cours : là où l'on va
+    t.query = g_pending.active ? g_pending.query : g_query;
+    t.filter = g_filter;
+    t.back = g_back;
+    t.fwd = g_fwd;
+    t.sortCol = g_sortCol;
+    t.sortAsc = g_sortAsc;
+    t.selected = HasView() ? NamesOf(SelectedEntries()) : std::vector<std::wstring>{};
+    const int f = HasView() ? FocusedEntry() : -1;
+    t.focus = f >= 0 ? NameOf(f) : L"";
+    t.top = ListView_GetTopIndex(g_list);
+    t.data = g_pending.active ? nullptr : g_view.data;
+}
+
+void ShowTab(size_t i) {
+    if (i >= g_tabList.size()) return;
+    if (g_editing) SendMessageW(g_list, LVM_CANCELEDITLABEL, 0, 0);
+    g_tab = i;
+    const Tab t = g_tabList[i];
+    g_back = t.back;
+    g_fwd = t.fwd;
+    g_sortCol = t.sortCol;
+    g_sortAsc = t.sortAsc;
+    UpdateSortArrow();
+    g_filter = t.filter;
+    g_goneNote.clear();
+    g_searchSync = true;
+    SetWindowTextW(g_searchBox, (t.filter.empty() ? t.query : t.filter).c_str());
+    g_searchSync = false;
+    if (g_tabBar) TabCtrl_SetCurSel(g_tabBar, (int)i);
+    const bool cached = t.data && _wcsicmp(t.data->path.c_str(), t.path.c_str()) == 0 && t.data->query == t.query &&
+                        t.data->searchDone && t.data->entries.size() <= 100000;
+    if (!cached) {
+        Navigate(t.path, Nav::Refresh, t.focus, t.selected, {}, false, &t.query);
+        g_pending.top = t.top;
+        return;
+    }
+    // Contenu déjà lu : affiché tout de suite, puis relu en arrière-plan.
+    Pending p;
+    p.active = true;
+    p.path = t.path;
+    p.nav = Nav::Refresh;
+    p.focus = t.focus;
+    p.selected = t.selected;
+    p.query = t.query;
+    p.top = t.top;
+    g_pending = std::move(p);
+    auto* r = new Result{Jobs_NewGeneration().gen, JobKind::Navigate};
+    r->data = t.data;
+    r->order = SortOrder(*t.data, g_sortCol, g_sortAsc, g_prefs, g_filter);
+    OnResult(r);
+    if (t.query.empty()) Refresh();  // changements faits pendant qu'on était ailleurs
+}
+
+void SwitchTab(size_t i) {
+    if (i == g_tab || i >= g_tabList.size()) {
+        UpdateTabStrip();
+        return;
+    }
+    SaveTab();
+    ShowTab(i);
+}
+
+// Nouvel onglet après l'onglet courant ; activate : on y va (sinon il attend en arrière-plan).
+void NewTab(const std::wstring& path, bool activate) {
+    SaveTab();
+    Tab t;
+    t.path = path;
+    t.sortCol = g_sortCol;
+    t.sortAsc = g_sortAsc;
+    g_tabList.insert(g_tabList.begin() + (ptrdiff_t)g_tab + 1, std::move(t));
+    if (!activate) {
+        UpdateTabStrip();
+        Flash(L"Ouvert dans un nouvel onglet : " + HistoryText(path));
+        return;
+    }
+    ++g_tab;
+    UpdateTabStrip();
+    ShowTab(g_tab);
+}
+
+void CloseTab(size_t i) {
+    if (i >= g_tabList.size()) return;
+    if (g_tabList.size() == 1) {  // dernier onglet : la fenêtre se ferme
+        PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+    const bool active = i == g_tab;
+    if (!active) SaveTab();
+    g_tabList.erase(g_tabList.begin() + (ptrdiff_t)i);
+    if (active) {
+        g_tab = std::min(i, g_tabList.size() - 1);
+        UpdateTabStrip();
+        ShowTab(g_tab);
+        return;
+    }
+    if (i < g_tab) --g_tab;
+    UpdateTabStrip();
+}
+
+void MoveTab(size_t from, size_t to) {
+    if (from == to || from >= g_tabList.size() || to >= g_tabList.size()) return;
+    SaveTab();
+    Tab t = std::move(g_tabList[from]);
+    g_tabList.erase(g_tabList.begin() + (ptrdiff_t)from);
+    g_tabList.insert(g_tabList.begin() + (ptrdiff_t)to, std::move(t));
+    if (g_tab == from) g_tab = to;
+    else if (from < g_tab && to >= g_tab) --g_tab;
+    else if (from > g_tab && to <= g_tab) ++g_tab;
+    UpdateTabStrip();
+}
+
+// Nouvelle fenêtre (Ctrl+N), un peu décalée par rapport à celle-ci, sur le même écran.
+void NewWindow(const std::wstring& path) {
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return;
+    WINDOWPLACEMENT wp{sizeof wp};
+    GetWindowPlacement(g_hwnd, &wp);
+    // Décalée de 30 px, sans déborder de la zone de travail de l'écran.
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    const RECT& wa = mi.rcWork;
+    const LONG w = std::min(wp.rcNormalPosition.right - wp.rcNormalPosition.left, wa.right - wa.left);
+    const LONG h = std::min(wp.rcNormalPosition.bottom - wp.rcNormalPosition.top, wa.bottom - wa.top);
+    LONG x = wp.rcNormalPosition.left + S(30), y = wp.rcNormalPosition.top + S(30);
+    if (x + w > wa.right) x = wa.left;
+    if (y + h > wa.bottom) y = wa.top;
+    x = std::max(x, wa.left);
+    y = std::max(y, wa.top);
+    std::wstring arg = path;
+    if (!arg.empty() && arg.back() == L'\\') arg += L'\\';  // « C:\" » : le \ protégerait le guillemet
+    wchar_t at[96];
+    swprintf_s(at, L"%ld,%ld,%ld,%ld", x, y, w, h);
+    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" \"" + arg + L"\" --at " + at;
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    } else {
+        SetStatus(L"Impossible d'ouvrir une nouvelle fenêtre : " + ErrorText(GetLastError()));
+    }
+}
+
+void ShowTabMenu(int hit, POINT pt) {
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, 1, L"Nouvel onglet\tCtrl+T");
+    if (hit >= 0) {
+        AppendMenuW(m, MF_STRING, 2, L"Dupliquer l'onglet");
+        AppendMenuW(m, MF_STRING, 5, L"Ouvrir dans une nouvelle fenêtre");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, 3, L"Fermer l'onglet\tCtrl+W");
+        AppendMenuW(m, MF_STRING | (g_tabList.size() > 1 ? 0 : MF_GRAYED), 4, L"Fermer les autres onglets");
+        AppendMenuW(m, MF_STRING | (hit + 1 < (int)g_tabList.size() ? 0 : MF_GRAYED), 6, L"Fermer les onglets à droite");
+    }
+    const UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, g_hwnd, nullptr);
+    DestroyMenu(m);
+    switch (cmd) {
+        case 1: NewTab(L"", true); break;
+        case 2: {
+            SaveTab();
+            Tab copy = g_tabList[(size_t)hit];
+            g_tabList.insert(g_tabList.begin() + hit + 1, std::move(copy));
+            if ((size_t)hit < g_tab) ++g_tab;
+            UpdateTabStrip();
+            SwitchTab((size_t)hit + 1);
+            break;
+        }
+        case 3: CloseTab((size_t)hit); break;
+        case 4: {
+            SaveTab();
+            const bool same = (size_t)hit == g_tab;
+            Tab keep = g_tabList[(size_t)hit];
+            g_tabList.assign(1, std::move(keep));
+            g_tab = 0;
+            UpdateTabStrip();
+            if (!same) ShowTab(0);
+            break;
+        }
+        case 6: {
+            SaveTab();
+            const bool shown = g_tab > (size_t)hit;  // l'onglet affiché disparaît : on montre celui cliqué
+            g_tabList.resize((size_t)hit + 1);
+            if (shown) g_tab = (size_t)hit;
+            UpdateTabStrip();
+            if (shown) ShowTab(g_tab);
+            break;
+        }
+        case 5: {
+            if ((size_t)hit == g_tab) SaveTab();
+            NewWindow(g_tabList[(size_t)hit].path);
+            break;
+        }
+    }
+    SetFocus(g_list);
+}
+
 // « Épingler dans FastExplorer » : Accès rapide propre à l'application, qui
 // marche même quand celui de Windows ne répond pas. Un dossier épinglé dans
 // Windows se désépingle par le menu du Shell (« Désépingler de l'Accès rapide »).
 std::vector<MenuExtra> PinExtras(const std::wstring& path, bool withOpen) {
     std::vector<MenuExtra> x;
-    if (withOpen) x.push_back({L"Ouvrir", [path] { Navigate(path, Nav::Normal); }, true});
+    if (withOpen) {
+        x.push_back({L"Ouvrir", [path] { Navigate(path, Nav::Normal); }, true});
+        x.push_back({L"Ouvrir dans un nouvel onglet", [path] { NewTab(path, true); }});
+    }
     const NavPin pin = NavPane_PinOf(path);
     if (pin == NavPin::Windows) {
         x.push_back({L"Désépingler de l'Accès rapide", [path] { NavPane_UnpinWindows(path); }});
@@ -1749,6 +2017,11 @@ void ShowContextMenu(LPARAM lp) {
         const bool background = names.empty();
         // « Ouvrir » sur un dossier ou un raccourci : chez nous, pas dans l'Explorateur.
         if (single >= 0 && (is(L"open") || is(L"explore"))) { ActivateEntry(single); return true; }
+        if (single >= 0 && E(single).isDir() && (is(L"opennewwindow") || is(L"opennewtab"))) {
+            const std::wstring dir = g_path.empty() ? names[0] : Join(g_path, names[0].c_str());
+            if (is(L"opennewwindow")) NewWindow(dir); else NewTab(dir, true);
+            return true;
+        }
         // Opérations de fichiers : notre moteur (resélection, estompage des éléments coupés…).
         if (!background && (is(L"copy") || is(L"cut"))) { CopyNames(names, is(L"cut")); return true; }
         if (is(L"paste")) {
@@ -1785,6 +2058,8 @@ void ShowNavMenu(const std::wstring& path, POINT pt) {
                                    [path, parent, leaf](const std::wstring& verb) {
         auto is = [&](const wchar_t* v) { return _wcsicmp(verb.c_str(), v) == 0; };
         if (is(L"open") || is(L"explore")) { Navigate(path, Nav::Normal); return true; }
+        if (!path.empty() && is(L"opennewwindow")) { NewWindow(path); return true; }
+        if (!path.empty() && is(L"opennewtab")) { NewTab(path, true); return true; }
         if (leaf.empty() || parent.empty()) return false;  // Ce PC, lecteurs : le Shell
         if (is(L"rename")) {  // dans la liste du dossier parent, comme un renommage ordinaire
             g_editAfter = leaf;
@@ -1957,7 +2232,7 @@ void ApplyFont() {
         SelectObject(dc, old);
         ReleaseDC(g_hwnd, dc);
     }
-    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_btnRefresh, g_nav, g_crumbs, g_searchBox})
+    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_btnRefresh, g_nav, g_crumbs, g_searchBox, g_tabBar})
         SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
 }
 
@@ -1994,24 +2269,28 @@ void Layout() {
     const int editH = g_fontH + S(10);  // texte centré verticalement
     const int h = std::max(S(30), editH);
     // Un seul lot de déplacements : un repaint au lieu d'un par contrôle.
-    HDWP dwp = BeginDeferWindowPos(10);
+    HDWP dwp = BeginDeferWindowPos(11);
     auto place = [&](HWND w, int x, int y, int cx, int cy) {
         if (dwp) dwp = DeferWindowPos(dwp, w, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
         else MoveWindow(w, x, y, cx, cy, TRUE);
     };
+    // Onglets tout en haut, sur toute la largeur.
+    const int tabH = g_fontH + S(12);
+    place(g_tabBar, 0, S(2), rc.right, tabH);
+    const int y0 = S(2) + tabH + S(2);
     int x = m;
     for (HWND b : {g_btnBack, g_btnFwd, g_btnUp}) {
-        place(b, x, m, bw, h);
+        place(b, x, y0, bw, h);
         x += bw + S(2);
     }
     x += S(4);
     const int searchW = std::min(S(260), std::max(0, (int)rc.right - x - m) / 3);
     const int addrW = std::max(0, (int)rc.right - x - m - searchW - S(6) - bw - S(2));
-    place(g_addr, x, m + (h - editH) / 2, addrW, editH);
-    place(g_crumbs, x, m + (h - editH) / 2, addrW, editH);  // même place
-    place(g_btnRefresh, x + addrW + S(2), m, bw, h);  // Actualiser, à droite de l'adresse comme l'Explorateur
-    place(g_searchBox, (int)rc.right - m - searchW, m + (h - editH) / 2, searchW, editH);
-    const int top = m + h + m;
+    place(g_addr, x, y0 + (h - editH) / 2, addrW, editH);
+    place(g_crumbs, x, y0 + (h - editH) / 2, addrW, editH);  // même place
+    place(g_btnRefresh, x + addrW + S(2), y0, bw, h);  // Actualiser, à droite de l'adresse comme l'Explorateur
+    place(g_searchBox, (int)rc.right - m - searchW, y0 + (h - editH) / 2, searchW, editH);
+    const int top = y0 + h + m;
     const int bodyH = std::max(0, (int)rc.bottom - top - statusH);
     // Volet de navigation, séparateur (déplaçable à la souris), liste.
     const int split = S(5);
@@ -2042,6 +2321,8 @@ void CreateChildren(HWND hwnd) {
         return CreateWindowExW(0, WC_BUTTONW, t, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0, hwnd,
                                (HMENU)(INT_PTR)id, g_inst, nullptr);
     };
+    g_tabBar = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_FOCUSNEVER, 0, 0, 0,
+                               0, hwnd, (HMENU)ID_TABS, g_inst, nullptr);
     g_btnBack = btn(L"←", ID_BACK);
     g_btnFwd = btn(L"→", ID_FWD);
     g_btnUp = btn(L"↑", ID_UP);
@@ -2058,6 +2339,7 @@ void CreateChildren(HWND hwnd) {
         SetFocus(g_list);
     };
     crumbs.edit = BeginAddressEdit;
+    crumbs.openNewTab = [](const std::wstring& path) { NewTab(path, false); };
     crumbs.driveText = NavPane_DriveText;
     g_crumbs = Crumbs_Create(hwnd, ID_CRUMBS, std::move(crumbs));
     g_searchBox = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0,
@@ -2102,6 +2384,7 @@ void CreateChildren(HWND hwnd) {
     ApplyImageList();
     UpdateSortArrow();
     UpdateButtons();
+    UpdateTabStrip();
     Layout();  // fenêtre encore invisible : aucun repaint
 }
 
@@ -2266,6 +2549,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_NOTIFY: {
             auto* hdr = (NMHDR*)lp;
             if (LRESULT r = 0; NavPane_Notify(hdr, &r)) return r;
+            if (hdr->hwndFrom == g_tabBar) {
+                if (hdr->code == TCN_SELCHANGE) {
+                    const int sel = TabCtrl_GetCurSel(g_tabBar);
+                    if (sel >= (int)g_tabList.size()) NewTab(L"", true);  // « + »
+                    else if (sel >= 0) SwitchTab((size_t)sel);
+                    SetFocus(g_list);
+                } else if (hdr->code == NM_RCLICK) {
+                    TCHITTESTINFO ht{};
+                    GetCursorPos(&ht.pt);
+                    const POINT screen = ht.pt;
+                    ScreenToClient(g_tabBar, &ht.pt);
+                    const int hit = TabCtrl_HitTest(g_tabBar, &ht);
+                    ShowTabMenu(hit < (int)g_tabList.size() ? hit : -1, screen);
+                    return TRUE;
+                }
+                return 0;
+            }
             if (hdr->hwndFrom != g_list) break;
             switch (hdr->code) {
                 case LVN_GETDISPINFOW: FillDispInfo(((NMLVDISPINFOW*)lp)->item); return 0;
@@ -2278,7 +2578,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case NM_CUSTOMDRAW: return OnListCustomDraw((NMLVCUSTOMDRAW*)lp);
                 case LVN_ODFINDITEMW: return FindItem((NMLVFINDITEMW*)lp);
                 case LVN_COLUMNCLICK: Resort(((NMLISTVIEW*)lp)->iSubItem); return 0;
-                case NM_DBLCLK: Activate(((NMITEMACTIVATE*)lp)->iItem); return 0;
+                case NM_DBLCLK: {
+                    const int e = HasView() ? EntryAt(((NMITEMACTIVATE*)lp)->iItem) : -1;
+                    if (e >= 0 && E(e).isDir() && GetKeyState(VK_CONTROL) < 0) {  // Ctrl+double-clic : nouvelle fenêtre
+                        NewWindow(g_path.empty() ? std::wstring(NameOf(e)) : Join(g_path, NameOf(e)));
+                        return 0;
+                    }
+                    Activate(((NMITEMACTIVATE*)lp)->iItem);
+                    return 0;
+                }
                 case LVN_BEGINDRAG:
                 case LVN_BEGINRDRAG: StartDrag(((NMLISTVIEW*)lp)->ptAction); return 0;
                 case LVN_BEGINLABELEDITW: return OnBeginLabelEdit((NMLVDISPINFOW*)lp);
@@ -2339,6 +2647,44 @@ bool HandleGlobalKeys(const MSG& m) {
         }
         return false;  // saisie d'un nom : toutes les touches vont à la zone d'édition
     }
+    // Onglets à la souris : clic du milieu = fermer (sur un onglet) ou ouvrir
+    // dans un nouvel onglet (sur un dossier) ; glisser un onglet le déplace.
+    if (m.message == WM_MBUTTONUP && (m.hwnd == g_tabBar || m.hwnd == g_list || m.hwnd == g_nav)) {
+        POINT c{GET_X_LPARAM(m.lParam), GET_Y_LPARAM(m.lParam)};
+        if (m.hwnd == g_tabBar) {
+            TCHITTESTINFO ht{c, 0};
+            const int hit = TabCtrl_HitTest(g_tabBar, &ht);
+            if (hit >= 0 && hit < (int)g_tabList.size()) CloseTab((size_t)hit);
+        } else if (m.hwnd == g_list) {
+            LVHITTESTINFO ht{};
+            ht.pt = c;
+            const int e = HasView() ? EntryAt(ListView_HitTest(g_list, &ht)) : -1;
+            if (e >= 0 && E(e).isDir())
+                NewTab(g_path.empty() ? std::wstring(NameOf(e)) : Join(g_path, NameOf(e)), false);
+        } else {
+            POINT s = c;
+            ClientToScreen(g_nav, &s);
+            if (std::wstring p; NavPane_PathAt(s, p)) NewTab(p, false);
+        }
+        return true;
+    }
+    if (m.hwnd == g_tabBar) {
+        if (m.message == WM_LBUTTONDOWN) {
+            TCHITTESTINFO ht{{GET_X_LPARAM(m.lParam), GET_Y_LPARAM(m.lParam)}, 0};
+            const int hit = TabCtrl_HitTest(g_tabBar, &ht);
+            g_tabDrag = hit >= 0 && hit < (int)g_tabList.size() ? hit : -1;
+        } else if (m.message == WM_MOUSEMOVE && g_tabDrag >= 0 && (m.wParam & MK_LBUTTON)) {
+            TCHITTESTINFO ht{{GET_X_LPARAM(m.lParam), GET_Y_LPARAM(m.lParam)}, 0};
+            const int hit = TabCtrl_HitTest(g_tabBar, &ht);
+            if (hit >= 0 && hit < (int)g_tabList.size() && hit != g_tabDrag && (size_t)g_tabDrag == g_tab) {
+                MoveTab((size_t)g_tabDrag, (size_t)hit);
+                g_tabDrag = hit;
+            }
+        } else if (m.message == WM_LBUTTONUP) {
+            g_tabDrag = -1;
+        }
+        return false;
+    }
     const HWND focus = GetFocus();
     if (m.message == WM_XBUTTONUP) {
         if (GET_XBUTTON_WPARAM(m.wParam) == XBUTTON1) GoBack(); else GoForward();
@@ -2359,6 +2705,35 @@ bool HandleGlobalKeys(const MSG& m) {
     }
     if (m.message != WM_KEYDOWN) return false;
     const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+    if (ctrl) {  // onglets et fenêtres
+        const bool sh = GetKeyState(VK_SHIFT) < 0;
+        const size_t n = g_tabList.size();
+        switch (m.wParam) {
+            case 'T': NewTab(L"", true); return true;
+            case 'W':
+            case VK_F4: CloseTab(g_tab); return true;
+            case VK_RETURN:  // Ctrl+Entrée : le dossier sélectionné dans une nouvelle fenêtre
+                if (focus == g_list && HasView()) {
+                    const int e = FocusedEntry();
+                    if (e >= 0 && E(e).isDir()) {
+                        NewWindow(g_path.empty() ? std::wstring(NameOf(e)) : Join(g_path, NameOf(e)));
+                        return true;
+                    }
+                }
+                break;
+            case 'N':
+                if (sh && focus == g_list) break;  // Ctrl+Maj+N : nouveau dossier
+                NewWindow(g_pending.active ? g_pending.path : g_path);
+                return true;
+            case VK_TAB: SwitchTab((g_tab + (sh ? n - 1 : 1)) % n); return true;
+            case VK_PRIOR: SwitchTab((g_tab + n - 1) % n); return true;
+            case VK_NEXT: SwitchTab((g_tab + 1) % n); return true;
+        }
+        if (m.wParam >= '1' && m.wParam <= '9' && !sh) {
+            SwitchTab(m.wParam == '9' ? n - 1 : std::min<size_t>(m.wParam - '1', n - 1));
+            return true;
+        }
+    }
     switch (m.wParam) {
         case VK_F5: Refresh(); return true;
         case 'R':
@@ -2432,12 +2807,12 @@ bool HandleGlobalKeys(const MSG& m) {
 
 }  // namespace
 
-bool Ui_Create(HINSTANCE inst, int show, const std::wstring& start) {
+bool Ui_Create(HINSTANCE inst, int show, const std::wstring& start, const RECT* at) {
     g_inst = inst;
     g_prefs = ReadViewPrefs();  // avant la première lecture : elle filtre déjà les éléments cachés
     Navigate(start, Nav::Normal);  // la lecture démarre pendant qu'on construit la fenêtre
     WarmUpShell();
-    INITCOMMONCONTROLSEX icc{sizeof icc, ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
+    INITCOMMONCONTROLSEX icc{sizeof icc, ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES};
     InitCommonControlsEx(&icc);
 
     WNDCLASSEXW wc{sizeof wc};
@@ -2450,9 +2825,10 @@ bool Ui_Create(HINSTANCE inst, int show, const std::wstring& start) {
     if (!RegisterClassExW(&wc)) return false;
 
     const UINT sd = GetDpiForSystem();
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"FastExplorer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
-                                CW_USEDEFAULT, MulDiv(1100, (int)sd, 96), MulDiv(700, (int)sd, 96), nullptr, nullptr,
-                                inst, nullptr);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"FastExplorer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                                at ? at->left : CW_USEDEFAULT, at ? at->top : CW_USEDEFAULT,
+                                at ? at->right : MulDiv(1100, (int)sd, 96), at ? at->bottom : MulDiv(700, (int)sd, 96),
+                                nullptr, nullptr, inst, nullptr);
     if (!hwnd) return false;
     ShowWindow(hwnd, show);
     return true;
