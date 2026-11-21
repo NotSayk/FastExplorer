@@ -8,6 +8,7 @@
 #include "fileops.h"
 #include "foldersize.h"
 #include "icons.h"
+#include "index.h"
 #include "jobs.h"
 #include "listing.h"
 #include <shlwapi.h>
@@ -260,6 +261,110 @@ void TestFolderSize() {
     auto a = Names(d, SortOrder(d, COL_SIZE, true, {}, {}, &sizes));
     CHECK_STR(a[0], L"vide");
     RemoveDirectoryW(Join(base, L"sous\\boucle").c_str());
+}
+
+// Entrée de journal USN construite à la main.
+std::vector<BYTE> UsnRecord(uint64_t frn, uint64_t parent, const std::wstring& name, uint32_t reason, uint32_t attr) {
+    std::vector<BYTE> b(sizeof(USN_RECORD_V2) + name.size() * 2, 0);
+    auto* r = (USN_RECORD_V2*)b.data();
+    r->RecordLength = (DWORD)b.size();
+    r->MajorVersion = 2;
+    r->FileReferenceNumber = frn;
+    r->ParentFileReferenceNumber = parent;
+    r->Reason = reason;
+    r->FileAttributes = attr;
+    r->FileNameLength = (WORD)(name.size() * 2);
+    r->FileNameOffset = (WORD)offsetof(USN_RECORD_V2, FileName);
+    memcpy(r->FileName, name.data(), name.size() * 2);
+    return b;
+}
+
+void TestVolumeIndex() {
+    VolumeIndex v(L'C');
+    const uint64_t seq = 3ull << 48;  // numéro de séquence (ignoré pour les parents)
+    v.Put(5, 5, L"", 0, FILE_ATTRIBUTE_DIRECTORY);
+    v.Put(seq | 100, 5, L"Users", 5, FILE_ATTRIBUTE_DIRECTORY);
+    v.Put(seq | 101, 100, L"sam", 3, FILE_ATTRIBUTE_DIRECTORY);
+    v.Put(102, seq | 101, L"Docs", 4, FILE_ATTRIBUTE_DIRECTORY);
+    v.Put(103, 101, L".cache", 6, FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN);
+    v.Put(200, 102, L"Rapport.txt", 11, FILE_ATTRIBUTE_ARCHIVE);
+    v.Put(201, 103, L"rapport_cache.txt", 17, 0);
+    v.Put(202, 999, L"rapport_orphelin.txt", 20, 0);  // parent inconnu : jamais affiché
+    v.Put(203, 102, L"Été rapport.md", 14, 0);
+    CHECK(v.Count() == 9);
+    CHECK_STR(v.PathOf(200), L"C:\\Users\\sam\\Docs\\Rapport.txt");
+    CHECK_STR(v.PathOf(5), L"C:\\");
+
+    auto search = [&](const std::wstring& q, uint64_t scope, bool hidden, uint32_t max = 1000) {
+        IndexQuery iq;
+        iq.query = q;
+        iq.showHidden = hidden;
+        iq.max = max;
+        std::vector<IndexHit> hits;
+        bool trunc = false;
+        v.Search(NameMatcher(q), iq, scope, hits, trunc);
+        std::vector<std::wstring> s;
+        for (auto& h : hits) s.push_back(h.path);
+        std::sort(s.begin(), s.end());
+        if (trunc) s.push_back(L"<tronqué>");
+        return s;
+    };
+    auto all = search(L"rapport", VolumeIndex::kNoScope, true);
+    CHECK(all.size() == 3);
+    CHECK(IndexOf(all, L"C:\\Users\\sam\\.cache\\rapport_cache.txt") >= 0);
+    CHECK(IndexOf(all, L"C:\\Users\\sam\\Docs\\Été rapport.md") >= 0);
+    CHECK(search(L"rapport", VolumeIndex::kNoScope, false).size() == 2);  // pas dans le dossier masqué
+    auto scoped = search(L"RAPPORT txt", 101, true);
+    CHECK(scoped.size() == 2);
+    CHECK(IndexOf(scoped, L"Docs\\Rapport.txt") >= 0);  // relatif au dossier de recherche
+    CHECK(search(L"ete", VolumeIndex::kNoScope, true).size() == 1);  // sans accents
+    CHECK(search(L"*.md", VolumeIndex::kNoScope, true).size() == 1);
+    CHECK(search(L"docs", VolumeIndex::kNoScope, true).size() == 1);  // les dossiers aussi
+    CHECK(search(L"rapport", 102, true).size() == 2);
+    auto one = search(L"rapport", VolumeIndex::kNoScope, true, 1);
+    CHECK(one.size() == 2 && one.back() == L"<tronqué>");
+
+    // Journal : renommage + déplacement, ancien nom ignoré, suppression.
+    auto old = UsnRecord(200, 102, L"Rapport.txt", USN_REASON_RENAME_OLD_NAME, 0);
+    v.Apply(*(USN_RECORD_V2*)old.data());
+    CHECK_STR(v.PathOf(200), L"C:\\Users\\sam\\Docs\\Rapport.txt");
+    auto ren = UsnRecord(200, 101, L"Bilan.txt", USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE, 0);
+    v.Apply(*(USN_RECORD_V2*)ren.data());
+    CHECK_STR(v.PathOf(200), L"C:\\Users\\sam\\Bilan.txt");
+    auto add = UsnRecord(seq | 204, 102, L"nouveau rapport.pdf", USN_REASON_FILE_CREATE, 0);
+    v.Apply(*(USN_RECORD_V2*)add.data());
+    CHECK(search(L"nouveau", VolumeIndex::kNoScope, true).size() == 1);
+    auto del = UsnRecord(seq | 204, 102, L"nouveau rapport.pdf", USN_REASON_FILE_DELETE | USN_REASON_CLOSE, 0);
+    v.Apply(*(USN_RECORD_V2*)del.data());
+    CHECK(search(L"nouveau", VolumeIndex::kNoScope, true).empty());
+    CHECK(v.Count() == 9);
+    v.Compact();
+    CHECK_STR(v.PathOf(200), L"C:\\Users\\sam\\Bilan.txt");
+
+    // Protocole : aller-retour et demandes malformées.
+    IndexQuery q;
+    q.query = L"rapport *.txt";
+    q.scope = L"C:\\Users";
+    q.showHidden = false;
+    q.max = 42;
+    auto enc = Index_EncodeQuery(q);
+    IndexQuery d;
+    CHECK(Index_DecodeQuery(enc.data(), enc.size(), d));
+    CHECK_STR(d.query, q.query);
+    CHECK_STR(d.scope, q.scope);
+    CHECK(!d.showHidden && d.showSuperHidden && d.max == 42);
+    CHECK(!Index_DecodeQuery(enc.data(), enc.size() - 2, d));  // tronquée
+    enc[0] ^= 1;
+    CHECK(!Index_DecodeQuery(enc.data(), enc.size(), d));  // mauvaise signature
+    IndexQuery empty;
+    auto e2 = Index_EncodeQuery(empty);
+    CHECK(!Index_DecodeQuery(e2.data(), e2.size(), d));  // recherche vide
+    CHECK(!Index_CurrentUserSid().empty());
+    if (!Index_ServiceInstalled()) {  // sans service : la recherche passe par le parcours des dossiers
+        std::vector<IndexHit> hits;
+        bool trunc = false;
+        CHECK(Index_Search(q, hits, trunc) == IndexStatus::Unavailable);
+    }
 }
 
 void TestEdgeCases() {
@@ -1166,6 +1271,7 @@ int wmain() {
     TestSortName();
     TestSortOther();
     TestFolderSize();
+    TestVolumeIndex();
     TestEdgeCases();
     TestLongPath();
     TestParallelMatchesSequential();

@@ -17,10 +17,13 @@
 //   navpane.*  volet de navigation : Accès rapide, arborescence de Ce PC
 //   pins.*     épingles propres à FastExplorer
 //   crumbs.*   fil d'Ariane de la barre d'adresse
+//   foldersize.* taille des dossiers en arrière-plan
+//   index.*    recherche instantanée : service (table des fichiers NTFS + journal USN) et client
 //   ui.*       fenêtre, ListView virtuelle, raccourcis
 
 #include "win.h"
 
+#include "index.h"
 #include "listing.h"
 #include "nt.h"
 #include "paths.h"
@@ -91,6 +94,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     // __wargv (CRT) plutôt que CommandLineToArgvW : évite de charger shell32 dès le lancement.
     const int argc = __argc;
     wchar_t** argv = __wargv;
+    // Service de la recherche instantanée, et son installation (process élevé, lancé par l'application).
+    if (argc >= 2 && _wcsicmp(argv[1], L"--service") == 0) return IndexService_Run();
+    if (argc >= 3 && _wcsicmp(argv[1], L"--install-index") == 0) {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        return IndexService_Install(argv[2]);
+    }
+    if (argc >= 2 && _wcsicmp(argv[1], L"--uninstall-index") == 0) {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        return IndexService_Uninstall();
+    }
     std::wstring start;
     if (argc >= 3 && _wcsicmp(argv[1], L"--bench") == 0) {
         if (argc >= 4 && _wcsicmp(argv[3], L"--seq") == 0) SetParallel(Parallel::Never);

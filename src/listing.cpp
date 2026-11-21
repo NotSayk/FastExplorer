@@ -217,12 +217,7 @@ void BuildSortKeys(DirData& d) {
 
 void SetParallel(Parallel p) { g_parallel.store(p); }
 
-namespace {
-struct Matcher {
-    std::vector<std::wstring> terms;
-    std::vector<bool> wild;
-    std::vector<std::string> ascii;  // mot en ASCII minuscule ("" : pas d'ASCII pur)
-    explicit Matcher(const std::wstring& q) {
+NameMatcher::NameMatcher(const std::wstring& q) {
         size_t i = 0;
         while (i < q.size()) {
             while (i < q.size() && iswspace(q[i])) ++i;
@@ -240,11 +235,12 @@ struct Matcher {
             }
             i = j;
         }
-    }
-    // Recherche sans casse en ASCII pur : le cas de presque tous les noms, et
-    // ~50 fois plus rapide que FindNLSStringEx. Renvoie -1 si le nom n'est pas
-    // en ASCII (il faut alors la comparaison linguistique, accents compris).
-    static int AsciiFind(const wchar_t* name, uint32_t n, const std::string& term) {
+}
+
+// Recherche sans casse en ASCII pur : le cas de presque tous les noms, et
+// ~50 fois plus rapide que FindNLSStringEx. Renvoie -1 si le nom n'est pas
+// en ASCII (il faut alors la comparaison linguistique, accents compris).
+int NameMatcher::AsciiFind(const wchar_t* name, uint32_t n, const std::string& term) {
         const size_t m = term.size();
         for (uint32_t i = 0; i < n; ++i)
             if (name[i] >= 0x80) return -1;
@@ -259,9 +255,9 @@ struct Matcher {
             if (k == m) return 1;
         }
         return 0;
-    }
+}
 
-    bool operator()(const wchar_t* name, uint32_t n) const {
+bool NameMatcher::operator()(const wchar_t* name, uint32_t n) const {
         if (terms.empty()) return false;
         std::wstring z;  // nom terminé par \0, pour les motifs
         for (size_t t = 0; t < terms.size(); ++t) {
@@ -280,11 +276,19 @@ struct Matcher {
             }
         }
         return true;
-    }
-};
+}
+
+namespace {
+using Matcher = NameMatcher;
 }  // namespace
 
 bool NameMatches(const std::wstring& query, const wchar_t* name, uint32_t n) { return Matcher(query)(name, n); }
+
+void DirData_Add(DirData& d, const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime) {
+    AddEntry(d, name, n, attr, size, mtime);
+}
+
+void DirData_BuildKeys(DirData& d) { BuildSortKeys(d); }
 
 void SearchTree(DirData& d, const std::wstring& query, const ViewPrefs& prefs, const CancelToken& ct,
                 const std::function<void(std::shared_ptr<DirData>)>& partial) {

@@ -10,6 +10,7 @@
 #include "fileops.h"
 #include "foldersize.h"
 #include "icons.h"
+#include "index.h"
 #include "jobs.h"
 #include "listing.h"
 #include "crumbs.h"
@@ -55,6 +56,8 @@ constexpr UINT WM_APP_SELSUM = WM_APP + 10;     // sélection changée : résum�
 constexpr UINT WM_APP_TABEDIT = WM_APP + 11;    // Tab pendant un renommage : renommer l'élément suivant
 constexpr UINT WM_APP_CMDFAIL = WM_APP + 12;    // commande tapée dans la barre d'adresse impossible (lParam = std::wstring*)
 constexpr UINT WM_APP_DIRSIZE = WM_APP + 14;    // taille d'un dossier calculée (lParam = DirSizeResult*)
+constexpr UINT WM_APP_INDEXDONE = WM_APP + 15;  // service de recherche installé / retiré (wParam = code, lParam = 1 : installé)
+constexpr UINT ID_SYS_INDEX = 0x0100;           // menu de la fenêtre : activer / désactiver la recherche instantanée
 constexpr UINT WM_APP_TESTDPI = WM_APP + 13;    // tests : comme WM_DPICHANGED (wParam = nouvelle échelle), que Windows
                                                 // ne laisse pas envoyer d'un autre processus
 constexpr UINT_PTR TIMER_LOADING = 1;
@@ -63,6 +66,7 @@ constexpr UINT_PTR TIMER_AFTEROP = 3;
 constexpr UINT_PTR TIMER_HOVER = 6;   // souris immobile sur la liste : préparer le menu contextuel
 constexpr UINT kMenuHoverMs = 100;
 constexpr UINT_PTR TIMER_PROGRESS = 7;  // progression des copies de notre moteur
+constexpr UINT_PTR TIMER_INDEXASK = 9;  // peu après le premier lancement : proposer la recherche instantanée
 constexpr UINT_PTR TIMER_PINNED = 8;    // après un menu contextuel : relire l'Accès rapide (épinglage)
 constexpr UINT_PTR TIMER_DRIVES = 4;  // Ce PC : regroupe les annonces d'arrivée / retrait de lecteurs
 constexpr UINT_PTR TIMER_EJECT = 5;   // éjection demandée : si elle échoue, on reprend la surveillance  // resélection après une opération, différée pendant un renommage
@@ -249,9 +253,11 @@ void ShowSummary() {
                    visible, g_filter.c_str(),
                    d.query.empty() ? L"   •   Entrée : chercher aussi dans les sous-dossiers" : L"");
     } else if (!d.query.empty()) {
-        swprintf_s(s, L"%zu résultat%s pour « %.100s »%s", shown, shown > 1 ? L"s" : L"", d.query.c_str(),
+        swprintf_s(s, L"%zu résultat%s pour « %.100s »%s%s%s", shown, shown > 1 ? L"s" : L"", d.query.c_str(),
+                   d.path.empty() ? L" dans tout le PC" : L"",
                    d.searchDone ? (d.truncated ? L"   •   arrêtée : trop de résultats" : L"")
-                                : L"   •   recherche en cours…");
+                                : L"   •   recherche en cours…",
+                   d.fromIndex ? L"   •   index instantané" : L"");
         if (!d.searchDone) {
             const size_t k = wcslen(s);
             swprintf_s(s + k, _countof(s) - k, L" (%zu dossiers parcourus)", d.scanned);
@@ -669,6 +675,85 @@ void AttachTarget(HWND hwnd) {
     if (Result* e = g_early.exchange(nullptr)) PostTo(hwnd, e);
 }
 
+// Recherche par l'index du service (instantanée). false s'il ne peut pas
+// répondre : pas de service, index en construction, dossier non indexé.
+bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, const CancelToken& ct) {
+    const double t0 = NowMs();
+    IndexQuery iq;
+    iq.query = q;
+    iq.scope = d.path;
+    iq.showHidden = prefs.showHidden;
+    iq.showSuperHidden = prefs.showSuperHidden;
+    iq.max = (uint32_t)kSearchMaxResults;
+    std::vector<IndexHit> hits;
+    bool truncated = false;
+    if (Index_Search(iq, hits, truncated) != IndexStatus::Ok || ct.cancelled()) return false;
+    // L'index ne garde que les noms : taille et date lues sur le disque, pour
+    // les premiers résultats (au-delà, la liste reste utilisable sans elles).
+    struct Info {
+        uint64_t size = 0;
+        int64_t mtime = 0;
+        uint32_t attr = 0;
+        bool ok = false;
+    };
+    std::vector<Info> info(hits.size());
+    const size_t statN = std::min<size_t>(hits.size(), 5000);
+    const unsigned T = statN > 64 ? 8u : 1u;
+    auto work = [&](unsigned t) {
+        for (size_t i = statN * t / T; i < statN * (t + 1) / T && !ct.cancelled(); ++i) {
+            WIN32_FILE_ATTRIBUTE_DATA fa;
+            if (!GetFileAttributesExW(ToNtPath(Join(d.path, hits[i].path.c_str())).c_str(), GetFileExInfoStandard, &fa))
+                continue;
+            info[i] = {((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow,
+                       (int64_t)(((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime),
+                       fa.dwFileAttributes, true};
+        }
+    };
+    std::vector<std::thread> th;
+    for (unsigned t = 1; t < T; ++t) th.emplace_back(work, t);
+    work(0);
+    for (auto& x : th) x.join();
+    if (ct.cancelled()) return false;
+    d.query = q;
+    for (size_t i = 0; i < hits.size(); ++i) {
+        const Info& x = info[i];
+        DirData_Add(d, hits[i].path.c_str(), (uint32_t)hits[i].path.size(), x.ok ? x.attr : hits[i].attr, x.size, x.mtime);
+    }
+    d.truncated = truncated;
+    d.fromIndex = true;
+    d.enumMs = NowMs() - t0;
+    const double t1 = NowMs();
+    DirData_BuildKeys(d);
+    d.keyMs = NowMs() - t1;
+    d.searchDone = true;
+    return true;
+}
+
+// Ce PC sans index : chaque disque local, l'un après l'autre (chemins complets).
+void SearchAllDrives(DirData& d, const std::wstring& q, const ViewPrefs& prefs, const CancelToken& ct) {
+    const double t0 = NowMs();
+    d.query = q;
+    const DWORD drives = GetLogicalDrives();
+    for (int i = 0; i < 26 && !d.truncated; ++i) {
+        const wchar_t root[] = {(wchar_t)(L'A' + i), L':', L'\\', 0};
+        if (!(drives & (1u << i)) || GetDriveTypeW(root) != DRIVE_FIXED) continue;
+        DirData one;
+        one.path = root;
+        SearchTree(one, q, prefs, ct);
+        if (ct.cancelled()) return;
+        d.scanned += one.scanned;
+        for (const Entry& e : one.entries) {
+            if (d.entries.size() >= kSearchMaxResults) { d.truncated = true; break; }
+            const std::wstring full = Join(root, one.name(e));
+            DirData_Add(d, full.c_str(), (uint32_t)full.size(), e.attr, e.size, e.mtime);
+        }
+        d.truncated |= one.truncated;
+    }
+    d.enumMs = NowMs() - t0;
+    DirData_BuildKeys(d);
+    d.searchDone = true;
+}
+
 // query : recherche à lancer dans `path`. Par défaut, un rafraîchissement
 // relance la recherche affichée ; toute autre navigation en sort.
 void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::vector<std::wstring> selected = {},
@@ -686,13 +771,21 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
         auto d = std::make_shared<DirData>();
         d->path = path;
         if (!q.empty()) {
-            // Résultats au fil de l'eau : chaque copie partielle s'affiche comme un rafraîchissement.
-            SearchTree(*d, q, prefs, ct, [&](std::shared_ptr<DirData> s) {
-                auto* r = new Result{ct.gen, JobKind::Navigate};
-                r->order = SortOrder(*s, col, asc, prefs, filter);
-                r->data = std::move(s);
-                Post(r);
-            });
+            if (SearchIndexed(*d, q, prefs, ct)) {
+                // index : tout est là d'un coup
+            } else if (ct.cancelled()) {
+                return;
+            } else if (path.empty()) {
+                SearchAllDrives(*d, q, prefs, ct);
+            } else {
+                // Résultats au fil de l'eau : chaque copie partielle s'affiche comme un rafraîchissement.
+                SearchTree(*d, q, prefs, ct, [&](std::shared_ptr<DirData> s) {
+                    auto* r = new Result{ct.gen, JobKind::Navigate};
+                    r->order = SortOrder(*s, col, asc, prefs, filter);
+                    r->data = std::move(s);
+                    Post(r);
+                });
+            }
         } else if (climb) EnumerateNearest(*d, ct);
         else Enumerate(*d, ct);
         if (ct.cancelled()) return;
@@ -806,11 +899,7 @@ void RunSearch() {
     const std::wstring current = g_pending.active ? g_pending.query : g_query;
     if (q == current) return;
     g_filter.clear();  // les résultats correspondent déjà au texte
-    if (!q.empty() && g_path.empty()) {
-        SetStatus(L"Ouvrez un dossier ou un lecteur pour y rechercher.");
-        return;
-    }
-    Navigate(g_path, Nav::Refresh, {}, {}, {}, false, &q);  // q vide : retour au contenu du dossier
+    Navigate(g_path, Nav::Refresh, {}, {}, {}, false, &q);  // q vide : retour au contenu du dossier ; Ce PC : tout le PC
 }
 
 void FocusSearch() {
@@ -2336,6 +2425,89 @@ void OnWatchTimer() {
     Refresh();
 }
 
+// ───────────────────────────── Recherche instantanée (service) ─────────────────────────────
+
+constexpr wchar_t kAppKey[] = L"Software\\FastExplorer";
+
+bool IndexAsked() {
+    DWORD v = 0, cb = sizeof v;
+    return RegGetValueW(HKEY_CURRENT_USER, kAppKey, L"IndexAsked", RRF_RT_REG_DWORD, nullptr, &v, &cb) == ERROR_SUCCESS && v;
+}
+
+void SetIndexAsked() {
+    DWORD v = 1;
+    RegSetKeyValueW(HKEY_CURRENT_USER, kAppKey, L"IndexAsked", REG_DWORD, &v, sizeof v);
+}
+
+// Installe ou retire le service, dans un process élevé (une demande d'autorisation de Windows).
+void RunIndexSetup(bool install) {
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return;
+    std::wstring args = install ? L"--install-index " + Index_CurrentUserSid() : L"--uninstall-index";
+    SHELLEXECUTEINFOW sei{sizeof sei};
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.hwnd = g_hwnd;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe;
+    sei.lpParameters = args.c_str();
+    sei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&sei)) {
+        const DWORD e = GetLastError();
+        SetStatus(e == ERROR_CANCELLED ? std::wstring(L"Recherche instantanée : autorisation refusée.")
+                                       : L"Recherche instantanée : " + ErrorText(e));
+        return;
+    }
+    SetStatus(install ? L"Installation du service de recherche…" : L"Retrait du service de recherche…");
+    if (!sei.hProcess) return;
+    std::thread([p = sei.hProcess, hwnd = g_hwnd, install] {
+        WaitForSingleObject(p, 120000);
+        DWORD code = ERROR_TIMEOUT;
+        GetExitCodeProcess(p, &code);
+        CloseHandle(p);
+        PostMessageW(hwnd, WM_APP_INDEXDONE, code, install ? 1 : 0);
+    }).detach();
+}
+
+void OnIndexDone(DWORD code, bool install) {
+    if (code) {
+        SetStatus(std::wstring(install ? L"Activation" : L"Désactivation") + L" de la recherche instantanée impossible : " +
+                  ErrorText(code));
+        return;
+    }
+    Flash(install ? L"Recherche instantanée activée : l'index se construit (quelques secondes), puis toute recherche "
+                    L"est immédiate, même dans tout le PC (Ce PC)."
+                  : L"Recherche instantanée désactivée : service retiré.");
+}
+
+HRESULT CALLBACK IndexAskCallback(HWND h, UINT n, WPARAM, LPARAM, LONG_PTR) {
+    if (n == TDN_CREATED) SendMessageW(h, TDM_SET_BUTTON_ELEVATION_REQUIRED_STATE, 100, TRUE);  // bouclier
+    return S_OK;
+}
+
+// Une seule fois : proposer d'activer la recherche instantanée.
+void AskIndex() {
+    if (IndexAsked() || Index_ServiceInstalled()) return;
+    SetIndexAsked();
+    TASKDIALOG_BUTTON buttons[] = {
+        {100, L"Activer la recherche instantanée\nWindows demandera une autorisation administrateur, une seule fois."},
+        {101, L"Plus tard\nActivable à tout moment depuis le menu de la fenêtre (Alt+Espace)."}};
+    TASKDIALOGCONFIG c{sizeof c};
+    c.hwndParent = g_hwnd;
+    c.dwFlags = TDF_USE_COMMAND_LINKS | TDF_POSITION_RELATIVE_TO_WINDOW | TDF_ALLOW_DIALOG_CANCELLATION;
+    c.pszWindowTitle = L"FastExplorer";
+    c.pszMainInstruction = L"Trouver n'importe quel fichier en un instant ?";
+    c.pszContent =
+        L"FastExplorer peut tenir à jour la liste des fichiers de vos disques, comme Everything : la recherche devient "
+        L"instantanée, dans un dossier comme dans tout le PC.\n\nUn petit service Windows est installé. Il lit seulement "
+        L"la liste des fichiers, ne modifie rien et ne répond qu'à votre compte.";
+    c.pButtons = buttons;
+    c.cButtons = 2;
+    c.nDefaultButton = 100;
+    c.pfCallback = IndexAskCallback;
+    int pressed = 0;
+    if (SUCCEEDED(TaskDialogIndirect(&c, &pressed, nullptr, nullptr)) && pressed == 100) RunIndexSetup(true);
+}
+
 // ───────────────────────────── Fenêtre ─────────────────────────────
 
 void ApplyFont() {
@@ -2520,6 +2692,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             AddClipboardFormatListener(hwnd);
             RegisterDrop();
             AttachTarget(hwnd);
+            if (HMENU sys = GetSystemMenu(hwnd, FALSE)) {
+                AppendMenuW(sys, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(sys, MF_STRING, ID_SYS_INDEX, L"Recherche instantanée…");
+            }
+            SetTimer(hwnd, TIMER_INDEXASK, 1500, nullptr);
             return 0;
         case WM_CONTEXTMENU:
             if ((HWND)wp == g_list) { ShowContextMenu(lp); return 0; }
@@ -2581,6 +2758,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ApplyViewPrefs(ReadViewPrefs());  // options des dossiers changées entre-temps ?
             }
             break;
+        case WM_INITMENU:
+            if ((HMENU)wp == GetSystemMenu(hwnd, FALSE))
+                ModifyMenuW((HMENU)wp, ID_SYS_INDEX, MF_BYCOMMAND | MF_STRING, ID_SYS_INDEX,
+                            Index_ServiceInstalled() ? L"Désactiver la recherche instantanée (retirer le service)"
+                                                     : L"Activer la recherche instantanée…");
+            break;
+        case WM_SYSCOMMAND:
+            if ((wp & 0xFFF0) == ID_SYS_INDEX) {
+                RunIndexSetup(!Index_ServiceInstalled());
+                return 0;
+            }
+            break;
+        case WM_APP_INDEXDONE: OnIndexDone((DWORD)wp, lp != 0); return 0;
         case WM_SETTINGCHANGE:
             if (lp && wcscmp((const wchar_t*)lp, L"ShellState") == 0) ApplyViewPrefs(ReadViewPrefs());
             break;
@@ -2637,6 +2827,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_WATCH) { OnWatchTimer(); return 0; }
             if (wp == TIMER_AFTEROP) { ApplyAfterOp(); return 0; }
             if (wp == TIMER_PROGRESS) { OnProgressTimer(); return 0; }
+            if (wp == TIMER_INDEXASK) {
+                KillTimer(hwnd, wp);
+                if (IsWindowVisible(hwnd) && !g_editing) AskIndex();
+                return 0;
+            }
             if (wp == TIMER_PINNED) { KillTimer(hwnd, wp); NavPane_RefreshPinned(true); return 0; }
             if (wp == TIMER_HOVER) {
                 KillTimer(hwnd, wp);

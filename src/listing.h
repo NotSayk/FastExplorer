@@ -48,8 +48,9 @@ struct DirData {
     bool searchDone = true;  // false : résultats partiels, la recherche continue
     bool truncated = false;  // trop de résultats : recherche arrêtée
     size_t scanned = 0;      // dossiers parcourus
+    bool fromIndex = false;  // résultats de l'index (service de recherche instantanée)
 
-    bool isRoot() const { return path.empty(); }
+    bool isRoot() const { return path.empty() && query.empty(); }  // Ce PC (pas une recherche dans tout le PC)
     const wchar_t* name(const Entry& e) const { return pool.data() + e.nameOff; }
 };
 
@@ -86,6 +87,20 @@ struct ViewPrefs;
 // présents (sans tenir compte de la casse ni des accents) ; un mot avec * ou ?
 // est un motif sur le nom entier (« *.txt »).
 bool NameMatches(const std::wstring& query, const wchar_t* name, uint32_t n);
+
+// Même règle, préparée une fois pour comparer beaucoup de noms (thread-safe en lecture).
+struct NameMatcher {
+    std::vector<std::wstring> terms;
+    std::vector<bool> wild;
+    std::vector<std::string> ascii;  // mot en ASCII minuscule ("" : pas d'ASCII pur)
+    explicit NameMatcher(const std::wstring& q);
+    bool operator()(const wchar_t* name, uint32_t n) const;
+    static int AsciiFind(const wchar_t* name, uint32_t n, const std::string& term);
+};
+
+// Construction de résultats hors Enumerate / SearchTree (index de recherche).
+void DirData_Add(DirData& d, const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime);
+void DirData_BuildKeys(DirData& d);  // à appeler une fois toutes les entrées ajoutées
 
 // Recherche récursive dans d.path (sous-dossiers compris, sans suivre les
 // jonctions ni entrer dans les dossiers masqués par `prefs`), sur plusieurs

@@ -549,7 +549,7 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 |---|---|---|
 | **Lenteur** (ouverture, gros dossiers, réseau, « Travail en cours… ») | Notre cœur : lecture NT, liste virtuelle, rien de bloquant | ✅ |
 | **Taille des dossiers** | Calcul en tâche de fond, colonne Taille remplie pour les dossiers, cache | ✅ P1 ⭐ (3 threads en priorité d'E/S basse, jonctions non suivies, « ≥ » si un sous-dossier est illisible, tri par taille, cache de 30 s périmé par les opérations de fichiers ; F5 recalcule ; pas sur les lecteurs réseau et optiques) |
-| **Recherche instantanée** sur tout le disque | Index MFT + journal USN (à la *Everything*) | P1 ⭐ |
+| **Recherche instantanée** sur tout le disque | Index MFT + journal USN (à la *Everything*) | ✅ P1 ⭐ (service `FastExplorerIndex` installé une fois, en un clic : table des fichiers NTFS lue en < 1 s, suivie par le journal USN ; canal nommé réservé à l'utilisateur, serveur vérifié ; ~140 ms dans tout le PC, 79 000 résultats en 0,7 s ; sans service : parcours des dossiers, Ce PC = tous les disques locaux) |
 | **Double panneau** (à la Total Commander) | Deux listes côte à côte, F5/F6 copier/déplacer vers l'autre panneau | P1 ⭐ |
 | **File d'attente de copies** | Copies mises en file (pas en parallèle sur le même disque), pause/reprise, reprise après erreur, vérification | P1 ⭐ |
 | **Renommage par lot avancé** | Motifs, expressions régulières, compteur, casse, aperçu avant/après | P2 ⭐ |
@@ -626,7 +626,7 @@ dossiers avant l'index…) :
 13. ✅ **Onglets et fenêtres** : Ctrl+T / Ctrl+W / Ctrl+Tab, réorganiser, clic milieu sur un dossier,
     Ctrl+N, ouvrir dans un nouvel onglet depuis le volet et le fil d'Ariane.
 14. ✅ **Taille des dossiers** ⭐ : calculée en arrière-plan (colonne Taille), sans ralentir la navigation.
-15. **Recherche instantanée sur tout le disque** ⭐ : index MFT + journal USN (à la *Everything*), puis
+15. ✅🟡 **Recherche instantanée sur tout le disque** ⭐ (filtres à venir) : index MFT + journal USN (à la *Everything*), puis
     filtres de recherche (date, type, taille).
 16. **Modes d'affichage** : grandes / moyennes icônes, zoom continu (Ctrl+molette), Ctrl+Maj+1…8,
     mode compact, **miniatures** (cache système partagé avec l'Explorateur).
