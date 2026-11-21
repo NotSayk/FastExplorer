@@ -563,7 +563,10 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | **Sessions / espaces de travail** | Ensembles d'onglets nommés, restaurés en un clic | P2 ⭐ |
 | **Signets** | Favoris de dossiers avec raccourcis clavier | P2 ⭐ |
 | **Fichiers verrouillés** | « Qui utilise ce fichier ? » + fermer l'application | P2 ⭐ |
-| **Statut Git** | Colonne/surimpression pour l'état des fichiers d'un dépôt | P3 ⭐ |
+| **Intégration Git** | Dans un dépôt : branche courante affichée, **changer de branche** en un clic, état des fichiers (modifié, nouveau, ignoré) en colonne ou surimpression ; à faire une fois l'interface aboutie | P2 ⭐ |
+| **Onglet WSL** | Section dédiée aux distributions Linux (`\\wsl.localhost\<distro>`) : liste des distributions, ouverture directe, état (démarrée / arrêtée) | P2 ⭐ |
+| **Connexions SFTP** | Serveurs SFTP enregistrés, parcourus comme des dossiers (copier, glisser-déposer, renommer), clés SSH, mots de passe dans le Gestionnaire d'identification Windows | P2 ⭐ |
+| **Connexions cloud** | Google Drive, OneDrive, Dropbox… parcourus directement par leurs API (sans client de synchronisation installé), comptes connectés par OAuth | P2 ⭐ |
 | **Portable** | Un seul .exe, aucune installation, configuration dans un fichier | ✅ ⭐ |
 | Chemins de plus de 260 caractères | L'Explorateur les gère mal (selon les opérations) | ✅ ⭐ |
 | Remplacer l'Explorateur par défaut | Win+E et « Ouvrir le dossier » des autres applications ⚙️ clé `HKCU\Software\Classes\Folder\shell` (à faire proprement et de façon réversible) | P2 |
@@ -609,6 +612,9 @@ Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre
 
 Puis les **P1** : onglets, annuler/rétablir, aperçu, miniatures, taille des dossiers ⭐, double panneau ⭐,
 file d'attente de copies ⭐, filtre instantané ⭐, autocomplétion, archives…
+
+Plus tard, une fois l'interface aboutie : intégration Git (changer de branche) ⭐, onglet WSL ⭐,
+connexions SFTP ⭐, connexions cloud (Google Drive, OneDrive, Dropbox…) ⭐.
 
 ---
 
