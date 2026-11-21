@@ -600,8 +600,73 @@ void TestCrumbs() {
     CHECK_STR(texts(Crumbs_Split(L"C:\\a\\\\b")), L"Ce PC|;C:|C:\\;a|C:\\a;b|C:\\a\\b;");  // séparateur doublé
 }
 
-void TestFastCopy() {
-    const std::wstring base = Join(g_root, L"fast");
+void TestViewPrefs() {
+    const DWORD H = FILE_ATTRIBUTE_HIDDEN, S = FILE_ATTRIBUTE_SYSTEM;
+    const ViewPrefs all{true, true, true}, noSuper{true, false, true}, none{false, false, true}, odd{false, true, true};
+    CHECK(IsShown(0, none) && IsShown(S, none));  // système seul : toujours affiché
+    CHECK(IsShown(H, all) && IsShown(H, noSuper) && !IsShown(H, none) && !IsShown(H, odd));
+    CHECK(IsShown(H | S, all) && !IsShown(H | S, noSuper) && !IsShown(H | S, none) && !IsShown(H | S, odd));
+
+    // Tri filtré : les masqués sortent de l'ordre, pas des entrées.
+    const std::wstring base = Join(g_root, L"vue");
+    CreateDirectoryW(base.c_str(), nullptr);
+    MakeFile(Join(base, L"normal.txt"), 1);
+    MakeFile(Join(base, L"cache.txt"), 1);
+    MakeFile(Join(base, L"protege.txt"), 1);
+    CreateDirectoryW(Join(base, L"dossier_cache").c_str(), nullptr);
+    SetFileAttributesW(Join(base, L"cache.txt").c_str(), H);
+    SetFileAttributesW(Join(base, L"protege.txt").c_str(), H | S);
+    SetFileAttributesW(Join(base, L"dossier_cache").c_str(), H);
+    DirData d;
+    d.path = base;
+    Enumerate(d);
+    auto names = [&](const ViewPrefs& p) {
+        std::wstring s;
+        for (uint32_t i : SortOrder(d, COL_NAME, true, p)) s += std::wstring(d.name(d.entries[i])) + L";";
+        return s;
+    };
+    CHECK(d.entries.size() == 4);
+    CHECK_STR(names(all), L"dossier_cache;cache.txt;normal.txt;protege.txt;");
+    CHECK_STR(names(noSuper), L"dossier_cache;cache.txt;normal.txt;");
+    CHECK_STR(names(none), L"normal.txt;");
+    CHECK_STR(names(ViewPrefs{}), L"dossier_cache;cache.txt;normal.txt;protege.txt;");  // défaut : tout
+    for (const wchar_t* n : {L"cache.txt", L"protege.txt", L"dossier_cache"})
+        SetFileAttributesW(Join(base, n).c_str(), FILE_ATTRIBUTE_NORMAL);
+    RemoveTree(base);
+
+    // Lecteurs de Ce PC : jamais filtrés.
+    DirData pc;
+    Enumerate(pc);
+    CHECK(SortOrder(pc, COL_NAME, true, none).size() == pc.entries.size());
+
+    // Extensions masquées : types connus seulement.
+    auto hid = [](const wchar_t* n, bool show) {
+        const uint32_t len = (uint32_t)wcslen(n);
+        const wchar_t* dot = wcsrchr(n, L'.');
+        return HiddenExtLen(n, len, dot ? (uint32_t)(dot - n) : len, show);
+    };
+    CHECK(hid(L"lisez-moi.txt", false) == 4 && hid(L"lisez-moi.txt", true) == 0);
+    CHECK(hid(L"Raccourci.lnk", true) == 4);   // NeverShowExt : toujours masquée, comme l'Explorateur
+    CHECK(hid(L"x.zzqqtype", false) == 0);     // type inconnu : affichée
+    CHECK(hid(L".gitignore", false) == 0);     // nom qui n'est qu'une extension
+    CHECK(hid(L"sans_extension", false) == 0);
+    CHECK(hid(L"point_final.", false) == 0);
+
+    // Volet : les mêmes règles.
+    const std::wstring nav = Join(g_root, L"vue_volet");
+    CreateDirectoryW(nav.c_str(), nullptr);
+    CreateDirectoryW(Join(nav, L"visible").c_str(), nullptr);
+    CreateDirectoryW(Join(nav, L"cache").c_str(), nullptr);
+    SetFileAttributesW(Join(nav, L"cache").c_str(), H);
+    NavPane_SetViewPrefs(none);
+    CHECK(NavPane_ReadChildren(nav).size() == 1);
+    NavPane_SetViewPrefs(noSuper);
+    CHECK(NavPane_ReadChildren(nav).size() == 2);
+    SetFileAttributesW(Join(nav, L"cache").c_str(), FILE_ATTRIBUTE_NORMAL);
+    RemoveTree(nav);
+}
+
+void TestFastCopy() {    const std::wstring base = Join(g_root, L"fast");
     const std::wstring src = Join(base, L"src"), dst = Join(base, L"dst");
     CreateDirectoryW(base.c_str(), nullptr);
     CreateDirectoryW(src.c_str(), nullptr);
@@ -931,6 +996,7 @@ int wmain() {
     TestNavPane();
     TestPins();
     TestCrumbs();
+    TestViewPrefs();
     TestFastCopy();
     TestFileOps();
     TestDrop();

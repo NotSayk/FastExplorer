@@ -68,7 +68,29 @@ bool IsGoneError(DWORD err);
 // existant (jusqu'à Ce PC) ; d.vanished garde alors le chemin demandé.
 void EnumerateNearest(DirData& d, const CancelToken& ct = {});
 
+// Préférences d'affichage de l'Explorateur (communes avec lui).
+struct ViewPrefs {
+    bool showHidden = true;        // éléments cachés
+    bool showSuperHidden = true;   // fichiers protégés du système (cachés ET système)
+    bool showExtensions = true;    // extensions des types connus
+    bool operator==(const ViewPrefs&) const = default;
+};
+// Réglages actuels de Windows (SHGetSetSettings).
+ViewPrefs ReadViewPrefs();
+// Change les réglages de Windows, comme Afficher ▸ Afficher de l'Explorateur
+// (prévient les autres fenêtres sur un thread).
+void WriteViewPrefs(const ViewPrefs& p);
+// L'élément est-il affiché ? Un protégé exige les deux réglages, comme l'Explorateur.
+bool IsShown(DWORD attr, const ViewPrefs& p);
+
+// Nombre de caractères d'extension à masquer à l'affichage d'un fichier (0 :
+// nom complet). Masquée : type connu et extensions masquées, ou type marqué
+// NeverShowExt (.lnk, .url…), sauf AlwaysShowExt. Résultat mis en cache par
+// extension ; utilisable depuis n'importe quel thread.
+uint32_t HiddenExtLen(const wchar_t* name, uint32_t nameLen, uint32_t extOff, bool showExtensions);
+
 // Permutation d'affichage : dossiers d'abord, puis la colonne demandée,
 // puis le nom (ordre naturel et linguistique de l'Explorateur). Ordre total
 // et déterministe : les égalités sont départagées par l'index.
-std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc);
+// Les éléments que `prefs` masque n'y figurent pas (lecteurs de Ce PC : jamais).
+std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs = {});

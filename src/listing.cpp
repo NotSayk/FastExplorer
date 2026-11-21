@@ -5,9 +5,11 @@
 #include "util.h"
 
 #include <shellapi.h>
+#include <shlobj.h>
 #include <winnetwk.h>
 
 #pragma comment(lib, "mpr")
+#pragma comment(lib, "advapi32")
 
 #include <algorithm>
 #include <cstring>
@@ -17,6 +19,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 namespace {
 
@@ -222,15 +225,93 @@ void Enumerate(DirData& d, const CancelToken& ct) {
     }
 }
 
-std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc) {
+ViewPrefs ReadViewPrefs() {
+    SHELLSTATEW ss{};
+    SHGetSetSettings(&ss, SSF_SHOWALLOBJECTS | SSF_SHOWSUPERHIDDEN | SSF_SHOWEXTENSIONS, FALSE);
+    ViewPrefs p;
+    p.showHidden = ss.fShowAllObjects != 0;
+    p.showSuperHidden = ss.fShowSuperHidden != 0;
+    p.showExtensions = ss.fShowExtensions != 0;
+    return p;
+}
+
+void WriteViewPrefs(const ViewPrefs& p) {
+    SHELLSTATEW ss{};
+    ss.fShowAllObjects = p.showHidden;
+    ss.fShowSuperHidden = p.showSuperHidden;
+    ss.fShowExtensions = p.showExtensions;
+    SHGetSetSettings(&ss, SSF_SHOWALLOBJECTS | SSF_SHOWSUPERHIDDEN | SSF_SHOWEXTENSIONS, TRUE);
+    // Les fenêtres de l'Explorateur se mettent à jour sur ce message ; une
+    // application figée ne doit pas nous bloquer : diffusion sur un thread.
+    std::thread([] {
+        DWORD_PTR r = 0;
+        SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"ShellState", SMTO_ABORTIFHUNG, 1000, &r);
+    }).detach();
+}
+
+bool IsShown(DWORD attr, const ViewPrefs& p) {
+    if (!(attr & FILE_ATTRIBUTE_HIDDEN)) return true;
+    if (!p.showHidden) return false;
+    return !(attr & FILE_ATTRIBUTE_SYSTEM) || p.showSuperHidden;
+}
+
+namespace {
+// Réglage d'un type, lu une fois dans le registre.
+enum ExtRule : uint8_t { kExtUnknown, kExtKnown, kExtNever, kExtAlways };
+
+bool HasValue(HKEY root, const std::wstring& key, const wchar_t* value) {
+    return RegGetValueW(root, key.c_str(), value, RRF_RT_ANY, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+}
+
+ExtRule ReadExtRule(const std::wstring& ext) {
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, ext.c_str(), 0, KEY_READ, &k) != ERROR_SUCCESS) return kExtUnknown;
+    wchar_t progId[256] = {};
+    DWORD cb = sizeof progId;
+    const bool hasProg = RegGetValueW(k, nullptr, nullptr, RRF_RT_REG_SZ, nullptr, progId, &cb) == ERROR_SUCCESS && progId[0];
+    RegCloseKey(k);
+    if (HasValue(HKEY_CLASSES_ROOT, ext, L"AlwaysShowExt")) return kExtAlways;
+    if (hasProg) {
+        if (HasValue(HKEY_CLASSES_ROOT, progId, L"AlwaysShowExt")) return kExtAlways;
+        if (HasValue(HKEY_CLASSES_ROOT, progId, L"NeverShowExt")) return kExtNever;
+    }
+    return kExtKnown;
+}
+
+std::mutex g_extMutex;
+std::unordered_map<std::wstring, ExtRule> g_extRules;
+}  // namespace
+
+uint32_t HiddenExtLen(const wchar_t* name, uint32_t nameLen, uint32_t extOff, bool showExtensions) {
+    // Pas d'extension, ou nom qui n'est qu'une extension (« .gitignore ») : nom complet.
+    if (extOff == 0 || extOff + 1 >= nameLen) return 0;
+    std::wstring ext(name + extOff, nameLen - extOff);
+    CharLowerBuffW(ext.data(), (DWORD)ext.size());
+    ExtRule rule;
+    {
+        std::lock_guard lock(g_extMutex);
+        auto it = g_extRules.find(ext);
+        if (it != g_extRules.end()) {
+            rule = it->second;
+        } else {
+            rule = ReadExtRule(ext);
+            g_extRules.emplace(ext, rule);
+        }
+    }
+    const bool hide = rule == kExtNever || (rule == kExtKnown && !showExtensions);
+    return hide ? nameLen - extOff : 0;
+}
+
+std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs) {
     const uint32_t n = (uint32_t)d.entries.size();
     std::vector<uint32_t> order;
     order.reserve(n);
+    const bool filter = !d.isRoot();
     for (uint32_t i = 0; i < n; ++i)
-        if (d.entries[i].isDir()) order.push_back(i);
+        if (d.entries[i].isDir() && (!filter || IsShown(d.entries[i].attr, prefs))) order.push_back(i);
     const size_t nDirs = order.size();
     for (uint32_t i = 0; i < n; ++i)
-        if (!d.entries[i].isDir()) order.push_back(i);
+        if (!d.entries[i].isDir() && (!filter || IsShown(d.entries[i].attr, prefs))) order.push_back(i);
 
     const Entry* E = d.entries.data();
     const BYTE* K = d.keys.data();

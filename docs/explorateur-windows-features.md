@@ -135,8 +135,8 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Volet de détails (Alt+Maj+P) | P1 |
 | Volet d'aperçu (Alt+P) | P1 |
 | Cases à cocher des éléments | P2 |
-| **Extensions de noms de fichiers** | **P0** (aujourd'hui : toujours affichées) |
-| **Éléments masqués** | **P0** (aujourd'hui : tout est affiché, sans distinction visuelle) |
+| **Extensions de noms de fichiers** | ✅ **P0** (réglage de Windows suivi en direct ; menu du fond du dossier ; types connus seulement, NeverShowExt / AlwaysShowExt respectés ; renommer garde l'extension masquée) |
+| **Éléments masqués** | ✅ **P0** (réglage de Windows suivi en direct ; Ctrl+H ou menu du fond du dossier ; affichés estompés ; « n masqués » dans la barre d'état ; même règle dans le volet) |
 | Mode compact | P1 |
 
 ### 4.3 Colonnes (vue Détails)
@@ -447,11 +447,11 @@ Accès : « … » ▸ Options. Trois onglets. Une ⭐ signale les options que n
 - Afficher l'icône du type sur les miniatures
 - Afficher les informations de taille dans les info-bulles des dossiers
 - Afficher le chemin complet dans la barre de titre ⭐
-- Fichiers et dossiers cachés : ne pas afficher / **afficher** ⭐
+- ✅ Fichiers et dossiers cachés : ne pas afficher / **afficher** ⭐
 - Masquer les lecteurs vides
-- **Masquer les extensions des fichiers dont le type est connu** ⭐
+- ✅ **Masquer les extensions des fichiers dont le type est connu** ⭐
 - Masquer les conflits de fusion de dossiers
-- **Masquer les fichiers protégés du système d'exploitation** ⭐
+- ✅ **Masquer les fichiers protégés du système d'exploitation** ⭐
 - Ouvrir les fenêtres des dossiers dans un processus distinct
 - Restaurer les fenêtres de dossiers précédentes à l'ouverture de session ⭐
 - Afficher les lettres de lecteur ⭐
@@ -606,7 +606,7 @@ Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre
 4. ✅ **Rafraîchissement automatique** : dossier affiché, arrivée / retrait des lecteurs dans Ce PC, dossier ou lecteur disparu → plus proche parent, éjection USB non bloquée.
 5. ✅ **Volet de navigation** : dossiers épinglés + arborescence de Ce PC ; libellés et jauges des lecteurs.
 6. ✅ **Fil d'Ariane** dans la barre d'adresse.
-7. **Affichage** : éléments cachés et système, masquage des extensions (en respectant les préférences de l'utilisateur).
+7. ✅ **Affichage** : éléments cachés et système, masquage des extensions (en respectant les préférences de l'utilisateur).
 8. **Barre d'état** : résumé de la sélection (nombre, taille).
 9. **Recherche** dans le dossier courant (puis l'index MFT en P1 ⭐).
 

@@ -27,6 +27,7 @@ struct MenuExtra {
     std::wstring text;
     std::function<void()> run;
     bool onlyWithoutShell = false;  // seulement si le Shell ne fournit pas de menu
+    bool checked = false;           // coche devant le texte
 };
 
 // Affiche le menu à `pt` (coordonnées écran) et exécute la commande choisie.

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 
@@ -25,8 +26,14 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-bool IsProtected(DWORD attr) {
-    return (attr & FILE_ATTRIBUTE_HIDDEN) && (attr & FILE_ATTRIBUTE_SYSTEM);
+// Préférences d'affichage (lues par les threads de lecture). Par défaut :
+// comme l'Explorateur d'origine, sans les fichiers protégés du système.
+std::mutex g_prefsMutex;
+ViewPrefs g_prefs{true, false, true};
+
+bool Visible(DWORD attr) {
+    std::lock_guard lock(g_prefsMutex);
+    return IsShown(attr, g_prefs);
 }
 
 // Un sous-dossier visible existe-t-il ? (lecteurs locaux seulement : ailleurs
@@ -44,7 +51,7 @@ bool HasSubfolder(const std::wstring& path) {
     do {
         const wchar_t* c = fd.cFileName;
         const bool dots = c[0] == L'.' && (!c[1] || (c[1] == L'.' && !c[2]));
-        if (!dots && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !IsProtected(fd.dwFileAttributes)) {
+        if (!dots && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && Visible(fd.dwFileAttributes)) {
             any = true;
             break;
         }
@@ -61,7 +68,7 @@ bool HasSubfolder(const std::wstring& path) {
 std::vector<uint32_t> SortedDirs(const DirData& d) {
     std::vector<uint32_t> dirs;
     for (uint32_t i = 0; i < d.entries.size(); ++i)
-        if (d.entries[i].isDir() && (d.isRoot() || !IsProtected(d.entries[i].attr))) dirs.push_back(i);
+        if (d.entries[i].isDir() && (d.isRoot() || Visible(d.entries[i].attr))) dirs.push_back(i);
     std::sort(dirs.begin(), dirs.end(), [&](uint32_t a, uint32_t b) {
         const Entry &x = d.entries[a], &y = d.entries[b];
         const int c = memcmp(d.keys.data() + x.keyOff, d.keys.data() + y.keyOff, std::min(x.keyLen, y.keyLen));
@@ -495,6 +502,19 @@ void NavPane_UnpinWindows(const std::wstring& path) {
         return;
     }
     StartPinnedRead(path);
+}
+
+void NavPane_SetViewPrefs(const ViewPrefs& p) {
+    {
+        std::lock_guard lock(g_prefsMutex);
+        if (g_prefs == p) return;
+        g_prefs = p;
+    }
+    if (!g_tree) return;
+    std::vector<uintptr_t> reload;  // dossiers ouverts : relus avec les nouvelles règles
+    for (const auto& [id, n] : g_nodes)
+        if ((n.kind == Kind::Folder || n.kind == Kind::Drive) && n.loaded && !n.loading) reload.push_back(id);
+    for (uintptr_t id : reload) StartLoad(id);
 }
 
 std::wstring NavPane_DriveText(const std::wstring& root) {

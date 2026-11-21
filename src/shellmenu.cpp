@@ -449,7 +449,8 @@ void AddExtras(HMENU menu, const std::vector<MenuExtra>& extras, bool shell) {
     UINT pos = 0;
     for (size_t i = 0; i < extras.size(); ++i) {
         if (shell && extras[i].onlyWithoutShell) continue;
-        InsertMenuW(menu, pos++, MF_BYPOSITION | MF_STRING, kExtraFirst + (UINT)i, extras[i].text.c_str());
+        InsertMenuW(menu, pos++, MF_BYPOSITION | MF_STRING | (extras[i].checked ? MF_CHECKED : 0), kExtraFirst + (UINT)i,
+                    extras[i].text.c_str());
     }
     if (pos && shell && GetMenuItemCount(menu) > (int)pos) InsertMenuW(menu, pos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
 }

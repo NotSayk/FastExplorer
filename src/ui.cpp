@@ -120,6 +120,8 @@ std::vector<std::wstring> g_back, g_fwd;
 int g_sortCol = COL_NAME;
 bool g_sortAsc = true;
 std::unordered_map<std::wstring, int> g_iconCache;
+ViewPrefs g_prefs;              // éléments cachés, extensions : réglages de l'Explorateur
+std::wstring g_editExt;         // renommage : extension masquée à l'affichage, remise à la fin
 double g_startupMs = -1;  // -1 = pas encore mesuré, 0 = déjà affiché
 uint64_t g_viewSerial = 0;
 uintptr_t g_watchId = 0;
@@ -187,8 +189,13 @@ void ShowSummary() {
     if (!HasView() || g_progressShown) return;
     const DirData& d = *g_view.data;
     wchar_t s[512];
-    int k = swprintf_s(s, L"%zu éléments  (%zu dossiers, %zu fichiers)   •   lecture %.2f ms, clés %.2f ms, tri %.2f ms",
-                       d.entries.size(), d.nDirs, d.nFiles, d.enumMs, d.keyMs, g_view.sortMs);
+    size_t dirs = 0;
+    for (uint32_t e : g_view.order) dirs += d.entries[e].isDir();
+    const size_t shown = g_view.order.size(), hidden = d.entries.size() - shown;
+    wchar_t masked[64] = L"";
+    if (hidden) swprintf_s(masked, L", %zu masqué%s", hidden, hidden > 1 ? L"s" : L"");
+    int k = swprintf_s(s, L"%zu éléments  (%zu dossiers, %zu fichiers%s)   •   lecture %.2f ms, clés %.2f ms, tri %.2f ms",
+                       shown, dirs, shown - dirs, masked, d.enumMs, d.keyMs, g_view.sortMs);
     if (g_startupMs > 0 && k > 0) {
         swprintf_s(s + k, _countof(s) - k, L"   •   démarrage %.0f ms", g_startupMs);
         g_startupMs = 0;  // affiché une seule fois
@@ -243,21 +250,23 @@ std::vector<int> FindEntriesByNames(const std::vector<std::wstring>& names) {
     return v;
 }
 
+// rowOf : par entrée, sa ligne, ou -1 si elle est masquée (éléments cachés).
 void RebuildRowOf() {
     const int n = RowCount();
-    g_view.rowOf.assign(n, -1);
+    g_view.rowOf.assign(HasView() ? g_view.data->entries.size() : 0, -1);
     for (int r = 0; r < n; ++r) g_view.rowOf[g_view.order[r]] = r;
 }
 
 // Applique une sélection exprimée en index d'entrées (indépendante du tri).
 void ApplySelection(const std::vector<int>& sel, int focus, bool scroll) {
     ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
-    const int n = RowCount();
-    if (!n) return;
+    if (!RowCount()) return;
     const std::vector<int>& rowOf = g_view.rowOf;
+    const int n = (int)rowOf.size();
+    // (-1 à SetItemState sélectionnerait tout : les entrées masquées sont ignorées)
     for (int e : sel)
-        if (e >= 0 && e < n) ListView_SetItemState(g_list, rowOf[e], LVIS_SELECTED, LVIS_SELECTED);
-    if (focus >= 0 && focus < n) {
+        if (e >= 0 && e < n && rowOf[e] >= 0) ListView_SetItemState(g_list, rowOf[e], LVIS_SELECTED, LVIS_SELECTED);
+    if (focus >= 0 && focus < n && rowOf[focus] >= 0) {
         const int fr = rowOf[focus];
         ListView_SetItemState(g_list, fr, LVIS_FOCUSED, LVIS_FOCUSED);
         ListView_SetSelectionMark(g_list, fr);
@@ -340,7 +349,9 @@ void FillDispInfo(LVITEMW& it) {
         it.iImage = g_view.icons[idx];
     }
     if (it.mask & LVIF_STATE) {  // surimpression (flèche de raccourci, état cloud), élément coupé
-        it.state = INDEXTOOVERLAYMASK(g_view.overlays[idx]) | (g_view.cut[idx] ? LVIS_CUT : 0) |
+        // Élément caché : estompé, comme dans l'Explorateur (même rendu qu'un élément coupé).
+        const bool dim = g_view.cut[idx] || (!g_view.data->isRoot() && (e.attr & FILE_ATTRIBUTE_HIDDEN));
+        it.state = INDEXTOOVERLAYMASK(g_view.overlays[idx]) | (dim ? LVIS_CUT : 0) |
                    (it.iItem == g_dropRow ? LVIS_DROPHILITED : 0);
         it.stateMask = LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED;
     }
@@ -352,7 +363,12 @@ void FillDispInfo(LVITEMW& it) {
         case COL_NAME:
             if (const DriveInfo* di = DriveOfEntry(idx))
                 wcsncpy_s(out, cch, DriveDisplayName(NameOf(idx), e.extra, *di).c_str(), _TRUNCATE);
-            else wcsncpy_s(out, cch, NameOf(idx), _TRUNCATE);
+            else {
+                const uint32_t hide = e.isDir() || g_view.data->isRoot()
+                                          ? 0
+                                          : HiddenExtLen(NameOf(idx), e.nameLen, e.extOff, g_prefs.showExtensions);
+                wcsncpy_s(out, cch, NameOf(idx), std::min<size_t>(e.nameLen - hide, (size_t)cch - 1));
+            }
             break;
         case COL_SIZE:
             if (const DriveInfo* di = DriveOfEntry(idx)) {
@@ -492,7 +508,7 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
     const int col = g_sortCol;
     const bool asc = g_sortAsc;
     const bool climb = nav == Nav::Refresh;  // dossier affiché disparu : on remonte, comme l'Explorateur
-    Jobs_Spawn([ct, path, col, asc, climb] {
+    Jobs_Spawn([ct, path, col, asc, climb, prefs = g_prefs] {
         auto d = std::make_shared<DirData>();
         d->path = path;
         if (climb) EnumerateNearest(*d, ct);
@@ -501,7 +517,7 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
         auto* r = new Result{ct.gen, JobKind::Navigate};
         if (!d->error) {
             const double t = NowMs();
-            r->order = SortOrder(*d, col, asc);
+            r->order = SortOrder(*d, col, asc, prefs);
             r->sortMs = NowMs() - t;
         }
         r->data = std::move(d);
@@ -515,16 +531,23 @@ void ApplyOrder(std::vector<uint32_t> order, double ms) {
     g_view.order = std::move(order);
     g_view.sortMs = ms;
     RebuildRowOf();
+    ListView_SetItemCountEx(g_list, RowCount(), LVSICF_NOSCROLL);  // change si des éléments sont masqués / affichés
     ApplySelection(sel, focus, true);
     InvalidateRect(g_list, nullptr, FALSE);
     ShowSummary();
 }
 
+void SortView();
+
 void Resort(int col) {
     if (col == g_sortCol) g_sortAsc = !g_sortAsc;
     else { g_sortCol = col; g_sortAsc = (col == COL_NAME || col == COL_TYPE); }
     UpdateSortArrow();
+    SortView();
+}
 
+// Retrie (et refiltre) la vue avec le tri et les préférences actuels.
+void SortView() {
     if (g_pending.active) {  // une navigation est en vol : on la relance avec le nouveau tri
         Pending p = g_pending;
         Navigate(p.path, p.nav, p.focus, p.selected, p.fallbackOpen, p.fallbackAnyError);
@@ -534,7 +557,7 @@ void Resort(int col) {
     auto data = g_view.data;
     if (data->entries.size() <= kSyncSortMax) {
         const double t = NowMs();
-        auto order = SortOrder(*data, g_sortCol, g_sortAsc);
+        auto order = SortOrder(*data, g_sortCol, g_sortAsc, g_prefs);
         ApplyOrder(std::move(order), NowMs() - t);
         return;
     }
@@ -542,13 +565,39 @@ void Resort(int col) {
     const int c = g_sortCol;
     const bool asc = g_sortAsc;
     SetStatus(L"Tri…");
-    Jobs_Spawn([ct, data, c, asc] {
+    Jobs_Spawn([ct, data, c, asc, prefs = g_prefs] {
         const double t = NowMs();
-        auto order = SortOrder(*data, c, asc);
+        auto order = SortOrder(*data, c, asc, prefs);
         if (ct.cancelled()) return;
         auto* r = new Result{ct.gen, JobKind::Sort, data, std::move(order), NowMs() - t};
         Post(r);
     });
+}
+
+// Préférences d'affichage changées (ici, dans l'Explorateur ou les options des dossiers).
+void ApplyViewPrefs(const ViewPrefs& p) {
+    if (p == g_prefs) return;
+    const bool refilter = p.showHidden != g_prefs.showHidden || p.showSuperHidden != g_prefs.showSuperHidden;
+    g_prefs = p;
+    NavPane_SetViewPrefs(p);
+    if (!HasView()) return;
+    if (refilter) SortView();
+    else InvalidateRect(g_list, nullptr, FALSE);  // extensions : seul l'affichage des noms change
+}
+
+// Comme Afficher ▸ Afficher de l'Explorateur : le réglage de Windows change aussi.
+void ToggleHidden() {
+    ViewPrefs p = g_prefs;
+    p.showHidden = !p.showHidden;
+    WriteViewPrefs(p);
+    ApplyViewPrefs(p);
+}
+
+void ToggleExtensions() {
+    ViewPrefs p = g_prefs;
+    p.showExtensions = !p.showExtensions;
+    WriteViewPrefs(p);
+    ApplyViewPrefs(p);
 }
 
 // Premier vrai dossier affiché : préchauffe les menus contextuels (une fois)
@@ -672,7 +721,7 @@ void OnResult(Result* raw) {
     SetWindowTextW(g_addr, g_path.c_str());
     Crumbs_SetPath(g_path);
     SetWindowTextW(g_hwnd, (L"FastExplorer — " + (g_path.empty() ? std::wstring(L"Ce PC") : g_path)).c_str());
-    ListView_SetItemCountEx(g_list, (int)d.entries.size(), refresh ? LVSICF_NOSCROLL : 0);
+    ListView_SetItemCountEx(g_list, (int)g_view.order.size(), refresh ? LVSICF_NOSCROLL : 0);
     if (refresh) {
         ApplySelection(FindEntriesByNames(p.selected), FindEntryByName(p.focus), false);
     } else {
@@ -717,7 +766,7 @@ void OnResult(Result* raw) {
     if (!g_editAfter.empty()) {
         const int e = refresh ? FindEntryByName(g_editAfter) : -1;
         g_editAfter.clear();
-        if (e >= 0) {
+        if (e >= 0 && g_view.rowOf[e] >= 0) {
             const int row = g_view.rowOf[e];
             ApplySelection({e}, e, true);
             SetFocus(g_list);
@@ -946,7 +995,8 @@ void Paste(const std::wstring& dest) {
 void DeleteNames(const std::vector<std::wstring>& names, bool permanent) {
     if (!CanModify() || names.empty() || !ConfirmDelete(g_hwnd, names, permanent)) return;
     std::vector<int> rows;
-    for (int e : FindEntriesByNames(names)) rows.push_back(g_view.rowOf[e]);
+    for (int e : FindEntriesByNames(names))
+        if (g_view.rowOf[e] >= 0) rows.push_back(g_view.rowOf[e]);
     std::sort(rows.begin(), rows.end());
     std::wstring next;
     if (!rows.empty()) {
@@ -990,6 +1040,9 @@ BOOL OnBeginLabelEdit(const NMLVDISPINFOW* di) {
     if (!CanModify() || idx < 0 || g_pending.active) return TRUE;  // refusé
     g_editing = true;
     g_editName = NameOf(idx);
+    const Entry& e = E(idx);
+    const uint32_t hide = e.isDir() ? 0 : HiddenExtLen(NameOf(idx), e.nameLen, e.extOff, g_prefs.showExtensions);
+    g_editExt.assign(NameOf(idx) + e.nameLen - hide, hide);  // la saisie montre le nom affiché, sans elle
     PostMessageW(g_hwnd, WM_APP_EDITSEL, 0, 0);
     return FALSE;
 }
@@ -1008,7 +1061,7 @@ void OnEditSel() {
         return;
     }
     const int idx = FindEntryByName(g_editName);
-    if (idx < 0 || E(idx).isDir()) return;
+    if (idx < 0 || E(idx).isDir() || !g_editExt.empty()) return;  // extension masquée : tout est sélectionné
     const wchar_t* name = NameOf(idx);
     const int dot = (int)(PathFindExtensionW(name) - name);
     if (dot > 0 && name[dot]) Edit_SetSel(ed, 0, dot);
@@ -1016,7 +1069,7 @@ void OnEditSel() {
 
 void OnReedit() {
     const int idx = FindEntryByName(g_reedit.name);
-    if (idx < 0 || !HasView()) { g_reedit = Reedit{}; return; }
+    if (idx < 0 || !HasView() || g_view.rowOf[idx] < 0) { g_reedit = Reedit{}; return; }
     SetFocus(g_list);
     ListView_EditLabel(g_list, g_view.rowOf[idx]);
 }
@@ -1027,7 +1080,8 @@ void OnEndLabelEdit(const NMLVDISPINFOW* di) {
     g_editName.clear();
     if (!di->item.pszText || old.empty()) return;  // Échap
     const std::wstring typed = di->item.pszText;
-    const std::wstring name = CleanFileName(typed);
+    std::wstring name = CleanFileName(typed);
+    if (!name.empty() && !g_editExt.empty()) name += g_editExt;  // extension masquée : conservée
     if (name.empty() || name == old) return;
     if (const wchar_t* err = FileNameError(name)) {
         g_reedit = Reedit{old, typed, err};
@@ -1155,6 +1209,9 @@ void ShowContextMenu(LPARAM lp) {
     if (sel.size() == 1 && E(sel[0]).isDir()) {
         const std::wstring dir = g_path.empty() ? names[0] : Join(g_path, names[0].c_str());  // Ce PC : un lecteur
         extras = PinExtras(dir, true);
+    } else if (sel.empty() && !g_path.empty()) {  // fond du dossier : options d'affichage
+        extras.push_back({L"Afficher les éléments masqués", ToggleHidden, false, g_prefs.showHidden});
+        extras.push_back({L"Afficher les extensions de noms de fichiers", ToggleExtensions, false, g_prefs.showExtensions});
     }
     const bool ok = ShellMenu_Show(g_hwnd, g_path, names, pt, GetKeyState(VK_SHIFT) < 0, [names](const std::wstring& verb) {
         auto is = [&](const wchar_t* v) { return _wcsicmp(verb.c_str(), v) == 0; };
@@ -1169,7 +1226,10 @@ void ShowContextMenu(LPARAM lp) {
             return true;
         }
         if (!background && is(L"delete")) { DeleteNames(names, GetKeyState(VK_SHIFT) < 0); return true; }
-        if (single >= 0 && is(L"rename")) { ListView_EditLabel(g_list, g_view.rowOf[single]); return true; }
+        if (single >= 0 && is(L"rename") && g_view.rowOf[single] >= 0) {
+            ListView_EditLabel(g_list, g_view.rowOf[single]);
+            return true;
+        }
         if (is(L"NewFolder")) { NewFolder(); return true; }
         if (background) g_expectNew = {g_view.data, GetTickCount64() + 10000};
         return false;
@@ -1503,7 +1563,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CREATE:
             g_hwnd = hwnd;
             g_dpi = GetDpiForWindow(hwnd);
+            g_prefs = ReadViewPrefs();
             CreateChildren(hwnd);
+            NavPane_SetViewPrefs(g_prefs);
             Icons_Start(hwnd, WM_APP_ICON);
             AddClipboardFormatListener(hwnd);
             RegisterDrop();
@@ -1555,7 +1617,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ACTIVATE:
             // (y compris juste après la fin d'une opération : la fenêtre du moteur peut encore s'activer)
             if (LOWORD(wp) == WA_INACTIVE) PostMessageW(hwnd, WM_APP_RECLAIM, 0, 0);
-            else NavPane_RefreshPinned();  // épinglé depuis l'Explorateur entre-temps ?
+            else {
+                NavPane_RefreshPinned();             // épinglé depuis l'Explorateur entre-temps ?
+                ApplyViewPrefs(ReadViewPrefs());  // options des dossiers changées entre-temps ?
+            }
+            break;
+        case WM_SETTINGCHANGE:
+            if (lp && wcscmp((const wchar_t*)lp, L"ShellState") == 0) ApplyViewPrefs(ReadViewPrefs());
             break;
         case WM_CLIPBOARDUPDATE: OnClipboardUpdate(); return 0;
         case WM_CLOSE:
@@ -1725,6 +1793,7 @@ bool HandleGlobalKeys(const MSG& m) {
         case 'X': if (!ctrl) return false; CopyNames(NamesOf(SelectedEntries()), true); return true;
         case 'V': if (!ctrl) return false; Paste(g_path); return true;
         case 'A': if (!ctrl) return false; ListView_SetItemState(g_list, -1, LVIS_SELECTED, LVIS_SELECTED); return true;
+        case 'H': if (!ctrl) return false; ToggleHidden(); return true;
         case 'N': if (!ctrl || !shift) return false; NewFolder(); return true;
         case 'D': if (!ctrl) return false; DeleteNames(NamesOf(SelectedEntries()), false); return true;
     }
@@ -1735,6 +1804,7 @@ bool HandleGlobalKeys(const MSG& m) {
 
 bool Ui_Create(HINSTANCE inst, int show, const std::wstring& start) {
     g_inst = inst;
+    g_prefs = ReadViewPrefs();  // avant la première lecture : elle filtre déjà les éléments cachés
     Navigate(start, Nav::Normal);  // la lecture démarre pendant qu'on construit la fenêtre
     WarmUpShell();
     INITCOMMONCONTROLSEX icc{sizeof icc, ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};

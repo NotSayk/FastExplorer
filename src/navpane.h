@@ -8,6 +8,7 @@
 #include <vector>
 
 struct DirData;
+struct ViewPrefs;
 
 // Volet de navigation (arborescence à gauche) :
 //   ★ Accès rapide : les dossiers épinglés de l'Explorateur, lus dans son propre
@@ -39,6 +40,8 @@ void NavPane_ShowPath(const std::wstring& path);
 // volet sont mis à jour sans nouvelle lecture du disque.
 void NavPane_FolderListed(const DirData& d);
 void NavPane_RefreshDrives();
+// Éléments cachés affichés ou non (comme la liste) ; relit les dossiers ouverts.
+void NavPane_SetViewPrefs(const ViewPrefs& p);
 // Nom affiché d'un lecteur de Ce PC (« Disque local (C:) ») s'il est déjà lu, sinon "".
 std::wstring NavPane_DriveText(const std::wstring& root);
 // Relit l'Accès rapide (au plus une fois toutes les 2 s, sauf `force`).
