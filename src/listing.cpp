@@ -529,16 +529,22 @@ uint32_t HiddenExtLen(const wchar_t* name, uint32_t nameLen, uint32_t extOff, bo
     return hide ? nameLen - extOff : 0;
 }
 
-std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs) {
+std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs, const std::wstring& nameFilter) {
     const uint32_t n = (uint32_t)d.entries.size();
     std::vector<uint32_t> order;
     order.reserve(n);
     const bool filter = !d.isRoot();
+    const Matcher match(nameFilter);
+    const bool byName = !match.terms.empty();
+    auto keep = [&](uint32_t i) {
+        const Entry& e = d.entries[i];
+        return (!filter || IsShown(e.attr, prefs)) && (!byName || match(d.name(e), e.nameLen));
+    };
     for (uint32_t i = 0; i < n; ++i)
-        if (d.entries[i].isDir() && (!filter || IsShown(d.entries[i].attr, prefs))) order.push_back(i);
+        if (d.entries[i].isDir() && keep(i)) order.push_back(i);
     const size_t nDirs = order.size();
     for (uint32_t i = 0; i < n; ++i)
-        if (!d.entries[i].isDir() && (!filter || IsShown(d.entries[i].attr, prefs))) order.push_back(i);
+        if (!d.entries[i].isDir() && keep(i)) order.push_back(i);
 
     const Entry* E = d.entries.data();
     const BYTE* K = d.keys.data();

@@ -196,6 +196,19 @@ void TestSortName() {
     CHECK_STR(r[0], L"zdir");  // décroissant : dossiers toujours en premier
     CHECK_STR(r[1], L"Adir");
     CHECK(IndexOf(r, L"noext") < IndexOf(r, L"a2.txt"));
+
+    // Filtre instantané : sans casse ni accents, motifs, plusieurs mots, ordre gardé.
+    auto f = Names(d, SortOrder(d, COL_NAME, true, {}, L"A1"));
+    CHECK(f.size() == 1 && f[0] == L"a10.txt");
+    f = Names(d, SortOrder(d, COL_NAME, true, {}, L"ETE"));
+    CHECK(f.size() == 1 && f[0] == L"été.md");
+    f = Names(d, SortOrder(d, COL_NAME, true, {}, L"*.txt"));
+    CHECK(f.size() == 3 && f[0] == L"a2.txt" && f[2] == L"B.txt");
+    f = Names(d, SortOrder(d, COL_NAME, true, {}, L"dir"));
+    CHECK(f.size() == 2 && f[0] == L"Adir");
+    CHECK(Names(d, SortOrder(d, COL_NAME, true, {}, L"a txt")).size() == 2);
+    CHECK(SortOrder(d, COL_NAME, true, {}, L"   ").size() == 8);  // espaces seuls : aucun filtre
+    CHECK(SortOrder(d, COL_NAME, true, {}, L"introuvable").empty());
 }
 
 void TestSortOther() {

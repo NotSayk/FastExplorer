@@ -50,6 +50,7 @@ constexpr UINT WM_APP_SHELLNOTIFY = WM_APP + 8; // lecteur ou média ajouté / r
 constexpr UINT WM_APP_NAV = WM_APP + 9;         // résultat d'une lecture du volet de navigation
 constexpr UINT WM_APP_SELSUM = WM_APP + 10;     // sélection changée : résumé dans la barre d'état (une fois par rafale)
 constexpr UINT WM_APP_TABEDIT = WM_APP + 11;    // Tab pendant un renommage : renommer l'élément suivant
+constexpr UINT WM_APP_CMDFAIL = WM_APP + 12;    // commande tapée dans la barre d'adresse impossible (lParam = std::wstring*)
 constexpr UINT_PTR TIMER_LOADING = 1;
 constexpr UINT_PTR TIMER_WATCH = 2;
 constexpr UINT_PTR TIMER_AFTEROP = 3;
@@ -57,7 +58,6 @@ constexpr UINT_PTR TIMER_HOVER = 6;   // souris immobile sur la liste : prépare
 constexpr UINT kMenuHoverMs = 100;
 constexpr UINT_PTR TIMER_PROGRESS = 7;  // progression des copies de notre moteur
 constexpr UINT_PTR TIMER_PINNED = 8;    // après un menu contextuel : relire l'Accès rapide (épinglage)
-constexpr UINT_PTR TIMER_SEARCH = 9;    // frappe dans la zone de recherche : lancer la recherche après une pause
 constexpr UINT_PTR TIMER_DRIVES = 4;  // Ce PC : regroupe les annonces d'arrivée / retrait de lecteurs
 constexpr UINT_PTR TIMER_EJECT = 5;   // éjection demandée : si elle échoue, on reprend la surveillance  // resélection après une opération, différée pendant un renommage
 constexpr UINT kLoadingDelayMs = 150;   // en dessous, aucun « Chargement… » (évite le clignotement)
@@ -91,6 +91,7 @@ struct Pending {
     bool fallbackAnyError = false;  // raccourci : aussi si la cible a disparu (le Shell s'en occupe)
     std::wstring query;             // recherche dans `path` ("" : simple lecture)
     size_t steps = 1;               // Précédent / Suivant : pas d'historique franchis (liste déroulante)
+    std::wstring command;           // barre d'adresse : si ce n'est pas un dossier, lancer ceci (« cmd », « wt »…)
 };
 
 enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
@@ -116,6 +117,7 @@ std::wstring g_tabTyped;        // touches tapées avant que cette saisie ne s'o
 ULONGLONG g_tabSince = 0;       // ≠ 0 : saisie suivante attendue depuis ce moment
 std::wstring g_query;           // recherche affichée ("" : contenu ordinaire du dossier)
 bool g_searchSync = false;      // texte de la zone de recherche changé par le programme
+std::wstring g_filter;          // filtre instantané sur les noms affichés ("" : aucun)
 int g_navW96 = 240;            // largeur du volet de navigation (à 96 ppp)
 bool g_splitDrag = false;      // séparateur volet / liste en cours de déplacement
 RECT g_split{};                // zone du séparateur (coordonnées client)
@@ -211,11 +213,21 @@ void ShowSummary() {
     wchar_t s[512];
     size_t dirs = 0;
     for (uint32_t e : g_view.order) dirs += d.entries[e].isDir();
-    const size_t shown = g_view.order.size(), hidden = d.entries.size() - shown;
+    const size_t shown = g_view.order.size();
+    size_t visible = d.entries.size();  // sans le filtre instantané (éléments cachés exclus)
+    if (!g_filter.empty() && !d.isRoot()) {
+        visible = 0;
+        for (const Entry& e : d.entries) visible += IsShown(e.attr, g_prefs);
+    }
+    const size_t hidden = g_filter.empty() ? d.entries.size() - shown : 0;
     wchar_t masked[64] = L"";
     if (hidden) swprintf_s(masked, L", %zu masqué%s", hidden, hidden > 1 ? L"s" : L"");
-    if (!d.query.empty()) {
-        swprintf_s(s, L"%zu résultat%s pour « %s »%s", shown, shown > 1 ? L"s" : L"", d.query.c_str(),
+    if (!g_filter.empty()) {
+        swprintf_s(s, L"%zu %s sur %zu  (filtre « %.100s »)%s", shown, d.query.empty() ? L"élément(s)" : L"résultat(s)",
+                   visible, g_filter.c_str(),
+                   d.query.empty() ? L"   •   Entrée : chercher aussi dans les sous-dossiers" : L"");
+    } else if (!d.query.empty()) {
+        swprintf_s(s, L"%zu résultat%s pour « %.100s »%s", shown, shown > 1 ? L"s" : L"", d.query.c_str(),
                    d.searchDone ? (d.truncated ? L"   •   arrêtée : trop de résultats" : L"")
                                 : L"   •   recherche en cours…");
         if (!d.searchDone) {
@@ -539,20 +551,21 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
               std::wstring fallbackOpen = {}, bool fallbackAnyError = false, const std::wstring* query = nullptr) {
     const CancelToken ct = Jobs_NewGeneration();
     const std::wstring q = query ? *query : (nav == Nav::Refresh ? g_query : std::wstring());
+    if (nav != Nav::Refresh && _wcsicmp(path.c_str(), g_path.c_str()) != 0) g_filter.clear();  // autre dossier
     g_pending = Pending{true,           path, nav, std::move(focus), std::move(selected), std::move(fallbackOpen),
                         fallbackAnyError, q};
     if (g_hwnd) SetTimer(g_hwnd, TIMER_LOADING, kLoadingDelayMs, nullptr);
     const int col = g_sortCol;
     const bool asc = g_sortAsc;
     const bool climb = nav == Nav::Refresh && q.empty();  // dossier affiché disparu : on remonte, comme l'Explorateur
-    Jobs_Spawn([ct, path, col, asc, climb, q, prefs = g_prefs] {
+    Jobs_Spawn([ct, path, col, asc, climb, q, prefs = g_prefs, filter = g_filter] {
         auto d = std::make_shared<DirData>();
         d->path = path;
         if (!q.empty()) {
             // Résultats au fil de l'eau : chaque copie partielle s'affiche comme un rafraîchissement.
             SearchTree(*d, q, prefs, ct, [&](std::shared_ptr<DirData> s) {
                 auto* r = new Result{ct.gen, JobKind::Navigate};
-                r->order = SortOrder(*s, col, asc, prefs);
+                r->order = SortOrder(*s, col, asc, prefs, filter);
                 r->data = std::move(s);
                 Post(r);
             });
@@ -562,7 +575,7 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
         auto* r = new Result{ct.gen, JobKind::Navigate};
         if (!d->error) {
             const double t = NowMs();
-            r->order = SortOrder(*d, col, asc, prefs);
+            r->order = SortOrder(*d, col, asc, prefs, filter);
             r->sortMs = NowMs() - t;
         }
         r->data = std::move(d);
@@ -602,7 +615,7 @@ void SortView() {
     auto data = g_view.data;
     if (data->entries.size() <= kSyncSortMax) {
         const double t = NowMs();
-        auto order = SortOrder(*data, g_sortCol, g_sortAsc, g_prefs);
+        auto order = SortOrder(*data, g_sortCol, g_sortAsc, g_prefs, g_filter);
         ApplyOrder(std::move(order), NowMs() - t);
         return;
     }
@@ -610,9 +623,9 @@ void SortView() {
     const int c = g_sortCol;
     const bool asc = g_sortAsc;
     SetStatus(L"Tri…");
-    Jobs_Spawn([ct, data, c, asc, prefs = g_prefs] {
+    Jobs_Spawn([ct, data, c, asc, prefs = g_prefs, filter = g_filter] {
         const double t = NowMs();
-        auto order = SortOrder(*data, c, asc, prefs);
+        auto order = SortOrder(*data, c, asc, prefs, filter);
         if (ct.cancelled()) return;
         auto* r = new Result{ct.gen, JobKind::Sort, data, std::move(order), NowMs() - t};
         Post(r);
@@ -638,19 +651,36 @@ void ShowSelectionSummary() {
 }
 
 void Refresh();
+void RunCommand(const std::wstring& cmd, const std::wstring& dir);
 
-// Lance (ou quitte) la recherche tapée dans la zone de recherche.
-void RunSearch() {
-    KillTimer(g_hwnd, TIMER_SEARCH);
-    if (!HasView()) return;
+std::wstring SearchText() {
     const int n = GetWindowTextLengthW(g_searchBox);
     std::wstring q(n + 1, L'\0');
     GetWindowTextW(g_searchBox, q.data(), n + 1);
     q.resize(n);
     while (!q.empty() && iswspace(q.back())) q.pop_back();
     while (!q.empty() && iswspace(q.front())) q.erase(0, 1);
+    return q;
+}
+
+// Filtre instantané : à chaque frappe, la liste ne garde que les noms qui
+// correspondent (dossier affiché, ou résultats d'une recherche), sans lire le disque.
+void ApplyFilter() {
+    if (!HasView()) return;
+    std::wstring f = SearchText();
+    if (f == (g_pending.active ? g_pending.query : g_query)) f.clear();  // texte de la recherche affichée
+    if (f == g_filter) return;
+    g_filter = std::move(f);
+    SortView();
+}
+
+// Entrée dans la zone : recherche dans les sous-dossiers (texte vide : on en sort).
+void RunSearch() {
+    if (!HasView()) return;
+    const std::wstring q = SearchText();
     const std::wstring current = g_pending.active ? g_pending.query : g_query;
     if (q == current) return;
+    g_filter.clear();  // les résultats correspondent déjà au texte
     if (!q.empty() && g_path.empty()) {
         SetStatus(L"Ouvrez un dossier ou un lecteur pour y rechercher.");
         return;
@@ -727,8 +757,9 @@ void OnResult(Result* raw) {
         for (int e : SelectedEntries()) p.selected.emplace_back(NameOf(e));
         if (const int f = FocusedEntry(); f >= 0) p.focus = NameOf(f);
     }
-    if (!d.query.empty() && !d.error && d.entries.size() <= kSyncSortMax)  // tri changé pendant la recherche
-        r->order = SortOrder(d, g_sortCol, g_sortAsc, g_prefs);
+    // Tri ou filtre changé pendant la recherche (filtre : toujours, il réduit le travail).
+    if (!d.query.empty() && !d.error && (d.entries.size() <= kSyncSortMax || !g_filter.empty()))
+        r->order = SortOrder(d, g_sortCol, g_sortAsc, g_prefs, g_filter);
 
     if (d.error) {
         SetWindowTextW(g_addr, g_path.c_str());
@@ -736,6 +767,11 @@ void OnResult(Result* raw) {
         if (!p.fallbackOpen.empty() && (p.fallbackAnyError || d.error == ERROR_DIRECTORY)) {
             ShowSummary();  // ce n'était pas un dossier : on l'ouvre, sans message d'erreur
             OpenWithShell(p.fallbackOpen);
+            return;
+        }
+        if (!p.command.empty() && d.error != ERROR_ACCESS_DENIED) {  // pas un dossier : une commande
+            ShowSummary();
+            RunCommand(p.command, g_path);
             return;
         }
         SetStatus(L"Impossible d'ouvrir « " + (d.path.empty() ? std::wstring(L"Ce PC") : d.path) + L" » : " +
@@ -809,7 +845,8 @@ void OnResult(Result* raw) {
     RebuildRowOf();
     g_path = d.path;
     g_query = d.query;
-    if (g_query.empty() && GetWindowTextLengthW(g_searchBox) && GetFocus() != g_searchBox) {
+    if (g_query.empty() && g_filter.empty() && GetWindowTextLengthW(g_searchBox) &&
+        (GetFocus() != g_searchBox || p.nav != Nav::Refresh)) {
         g_searchSync = true;  // sorti de la recherche (autre dossier) : zone vidée
         SetWindowTextW(g_searchBox, L"");
         g_searchSync = false;
@@ -935,6 +972,42 @@ void Refresh() {
     Navigate(g_path, Nav::Refresh, f >= 0 ? NameOf(f) : L"", std::move(names));
 }
 
+// Lance une commande tapée dans la barre d'adresse, sur un thread (la
+// recherche du programme dans le PATH et les App Paths touche le disque).
+void RunCommand(const std::wstring& cmd, const std::wstring& dir) {
+    std::wstring file, params;
+    if (cmd[0] == L'"') {
+        const size_t q = cmd.find(L'"', 1);
+        file = cmd.substr(1, q == std::wstring::npos ? std::wstring::npos : q - 1);
+        if (q != std::wstring::npos && q + 1 < cmd.size()) params = cmd.substr(q + 1);
+    } else {
+        const size_t sp = cmd.find(L' ');
+        file = cmd.substr(0, sp);
+        if (sp != std::wstring::npos) params = cmd.substr(sp + 1);
+    }
+    while (!params.empty() && iswspace(params.front())) params.erase(0, 1);
+    SetStatus(L"Lancement de « " + cmd + L" »…");
+    std::thread([hwnd = g_hwnd, cmd, file, params, dir] {
+        const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        SHELLEXECUTEINFOW sei{sizeof sei};
+        sei.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+        sei.lpFile = file.c_str();
+        sei.lpParameters = params.empty() ? nullptr : params.c_str();
+        sei.lpDirectory = dir.empty() ? nullptr : dir.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+        if (!ShellExecuteExW(&sei)) {
+            const DWORD err = GetLastError();
+            auto* msg = new std::wstring(L"Impossible de trouver « " + cmd + L" » : ce n'est ni un dossier ni une commande (" +
+                                         ErrorText(err) + L")");
+            if (!PostMessageW(hwnd, WM_APP_CMDFAIL, 0, (LPARAM)msg)) delete msg;
+        } else {
+            auto* msg = new std::wstring();  // réussi : on rétablit le résumé
+            if (!PostMessageW(hwnd, WM_APP_CMDFAIL, 0, (LPARAM)msg)) delete msg;
+        }
+        if (SUCCEEDED(hr)) CoUninitialize();
+    }).detach();
+}
+
 // Barre d'adresse : fil d'Ariane, ou zone de saisie le temps de taper un chemin.
 void BeginAddressEdit() {
     if (!IsWindowVisible(g_addr)) {
@@ -960,6 +1033,13 @@ void NavigateAddress() {
     t.resize(n);
     const std::wstring path = NormalizePath(t, g_path);
     Navigate(path, Nav::Normal, {}, {}, path);  // un fichier tapé dans la barre s'ouvre
+    // « cmd », « wt », « notepad x.txt », « code . » : lancés dans le dossier
+    // affiché si ce n'est pas un dossier, comme dans l'Explorateur.
+    std::wstring cmd = t;
+    while (!cmd.empty() && iswspace(cmd.back())) cmd.pop_back();
+    while (!cmd.empty() && iswspace(cmd.front())) cmd.erase(0, 1);
+    const std::wstring first = cmd.substr(0, std::min(cmd.find(L' '), cmd.size()));
+    if (!first.empty() && first.find_first_of(L"\\/:") == std::wstring::npos) g_pending.command = cmd;
     SetFocus(g_list);
 }
 
@@ -1760,6 +1840,8 @@ void CreateChildren(HWND hwnd) {
     // Zone de saisie cachée : le fil d'Ariane occupe sa place, sauf pendant la saisie.
     g_addr = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
                              (HMENU)ID_ADDR, g_inst, nullptr);
+    // Suggestions de dossiers pendant la frappe (énumérées par le Shell sur son propre thread).
+    SHAutoComplete(g_addr, SHACF_FILESYS_DIRS | SHACF_AUTOSUGGEST_FORCE_ON | SHACF_AUTOAPPEND_FORCE_OFF);
     CrumbHost crumbs;
     crumbs.navigate = [](const std::wstring& path) {
         Navigate(path, Nav::Normal);
@@ -1770,7 +1852,7 @@ void CreateChildren(HWND hwnd) {
     g_crumbs = Crumbs_Create(hwnd, ID_CRUMBS, std::move(crumbs));
     g_searchBox = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0,
                                   0, 0, hwnd, (HMENU)ID_SEARCH, g_inst, nullptr);
-    Edit_SetCueBannerTextFocused(g_searchBox, L"Rechercher (Ctrl+F)", TRUE);
+    Edit_SetCueBannerTextFocused(g_searchBox, L"Filtrer, Entrée : rechercher (Ctrl+F)", TRUE);
 
     g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_SHAREIMAGELISTS |
@@ -1871,6 +1953,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_EDITSEL: OnEditSel(); return 0;
         case WM_APP_REEDIT: OnReedit(); return 0;
         case WM_APP_TABEDIT: OnTabEdit(); return 0;
+        case WM_APP_CMDFAIL: {
+            std::unique_ptr<std::wstring> text((std::wstring*)lp);
+            if (text->empty()) ShowSummary();
+            else SetStatus(*text);
+            return 0;
+        }
         case WM_APP_RECLAIM: ReclaimForeground(); return 0;
         case WM_ACTIVATE:
             // (y compris juste après la fin d'une opération : la fenêtre du moteur peut encore s'activer)
@@ -1919,7 +2007,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_AFTEROP) { ApplyAfterOp(); return 0; }
             if (wp == TIMER_PROGRESS) { OnProgressTimer(); return 0; }
             if (wp == TIMER_PINNED) { KillTimer(hwnd, wp); NavPane_RefreshPinned(true); return 0; }
-            if (wp == TIMER_SEARCH) { RunSearch(); return 0; }
             if (wp == TIMER_HOVER) {
                 KillTimer(hwnd, wp);
                 POINT c;
@@ -1944,7 +2031,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (HIWORD(wp) == EN_KILLFOCUS) EndAddressEdit();
                     return 0;
                 case ID_SEARCH:  // recherche lancée après une courte pause dans la frappe
-                    if (HIWORD(wp) == EN_CHANGE && !g_searchSync) SetTimer(hwnd, TIMER_SEARCH, 300, nullptr);
+                    if (HIWORD(wp) == EN_CHANGE && !g_searchSync) ApplyFilter();
                     return 0;
             }
             break;

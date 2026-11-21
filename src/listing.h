@@ -119,5 +119,8 @@ uint32_t HiddenExtLen(const wchar_t* name, uint32_t nameLen, uint32_t extOff, bo
 // Permutation d'affichage : dossiers d'abord, puis la colonne demandée,
 // puis le nom (ordre naturel et linguistique de l'Explorateur). Ordre total
 // et déterministe : les égalités sont départagées par l'index.
-// Les éléments que `prefs` masque n'y figurent pas (lecteurs de Ce PC : jamais).
-std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs = {});
+// Les éléments que `prefs` masque n'y figurent pas (lecteurs de Ce PC : jamais),
+// ni ceux dont le nom ne correspond pas à `nameFilter` (filtre instantané,
+// mêmes règles que NameMatches ; vide : aucun filtre).
+std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs = {},
+                                const std::wstring& nameFilter = {});

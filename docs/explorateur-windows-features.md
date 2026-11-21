@@ -61,9 +61,9 @@ De haut en bas :
 | Chevron le plus à gauche | Liste des emplacements racines (Bureau, Ce PC, Réseau…) | P2 |
 | Clic dans le vide de la barre | Bascule en mode texte, chemin complet sélectionné | ✅ (mode texte seul pour l'instant) |
 | Saisie de chemin | Chemin absolu, relatif, `..`, `%VARIABLES%`, UNC `\\serveur\partage` | ✅ |
-| **Autocomplétion** | Suggestions de sous-dossiers et fichiers pendant la frappe, Tab pour compléter | P1 |
+| **Autocomplétion** | Suggestions de sous-dossiers et fichiers pendant la frappe, Tab pour compléter | ✅🟡 P1 (bloc 11 : dossiers, `SHAutoComplete` sur son propre thread ; chemins absolus) |
 | Liste déroulante d'historique | F4 ou flèche de droite : chemins tapés récemment | P2 |
-| Lancer une commande | Taper `cmd`, `powershell`, `wt`, `notepad`… dans la barre : ouvre le programme **dans le dossier courant** | P1 |
+| Lancer une commande | Taper `cmd`, `powershell`, `wt`, `notepad`… dans la barre : ouvre le programme **dans le dossier courant** | ✅ (bloc 11 : si ce n'est pas un dossier ; arguments acceptés, ex. `code .` ; lancé sur un thread) |
 | URL | `https://…` ouvre le navigateur, `ftp://` ouvre l'accès FTP en lecture | P3 |
 | Commandes `shell:` | `shell:startup`, `shell:sendto`, `shell:downloads`, `shell:appsfolder`, `shell:recyclebinfolder`, `shell:common startup`… (~120 noms) | P2 ⚙️ Known Folders + `SHParseDisplayName` |
 | CLSID | `::{20D04FE0-3AEA-1069-A2D8-08002B30309D}` (Ce PC), etc. | P3 |
@@ -290,7 +290,7 @@ comme arrière-plan, Pivoter (images), Monter (ISO/VHD), Graver…
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Barre de recherche | Ctrl+E, Ctrl+F, F3 ; cherche dans le dossier courant et ses sous-dossiers | ✅ **P0** (sans index : parcours parallèle, résultats au fil de l'eau ; mots sans casse ni accents, motifs * ?, dossiers cachés selon le réglage, jonctions non suivies ; « Ouvrir l'emplacement du fichier » ; Échap pour sortir. C:\Windows entier : ~3 s) |
+| Barre de recherche | Ctrl+E, Ctrl+F, F3 ; cherche dans le dossier courant et ses sous-dossiers | ✅ **P0** (sans index : parcours parallèle, résultats au fil de l'eau ; mots sans casse ni accents, motifs * ?, dossiers cachés selon le réglage, jonctions non suivies ; « Ouvrir l'emplacement du fichier » ; Échap pour sortir. C:\Windows entier : ~3 s). Depuis le bloc 11 : la frappe filtre aussitôt, **Entrée** lance la recherche dans les sous-dossiers |
 | Résultats en direct | Au fil de la frappe, nom et contenu des fichiers indexés | ✅🟡 P1 (noms au fil de l'eau ; contenu : avec l'index) |
 | Index Windows Search | Rapide dans les emplacements indexés, lent (parcours disque) ailleurs ; options *Ne pas utiliser l'index*, *Inclure les fichiers système*, *Fichiers compressés*, *Correspondances partielles* | P2 ⚙️ requêtes OLE DB / `ISearchQueryHelper` sur `SystemIndex` |
 | **Syntaxe AQS** | `nom:`, `ext:.pdf`, `type:image`, `kind:music`, `taille:>100Mo`, `size:gigantic`, `date:aujourd'hui`, `datemodified:01/01/2026..31/01/2026`, `auteur:`, opérateurs `AND`, `OR`, `NOT`, `-`, guillemets, joker `*` | P2 |
@@ -553,7 +553,7 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | **Double panneau** (à la Total Commander) | Deux listes côte à côte, F5/F6 copier/déplacer vers l'autre panneau | P1 ⭐ |
 | **File d'attente de copies** | Copies mises en file (pas en parallèle sur le même disque), pause/reprise, reprise après erreur, vérification | P1 ⭐ |
 | **Renommage par lot avancé** | Motifs, expressions régulières, compteur, casse, aperçu avant/après | P2 ⭐ |
-| **Filtre instantané** du dossier courant | Taper pour filtrer la liste (sans lancer de recherche) | P1 ⭐ |
+| **Filtre instantané** du dossier courant | Taper pour filtrer la liste (sans lancer de recherche) | ✅ ⭐ (bloc 11 : zone de recherche, à chaque frappe, sans lire le disque ; filtre aussi des résultats de recherche ; mêmes règles que la recherche) |
 | **Raccourcis personnalisables** | Table de raccourcis éditable | P2 ⭐ |
 | **Palette de commandes** | Ctrl+Maj+P : toutes les actions accessibles au clavier | P2 ⭐ |
 | **Terminal intégré** | Volet terminal qui suit le dossier courant | P2 ⭐ |
@@ -618,7 +618,7 @@ dossiers avant l'index…) :
     pour renommer, Tab / Maj+Tab pendant le renommage, historique déroulant de Précédent / Suivant, bouton
     Actualiser, mise en évidence des nouveaux éléments, pavé numérique dans le volet, affichage des
     raccourcis `.url`, liens symboliques et jonctions.
-11. **Filtre instantané** ⭐ du dossier courant (taper pour filtrer, sans lancer de recherche) et
+11. ✅ **Filtre instantané** ⭐ du dossier courant (taper pour filtrer, sans lancer de recherche) et
     **autocomplétion** de la barre d'adresse (+ lancer une commande, ex. `cmd`, `wt`).
 12. **Annuler / Rétablir** (Ctrl+Z / Ctrl+Y) et **opérations robustes** : fichier en cours d'utilisation
     (Restart Manager : quelle application le bloque), droits insuffisants (élévation), espace insuffisant,
