@@ -98,6 +98,28 @@ struct NameMatcher {
     static int AsciiFind(const wchar_t* name, uint32_t n, const std::string& term);
 };
 
+// Filtres d'une recherche, mêlés aux mots du nom (anglais accepté aussi) :
+//   ext:pdf  ext:jpg;png        extension(s)
+//   type:dossier  type:fichier  (folder / file)
+//   taille:>10Mo  taille:<1Go  taille:1Mo..50Mo   (size:, unités o Ko Mo Go To / B KB MB GB TB, base 1024)
+//   date:aujourd'hui  date:hier  date:semaine  date:mois  date:année   (7, 30, 365 derniers jours)
+//   date:>2026-01-01  date:<2026-01-01  date:2026-01-01  date:2026-01-01..2026-03-31   (modifié:, modified:)
+// Un filtre illisible reste un mot du nom (aucun résultat : l'erreur se voit).
+struct SearchSpec {
+    std::wstring names;              // le reste : mots du nom (règles de NameMatches)
+    std::vector<std::wstring> exts;  // en minuscules, sans le point
+    int kind = 0;                    // 0 : tout, 1 : dossiers, 2 : fichiers
+    uint64_t minSize = 0, maxSize = UINT64_MAX;
+    int64_t minTime = INT64_MIN, maxTime = INT64_MAX;  // FILETIME UTC, [min, max)
+    bool sized() const { return minSize || maxSize != UINT64_MAX; }
+    bool dated() const { return minTime != INT64_MIN || maxTime != INT64_MAX; }
+    bool filtered() const { return !exts.empty() || kind || sized() || dated(); }
+    // Filtres seulement (pas les mots du nom). name : nom ou chemin relatif (l'extension est prise sur la fin).
+    bool Accept(const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime) const;
+};
+// now : FILETIME UTC de référence (0 : maintenant).
+SearchSpec ParseSearch(const std::wstring& q, int64_t now = 0);
+
 // Construction de résultats hors Enumerate / SearchTree (index de recherche).
 void DirData_Add(DirData& d, const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime);
 void DirData_BuildKeys(DirData& d);  // à appeler une fois toutes les entrées ajoutées

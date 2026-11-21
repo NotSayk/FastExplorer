@@ -294,7 +294,7 @@ comme arrière-plan, Pivoter (images), Monter (ISO/VHD), Graver…
 | Résultats en direct | Au fil de la frappe, nom et contenu des fichiers indexés | ✅🟡 P1 (noms au fil de l'eau ; contenu : avec l'index) |
 | Index Windows Search | Rapide dans les emplacements indexés, lent (parcours disque) ailleurs ; options *Ne pas utiliser l'index*, *Inclure les fichiers système*, *Fichiers compressés*, *Correspondances partielles* | P2 ⚙️ requêtes OLE DB / `ISearchQueryHelper` sur `SystemIndex` |
 | **Syntaxe AQS** | `nom:`, `ext:.pdf`, `type:image`, `kind:music`, `taille:>100Mo`, `size:gigantic`, `date:aujourd'hui`, `datemodified:01/01/2026..31/01/2026`, `auteur:`, opérateurs `AND`, `OR`, `NOT`, `-`, guillemets, joker `*` | P2 |
-| Filtres du ruban de recherche | Date de modification, Type, Taille, Autres propriétés ; emplacement (dossier courant / tous les sous-dossiers) | P1 |
+| Filtres du ruban de recherche | Date de modification, Type, Taille, Autres propriétés ; emplacement (dossier courant / tous les sous-dossiers) | ✅ P1 (dans la zone de recherche et le filtre instantané : `ext:pdf;docx`, `type:dossier`, `taille:>10Mo` / `1Mo..50Mo`, `date:semaine` / `hier` / `>2026-01-01` / `2026-01-01..2026-03-31` ; noms anglais acceptés) |
 | Recherches récentes | Historique des recherches | P2 |
 | Enregistrer la recherche | Fichier `.search-ms` (dossier virtuel) | P3 |
 | Ouvrir l'emplacement du fichier | Depuis un résultat | ✅ (bloc 9) |
@@ -626,7 +626,7 @@ dossiers avant l'index…) :
 13. ✅ **Onglets et fenêtres** : Ctrl+T / Ctrl+W / Ctrl+Tab, réorganiser, clic milieu sur un dossier,
     Ctrl+N, ouvrir dans un nouvel onglet depuis le volet et le fil d'Ariane.
 14. ✅ **Taille des dossiers** ⭐ : calculée en arrière-plan (colonne Taille), sans ralentir la navigation.
-15. ✅🟡 **Recherche instantanée sur tout le disque** ⭐ (filtres à venir) : index MFT + journal USN (à la *Everything*), puis
+15. ✅ **Recherche instantanée sur tout le disque** ⭐ : index MFT + journal USN (à la *Everything*), puis
     filtres de recherche (date, type, taille).
 16. **Modes d'affichage** : grandes / moyennes icônes, zoom continu (Ctrl+molette), Ctrl+Maj+1…8,
     mode compact, **miniatures** (cache système partagé avec l'Explorateur).

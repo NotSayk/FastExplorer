@@ -280,7 +280,179 @@ bool NameMatcher::operator()(const wchar_t* name, uint32_t n) const {
 
 namespace {
 using Matcher = NameMatcher;
+
+bool PrefixI(const std::wstring& s, const wchar_t* p, std::wstring& rest) {
+    const size_t n = wcslen(p);
+    if (s.size() <= n || _wcsnicmp(s.c_str(), p, n) != 0) return false;
+    rest = s.substr(n);
+    return true;
+}
+
+// « 10Mo », « 1,5 Go », « 300 » (octets) ; base 1024 comme l'Explorateur.
+bool ParseSize(std::wstring s, uint64_t& out) {
+    for (auto& c : s) if (c == L',') c = L'.';
+    wchar_t* end = nullptr;
+    const double v = wcstod(s.c_str(), &end);
+    if (end == s.c_str() || v < 0) return false;
+    std::wstring u = end;
+    for (auto& c : u) c = towlower(c);
+    double mul = 1;
+    if (u.empty() || u == L"o" || u == L"b") mul = 1;
+    else if (u == L"ko" || u == L"kb" || u == L"k") mul = 1024.0;
+    else if (u == L"mo" || u == L"mb" || u == L"m") mul = 1024.0 * 1024;
+    else if (u == L"go" || u == L"gb" || u == L"g") mul = 1024.0 * 1024 * 1024;
+    else if (u == L"to" || u == L"tb" || u == L"t") mul = 1024.0 * 1024 * 1024 * 1024;
+    else return false;
+    out = (uint64_t)(v * mul + 0.5);
+    return true;
+}
+
+int64_t ToFileTime(const SYSTEMTIME& local) {
+    SYSTEMTIME utc;
+    FILETIME ft;
+    if (!TzSpecificLocalTimeToSystemTime(nullptr, &local, &utc) || !SystemTimeToFileTime(&utc, &ft)) return INT64_MIN;
+    return (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+}
+
+constexpr int64_t kDay = 864000000000ll;  // en unités de 100 ns
+
+// Début (minuit local) du jour « AAAA-MM-JJ ».
+bool ParseDay(const std::wstring& s, int64_t& out) {
+    SYSTEMTIME st{};
+    int y = 0, m = 0, d = 0;
+    if (swscanf_s(s.c_str(), L"%d-%d-%d", &y, &m, &d) != 3 || y < 1601 || m < 1 || m > 12 || d < 1 || d > 31) return false;
+    st.wYear = (WORD)y;
+    st.wMonth = (WORD)m;
+    st.wDay = (WORD)d;
+    out = ToFileTime(st);
+    return out != INT64_MIN;
+}
+
+bool ParseDate(const std::wstring& s, int64_t now, SearchSpec& spec) {
+    std::wstring v = s;
+    for (auto& c : v) c = towlower(c);
+    FILETIME fnow{(DWORD)now, (DWORD)((uint64_t)now >> 32)}, lnow;
+    SYSTEMTIME today;
+    FileTimeToLocalFileTime(&fnow, &lnow);
+    FileTimeToSystemTime(&lnow, &today);
+    today.wHour = today.wMinute = today.wSecond = today.wMilliseconds = 0;
+    const int64_t midnight = ToFileTime(today);
+    if (v == L"aujourd'hui" || v == L"aujourdhui" || v == L"today") { spec.minTime = midnight; return true; }
+    if (v == L"hier" || v == L"yesterday") { spec.minTime = midnight - kDay; spec.maxTime = midnight; return true; }
+    if (v == L"semaine" || v == L"week") { spec.minTime = now - 7 * kDay; return true; }
+    if (v == L"mois" || v == L"month") { spec.minTime = now - 30 * kDay; return true; }
+    if (v == L"année" || v == L"annee" || v == L"year") { spec.minTime = now - 365 * kDay; return true; }
+    int64_t a = 0, b = 0;
+    if (const size_t dots = v.find(L".."); dots != std::wstring::npos) {
+        if (!ParseDay(v.substr(0, dots), a) || !ParseDay(v.substr(dots + 2), b)) return false;
+        spec.minTime = a;
+        spec.maxTime = b + kDay;  // jour de fin compris
+        return true;
+    }
+    if (v[0] == L'>' || v[0] == L'<') {
+        const bool after = v[0] == L'>';
+        const size_t skip = v.size() > 1 && v[1] == L'=' ? 2 : 1;
+        if (!ParseDay(v.substr(skip), a)) return false;
+        if (after) spec.minTime = skip == 2 ? a : a + kDay;  // « >1er janvier » : à partir du 2
+        else spec.maxTime = skip == 2 ? a + kDay : a;        // « <1er janvier » : jusqu'au 31 décembre
+        return true;
+    }
+    if (!ParseDay(v, a)) return false;
+    spec.minTime = a;
+    spec.maxTime = a + kDay;
+    return true;
+}
+
+bool ParseSizeFilter(const std::wstring& v, SearchSpec& spec) {
+    uint64_t a = 0, b = 0;
+    if (const size_t dots = v.find(L".."); dots != std::wstring::npos) {
+        if (!ParseSize(v.substr(0, dots), a) || !ParseSize(v.substr(dots + 2), b)) return false;
+        spec.minSize = a;
+        spec.maxSize = b;
+        return true;
+    }
+    if (v.empty()) return false;
+    if (v[0] == L'>' || v[0] == L'<') {
+        const bool orEq = v.size() > 1 && v[1] == L'=';
+        if (!ParseSize(v.substr(orEq ? 2 : 1), a)) return false;
+        if (v[0] == L'>') spec.minSize = orEq ? a : a + 1;
+        else spec.maxSize = orEq ? a : (a ? a - 1 : 0);
+        return true;
+    }
+    if (!ParseSize(v, a)) return false;  // « taille:10Mo » : au moins
+    spec.minSize = a;
+    return true;
+}
 }  // namespace
+
+SearchSpec ParseSearch(const std::wstring& q, int64_t now) {
+    if (!now) {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        now = (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+    }
+    SearchSpec spec;
+    size_t i = 0;
+    while (i < q.size()) {
+        while (i < q.size() && iswspace(q[i])) ++i;
+        size_t j = i;
+        while (j < q.size() && !iswspace(q[j])) ++j;
+        if (j == i) break;
+        const std::wstring tok = q.substr(i, j - i);
+        i = j;
+        std::wstring v;
+        bool ok = false;
+        if (PrefixI(tok, L"ext:", v)) {
+            for (size_t a = 0; a <= v.size();) {
+                size_t b = v.find_first_of(L";,|", a);
+                if (b == std::wstring::npos) b = v.size();
+                std::wstring e = v.substr(a, b - a);
+                while (!e.empty() && e[0] == L'.') e.erase(0, 1);
+                for (auto& c : e) c = towlower(c);
+                if (!e.empty()) spec.exts.push_back(e);
+                a = b + 1;
+            }
+            ok = !spec.exts.empty();
+        } else if (PrefixI(tok, L"type:", v)) {
+            for (auto& c : v) c = towlower(c);
+            if (v == L"dossier" || v == L"dossiers" || v == L"folder" || v == L"d") { spec.kind = 1; ok = true; }
+            if (v == L"fichier" || v == L"fichiers" || v == L"file" || v == L"f") { spec.kind = 2; ok = true; }
+        } else if (PrefixI(tok, L"taille:", v) || PrefixI(tok, L"size:", v)) {
+            ok = ParseSizeFilter(v, spec);
+        } else if (PrefixI(tok, L"date:", v) || PrefixI(tok, L"modifié:", v) || PrefixI(tok, L"modifie:", v) ||
+                   PrefixI(tok, L"modified:", v)) {
+            ok = ParseDate(v, now, spec);
+        }
+        if (!ok) {
+            if (!spec.names.empty()) spec.names += L' ';
+            spec.names += tok;
+        }
+    }
+    return spec;
+}
+
+bool SearchSpec::Accept(const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime) const {
+    const bool dir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (kind == 1 && !dir) return false;
+    if (kind == 2 && dir) return false;
+    if (!exts.empty()) {
+        if (dir) return false;
+        uint32_t dot = n;
+        for (uint32_t k = n; k-- > 0;) {
+            if (name[k] == L'\\') break;
+            if (name[k] == L'.') { dot = k; break; }
+        }
+        if (dot == n) return false;
+        const uint32_t len = n - dot - 1;
+        bool any = false;
+        for (const auto& e : exts)
+            if (e.size() == len && _wcsnicmp(name + dot + 1, e.c_str(), len) == 0) { any = true; break; }
+        if (!any) return false;
+    }
+    if (sized() && (dir || size < minSize || size > maxSize)) return false;  // dossiers : pas de taille
+    if (dated() && (mtime < minTime || mtime >= maxTime)) return false;
+    return true;
+}
 
 bool NameMatches(const std::wstring& query, const wchar_t* name, uint32_t n) { return Matcher(query)(name, n); }
 
@@ -302,7 +474,13 @@ void SearchTree(DirData& d, const std::wstring& query, const ViewPrefs& prefs, c
         if (h == INVALID_HANDLE_VALUE) { d.error = GetLastError(); return; }
         CloseHandle(h);
     }
-    const Matcher match(query);
+    const SearchSpec spec = ParseSearch(query);
+    const Matcher nameMatch(spec.names);
+    const bool anyName = nameMatch.terms.empty();  // filtres seuls (« ext:pdf ») : tous les noms
+    auto match = [&](const wchar_t* fn, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime) {
+        return (anyName || nameMatch(fn, n)) && spec.Accept(fn, n, attr, size, mtime);
+    };
+    if (anyName && !spec.filtered()) { d.error = ERROR_INVALID_PARAMETER; return; }
     const std::wstring root = d.path;
     // Disque réseau : moins de requêtes en parallèle (le serveur sert aussi les autres).
     const bool remote = (root.size() > 1 && root[0] == L'\\') ||
@@ -357,7 +535,7 @@ void SearchTree(DirData& d, const std::wstring& query, const ViewPrefs& prefs, c
                         if (!dot && IsShown(attr, prefs)) {
                             // Pas de jonction ni de lien : pas de boucle, pas de doublon.
                             const bool descend = (attr & FILE_ATTRIBUTE_DIRECTORY) && !(attr & FILE_ATTRIBUTE_REPARSE_POINT);
-                            const bool hit = match(fn, n);
+                            const bool hit = match(fn, n, attr, (uint64_t)di->EndOfFile.QuadPart, di->LastWriteTime.QuadPart);
                             if (hit || descend) {  // chemin construit seulement si utile
                                 std::wstring child = rel.empty() ? std::wstring(fn, n) : rel + L"\\" + std::wstring(fn, n);
                                 if (hit)
@@ -539,11 +717,13 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewP
     std::vector<uint32_t> order;
     order.reserve(n);
     const bool filter = !d.isRoot();
-    const Matcher match(nameFilter);
-    const bool byName = !match.terms.empty();
+    const SearchSpec spec = ParseSearch(nameFilter);  // le filtre instantané comprend aussi ext:, taille:…
+    const Matcher match(spec.names);
+    const bool byName = !match.terms.empty(), byFilter = spec.filtered();
     auto keep = [&](uint32_t i) {
         const Entry& e = d.entries[i];
-        return (!filter || IsShown(e.attr, prefs)) && (!byName || match(d.name(e), e.nameLen));
+        return (!filter || IsShown(e.attr, prefs)) && (!byName || match(d.name(e), e.nameLen)) &&
+               (!byFilter || spec.Accept(d.name(e), e.nameLen, e.attr, e.size, e.mtime));
     };
     for (uint32_t i = 0; i < n; ++i)
         if (d.entries[i].isDir() && keep(i)) order.push_back(i);

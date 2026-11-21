@@ -679,15 +679,36 @@ void AttachTarget(HWND hwnd) {
 // répondre : pas de service, index en construction, dossier non indexé.
 bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, const CancelToken& ct) {
     const double t0 = NowMs();
+    // Le service ne connaît que les noms : on lui envoie les mots du nom (ou
+    // « *.ext » par extension demandée) ; les autres filtres s'appliquent ici.
+    const SearchSpec spec = ParseSearch(q);
+    std::vector<std::wstring> asks;
+    if (!NameMatcher(spec.names).terms.empty()) asks.push_back(spec.names);
+    else for (const auto& e : spec.exts) asks.push_back(L"*." + e);
+    if (asks.empty()) return false;  // « taille:>1Go » seul : tous les fichiers, le parcours des dossiers convient mieux
     IndexQuery iq;
-    iq.query = q;
     iq.scope = d.path;
     iq.showHidden = prefs.showHidden;
     iq.showSuperHidden = prefs.showSuperHidden;
     iq.max = (uint32_t)kSearchMaxResults;
     std::vector<IndexHit> hits;
     bool truncated = false;
-    if (Index_Search(iq, hits, truncated) != IndexStatus::Ok || ct.cancelled()) return false;
+    for (const auto& a : asks) {
+        iq.query = a;
+        std::vector<IndexHit> part;
+        bool t = false;
+        if (Index_Search(iq, part, t) != IndexStatus::Ok || ct.cancelled()) return false;
+        truncated |= t;
+        for (auto& h : part) hits.push_back(std::move(h));
+    }
+    // Filtres sans le disque (type, extension) d'abord : moins de fichiers à lire.
+    if (spec.filtered()) {
+        SearchSpec byName = spec;
+        byName.minSize = 0, byName.maxSize = UINT64_MAX, byName.minTime = INT64_MIN, byName.maxTime = INT64_MAX;
+        std::erase_if(hits, [&](const IndexHit& h) {
+            return !byName.Accept(h.path.c_str(), (uint32_t)h.path.size(), h.attr, 0, 0);
+        });
+    }
     // L'index ne garde que les noms : taille et date lues sur le disque, pour
     // les premiers résultats (au-delà, la liste reste utilisable sans elles).
     struct Info {
@@ -697,7 +718,8 @@ bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, co
         bool ok = false;
     };
     std::vector<Info> info(hits.size());
-    const size_t statN = std::min<size_t>(hits.size(), 5000);
+    // Taille ou date demandée : il faut les lire toutes.
+    const size_t statN = spec.sized() || spec.dated() ? hits.size() : std::min<size_t>(hits.size(), 5000);
     const unsigned T = statN > 64 ? 8u : 1u;
     auto work = [&](unsigned t) {
         for (size_t i = statN * t / T; i < statN * (t + 1) / T && !ct.cancelled(); ++i) {
@@ -717,7 +739,11 @@ bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, co
     d.query = q;
     for (size_t i = 0; i < hits.size(); ++i) {
         const Info& x = info[i];
-        DirData_Add(d, hits[i].path.c_str(), (uint32_t)hits[i].path.size(), x.ok ? x.attr : hits[i].attr, x.size, x.mtime);
+        const uint32_t attr = x.ok ? x.attr : hits[i].attr;
+        if ((spec.sized() || spec.dated()) &&
+            (!x.ok || !spec.Accept(hits[i].path.c_str(), (uint32_t)hits[i].path.size(), attr, x.size, x.mtime)))
+            continue;
+        DirData_Add(d, hits[i].path.c_str(), (uint32_t)hits[i].path.size(), attr, x.size, x.mtime);
     }
     d.truncated = truncated;
     d.fromIndex = true;

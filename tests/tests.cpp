@@ -367,6 +367,68 @@ void TestVolumeIndex() {
     }
 }
 
+void TestSearchFilters() {
+    // 15 mars 2026, 12 h UTC.
+    SYSTEMTIME st{2026, 3, 0, 15, 12, 0, 0, 0};
+    FILETIME ft;
+    SystemTimeToFileTime(&st, &ft);
+    const int64_t now = (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+    constexpr int64_t day = 864000000000ll;
+
+    auto s = ParseSearch(L"rapport ext:PDF;.docx type:fichier taille:>10Mo", now);
+    CHECK_STR(s.names, L"rapport");
+    CHECK(s.exts.size() == 2 && s.exts[0] == L"pdf" && s.exts[1] == L"docx");
+    CHECK(s.kind == 2);
+    CHECK(s.minSize == 10ull * 1024 * 1024 + 1 && s.maxSize == UINT64_MAX);
+    CHECK(s.Accept(L"a\\Rapport.Pdf", 13, 0, 20ull << 20, 0));
+    CHECK(!s.Accept(L"a\\Rapport.Pdf", 13, 0, 1ull << 20, 0));    // trop petit
+    CHECK(!s.Accept(L"rapport.txt", 11, 0, 20ull << 20, 0));        // autre extension
+    CHECK(!s.Accept(L"x.pdf", 5, FILE_ATTRIBUTE_DIRECTORY, 0, 0));  // dossier
+    CHECK(!s.Accept(L"dossier.pdf\\fichier", 19, 0, 20ull << 20, 0));  // l'extension est celle du nom
+
+    auto r = ParseSearch(L"size:1,5Go..2Go type:folder", now);
+    CHECK(r.names.empty() && r.kind == 1 && r.minSize == 1610612736ull && r.maxSize == 2147483648ull);
+    CHECK(ParseSearch(L"taille:<1Ko", now).maxSize == 1023);
+    CHECK(ParseSearch(L"taille:10", now).minSize == 10);
+    CHECK_STR(ParseSearch(L"taille:beaucoup ext: type:truc", now).names, L"taille:beaucoup ext: type:truc");  // illisibles
+
+    auto w = ParseSearch(L"date:semaine", now);
+    CHECK(w.minTime == now - 7 * day && w.maxTime == INT64_MAX);
+    auto y = ParseSearch(L"modifié:hier", now);
+    CHECK(y.maxTime - y.minTime == day && y.maxTime <= now && now - y.maxTime < day);
+    auto t = ParseSearch(L"date:aujourd'hui", now);
+    CHECK(t.minTime <= now && now - t.minTime < day);
+    auto d1 = ParseSearch(L"date:2026-01-01", now);
+    CHECK(d1.maxTime - d1.minTime == day);
+    auto rg = ParseSearch(L"date:2026-01-01..2026-01-31", now);
+    CHECK(rg.maxTime - rg.minTime == 31 * day);
+    auto after = ParseSearch(L"date:>2026-01-01", now), from = ParseSearch(L"date:>=2026-01-01", now);
+    CHECK(after.minTime == from.minTime + day);
+    CHECK(ParseSearch(L"date:<2026-01-01", now).maxTime == from.minTime);
+    CHECK(!ParseSearch(L"date:2026-13-01", now).dated());
+
+    // Filtre instantané et recherche dans les sous-dossiers.
+    DirData d;
+    d.path = g_root;
+    Enumerate(d);
+    auto txt = Names(d, SortOrder(d, COL_NAME, true, {}, L"ext:txt"));
+    CHECK(txt.size() == 3);
+    auto big = Names(d, SortOrder(d, COL_NAME, true, {}, L"a taille:>100"));
+    CHECK(big.size() == 1 && big[0] == L"a10.txt");
+    auto dirs = Names(d, SortOrder(d, COL_NAME, true, {}, L"type:dossier"));
+    CHECK(IndexOf(dirs, L"zdir") >= 0 && IndexOf(dirs, L"Adir") >= 0 && IndexOf(dirs, L"a2.txt") < 0);
+    DirData sr;
+    sr.path = g_root;
+    SearchTree(sr, L"ext:txt taille:<100", {}, {});
+    std::vector<std::wstring> found;
+    for (const Entry& e : sr.entries) found.emplace_back(sr.name(e));
+    CHECK(IndexOf(found, L"a2.txt") >= 0 && IndexOf(found, L"B.txt") >= 0 && IndexOf(found, L"a10.txt") < 0);
+    DirData none;
+    none.path = g_root;
+    SearchTree(none, L"   ", {}, {});
+    CHECK(none.error == ERROR_INVALID_PARAMETER);
+}
+
 void TestEdgeCases() {
     DirData empty;
     empty.path = Join(g_root, L"zdir");
@@ -1272,6 +1334,7 @@ int wmain() {
     TestSortOther();
     TestFolderSize();
     TestVolumeIndex();
+    TestSearchFilters();
     TestEdgeCases();
     TestLongPath();
     TestParallelMatchesSequential();
