@@ -1,0 +1,36 @@
+# FastExplorer
+
+Explorateur de fichiers Windows natif (C++20 / Win32), conçu pour la vitesse.
+
+## Compiler et tester
+
+| Commande | Résultat |
+|---|---|
+| `build.bat` | release optimisée → `build\release\FastExplorer.exe` |
+| `build.bat debug` | debug → `build\debug\` |
+| `build.bat asan` | debug + AddressSanitizer → `build\asan\` |
+| `build.bat test` | compile et lance les tests sous AddressSanitizer |
+
+Mesurer un dossier : `FastExplorer.exe --bench <dossier> [--seq|--par]`
+
+## Architecture (`src/`)
+
+| Module | Rôle |
+|---|---|
+| `nt.*` | accès à ntdll (`NtQueryDirectoryFile`) |
+| `paths.*` | chemins : `\\?\`, UNC, parent, normalisation de saisie |
+| `listing.*` | lecture d'un dossier, clés de tri, tri — sans UI, testé |
+| `jobs.*` | tâches de fond : génération, annulation, `CancelSynchronousIo` |
+| `ui.*` | fenêtre, ListView virtuelle, raccourcis |
+| `main.cpp` | entrée, mode benchmark |
+
+## Règles de la base
+
+- Le thread de l'interface ne fait **aucune E/S** disque ou réseau, et aucun travail
+  proportionnel à la taille du dossier au-delà de 20 000 entrées.
+- `DirData` est **immuable** une fois construite : partagée sans verrou entre l'UI et les tâches.
+- L'affichage passe par une **permutation** (`order`) : trier ne déplace jamais les données,
+  et la sélection survit au tri.
+- Toute optimisation est **mesurée avant/après** (`--bench`, temps de démarrage dans la barre d'état).
+  Sans gain mesuré, elle est retirée.
+- Compilation en `/W4 /WX` : zéro avertissement.
