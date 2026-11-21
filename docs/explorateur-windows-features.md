@@ -57,7 +57,7 @@ De haut en bas :
 | Fonction | Détail | Prio |
 |---|---|---|
 | **Fil d'Ariane** (breadcrumb) | Chaque segment est cliquable | ✅ **P0** (segments, chevrons ▸ menu des sous-dossiers, « « » pour les segments qui débordent, clic dans le vide = saisie) |
-| Chevrons `>` entre les segments | Clic : menu des sous-dossiers frères, pour sauter latéralement | P1 |
+| Chevrons `>` entre les segments | Clic : menu des sous-dossiers frères, pour sauter latéralement | ✅ (bloc 6) |
 | Chevron le plus à gauche | Liste des emplacements racines (Bureau, Ce PC, Réseau…) | P2 |
 | Clic dans le vide de la barre | Bascule en mode texte, chemin complet sélectionné | ✅ (mode texte seul pour l'instant) |
 | Saisie de chemin | Chemin absolu, relatif, `..`, `%VARIABLES%`, UNC `\\serveur\partage` | ✅ |
@@ -86,7 +86,7 @@ De haut en bas :
 | **Bibliothèques** | Masquées par défaut. Vues agrégées de plusieurs dossiers (Documents, Musique, Images, Vidéos) | P3 |
 | **Corbeille** | Voir §11 | P1 |
 | **Panneau de configuration** | Visible si « Afficher tous les dossiers » est coché | P3 |
-| Clic droit sur le volet | Épingler, détacher, développer, ouvrir dans un nouvel onglet, propriétés | P1 |
+| Clic droit sur le volet | Épingler, détacher, développer, ouvrir dans un nouvel onglet, propriétés | ✅🟡 P1 (menu du Shell + épingler / désépingler ; développer et nouvel onglet à venir) |
 
 Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*, *Afficher tous les dossiers*,
 *Développer jusqu'au dossier ouvert*, *Afficher Réseau / Ce PC*.
@@ -280,7 +280,7 @@ comme arrière-plan, Pivoter (images), Monter (ISO/VHD), Graver…
 | Afficher le menu **complet du Shell** (avec toutes les extensions installées) | ✅ P0 (Maj = verbes étendus ; doublons d'extensions retirés) ⚙️ `IContextMenu` / `IContextMenu2/3` via `IShellFolder::GetUIObjectOf` + `QueryContextMenu` / `InvokeCommand` |
 | Menu sur une zone vide | Affichage, Trier par, Regrouper par, Actualiser, Coller, Nouveau ▸, Propriétés, Ouvrir dans le Terminal | ✅ P0 (menu Shell du dossier) |
 | Menu sur plusieurs éléments | Commandes communes | ✅ P0 |
-| Menu sur un lecteur | Formater, Éjecter, BitLocker, Propriétés | P1 |
+| Menu sur un lecteur | Formater, Éjecter, BitLocker, Propriétés | ✅ (menu du Shell) |
 | Touche Menu / Maj+F10 au clavier | P0 |
 | Notre propre menu rapide (commandes internes) + accès au menu Shell | P1 |
 
@@ -291,13 +291,13 @@ comme arrière-plan, Pivoter (images), Monter (ISO/VHD), Graver…
 | Fonction | Détail | Prio |
 |---|---|---|
 | Barre de recherche | Ctrl+E, Ctrl+F, F3 ; cherche dans le dossier courant et ses sous-dossiers | ✅ **P0** (sans index : parcours parallèle, résultats au fil de l'eau ; mots sans casse ni accents, motifs * ?, dossiers cachés selon le réglage, jonctions non suivies ; « Ouvrir l'emplacement du fichier » ; Échap pour sortir. C:\Windows entier : ~3 s) |
-| Résultats en direct | Au fil de la frappe, nom et contenu des fichiers indexés | P1 |
+| Résultats en direct | Au fil de la frappe, nom et contenu des fichiers indexés | ✅🟡 P1 (noms au fil de l'eau ; contenu : avec l'index) |
 | Index Windows Search | Rapide dans les emplacements indexés, lent (parcours disque) ailleurs ; options *Ne pas utiliser l'index*, *Inclure les fichiers système*, *Fichiers compressés*, *Correspondances partielles* | P2 ⚙️ requêtes OLE DB / `ISearchQueryHelper` sur `SystemIndex` |
 | **Syntaxe AQS** | `nom:`, `ext:.pdf`, `type:image`, `kind:music`, `taille:>100Mo`, `size:gigantic`, `date:aujourd'hui`, `datemodified:01/01/2026..31/01/2026`, `auteur:`, opérateurs `AND`, `OR`, `NOT`, `-`, guillemets, joker `*` | P2 |
 | Filtres du ruban de recherche | Date de modification, Type, Taille, Autres propriétés ; emplacement (dossier courant / tous les sous-dossiers) | P1 |
 | Recherches récentes | Historique des recherches | P2 |
 | Enregistrer la recherche | Fichier `.search-ms` (dossier virtuel) | P3 |
-| Ouvrir l'emplacement du fichier | Depuis un résultat | P1 |
+| Ouvrir l'emplacement du fichier | Depuis un résultat | ✅ (bloc 9) |
 | Recherche dans le contenu | Via l'index ; filtres IFilter par type (PDF, Office, texte) | P2 |
 | Lenteur notoire | Hors index : parcours séquentiel, parfois très lent | ⭐ opportunité (§20) |
 
@@ -404,7 +404,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | Fonction | Prio |
 |---|---|
 | Jauge d'espace libre, libellé du volume (« Windows (C:) ») | ✅ **P0** |
-| Éjecter (clés USB, disques externes) | P1 ⚙️ `CM_Request_Device_Eject` |
+| Éjecter (clés USB, disques externes) | ✅ (menu du Shell sur le lecteur ; éjection non bloquée par la surveillance, bloc 4) ⚙️ `CM_Request_Device_Eject` |
 | Formater (FAT32, exFAT, NTFS, ReFS) | P2 (déléguer au dialogue `SHFormatDrive`) |
 | Renommer le volume | P2 |
 | **Monter** une image ISO/VHD/VHDX (double-clic) ; Éjecter pour démonter | P2 |
@@ -413,7 +413,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | Téléphones et appareils photo (**MTP**) : parcourir et copier | P2 ⚙️ espace de noms Shell (pas de chemin Win32 : PIDL seulement) |
 | BitLocker (déverrouiller, gérer) | P3 |
 | Dev Drive (ReFS) | P3 |
-| Arrivée et départ de lecteurs en direct | **P1** ⚙️ `WM_DEVICECHANGE` / `SHChangeNotify(SHCNE_DRIVEADD…)` |
+| Arrivée et départ de lecteurs en direct | ✅ (bloc 4) ⚙️ `WM_DEVICECHANGE` / `SHChangeNotify(SHCNE_DRIVEADD…)` |
 
 ---
 
@@ -610,8 +610,37 @@ Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre
 8. ✅ **Barre d'état** : résumé de la sélection (nombre, taille).
 9. ✅ **Recherche** dans le dossier courant (puis l'index MFT en P1 ⭐).
 
-Puis les **P1** : onglets, annuler/rétablir, aperçu, miniatures, taille des dossiers ⭐, double panneau ⭐,
-file d'attente de copies ⭐, filtre instantané ⭐, autocomplétion, archives…
+Tous les P0 sont faits. Puis les **P1**, par blocs, dans un ordre qui fait passer d'abord ce qui sert
+tous les jours et ce dont d'autres blocs dépendent (les onglets avant le double panneau, la taille des
+dossiers avant l'index…) :
+
+10. **Finitions rapides** : copier le chemin (Ctrl+Maj+C, « Copier en tant que chemin d'accès »), clic lent
+    pour renommer, Tab / Maj+Tab pendant le renommage, historique déroulant de Précédent / Suivant, bouton
+    Actualiser, mise en évidence des nouveaux éléments, pavé numérique dans le volet, affichage des
+    raccourcis `.url`, liens symboliques et jonctions.
+11. **Filtre instantané** ⭐ du dossier courant (taper pour filtrer, sans lancer de recherche) et
+    **autocomplétion** de la barre d'adresse (+ lancer une commande, ex. `cmd`, `wt`).
+12. **Annuler / Rétablir** (Ctrl+Z / Ctrl+Y) et **opérations robustes** : fichier en cours d'utilisation
+    (Restart Manager : quelle application le bloque), droits insuffisants (élévation), espace insuffisant,
+    chemin trop long, suppression définitive sur un lecteur réseau ou amovible.
+13. **Onglets et fenêtres** : Ctrl+T / Ctrl+W / Ctrl+Tab, réorganiser, clic milieu sur un dossier,
+    Ctrl+N, ouvrir dans un nouvel onglet depuis le volet et le fil d'Ariane.
+14. **Taille des dossiers** ⭐ : calculée en arrière-plan (colonne Taille), sans ralentir la navigation.
+15. **Recherche instantanée sur tout le disque** ⭐ : index MFT + journal USN (à la *Everything*), puis
+    filtres de recherche (date, type, taille).
+16. **Modes d'affichage** : grandes / moyennes icônes, zoom continu (Ctrl+molette), Ctrl+Maj+1…8,
+    mode compact, **miniatures** (cache système partagé avec l'Explorateur).
+17. **Colonnes** : choix des colonnes (Property System), vue mémorisée par dossier.
+18. **Volets d'aperçu et de détails** (Alt+P, Alt+Maj+P) : preview handlers hors processus, propriétés
+    modifiables, sélection multiple, largeur réglable.
+19. **File d'attente de copies** ⭐ : opérations à la suite plutôt qu'en parallèle sur un même disque,
+    pause / reprise, liste visible.
+20. **Double panneau** ⭐ (à la Total Commander), sur la base des onglets.
+21. **Corbeille et Accueil** : parcourir, restaurer, vider ; page d'Accueil (Accès rapide, récents).
+22. **Archives** : parcourir un ZIP comme un dossier, extraire tout, compresser.
+23. **Réseau** : lister les partages d'un serveur (`\\serveur`).
+24. **Barre de commandes et menu rapide** : nos commandes courantes en un clic, accès au menu du Shell,
+    renommage multiple.
 
 Plus tard, une fois l'interface aboutie : intégration Git (changer de branche) ⭐, onglet WSL ⭐,
 connexions SFTP ⭐, connexions cloud (Google Drive, OneDrive, Dropbox…) ⭐.
