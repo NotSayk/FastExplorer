@@ -497,6 +497,20 @@ void NavPane_UnpinWindows(const std::wstring& path) {
     StartPinnedRead(path);
 }
 
+std::wstring NavPane_DriveText(const std::wstring& root) {
+    for (const auto& [id, n] : g_nodes) {
+        if (n.kind != Kind::Drive || _wcsicmp(n.path.c_str(), root.c_str()) != 0) continue;
+        wchar_t text[260] = {};
+        TVITEMW it{};
+        it.mask = TVIF_TEXT;
+        it.hItem = n.h;
+        it.pszText = text;
+        it.cchTextMax = _countof(text);
+        return TreeView_GetItem(g_tree, &it) ? std::wstring(text) : std::wstring();
+    }
+    return {};
+}
+
 void NavPane_RefreshDrives() {
     if (!g_pc) return;
     if (Node* n = NodeOf(g_pc)) {

@@ -11,6 +11,7 @@
 #include "icons.h"
 #include "jobs.h"
 #include "listing.h"
+#include "crumbs.h"
 #include "navpane.h"
 #include "paths.h"
 #include "shellmenu.h"
@@ -62,7 +63,7 @@ constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-
 // d'événements (copie de milliers de fichiers) et s'espace sur les gros dossiers.
 constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
-enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV };
+enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS };
 enum class Nav { Normal, Back, Forward, Refresh };
 enum class JobKind { Navigate, Sort };
 
@@ -103,7 +104,7 @@ struct View {
 };
 
 HINSTANCE g_inst;
-HWND g_hwnd, g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav;
+HWND g_hwnd, g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav, g_crumbs;
 int g_navW96 = 240;            // largeur du volet de navigation (à 96 ppp)
 bool g_splitDrag = false;      // séparateur volet / liste en cours de déplacement
 RECT g_split{};                // zone du séparateur (coordonnées client)
@@ -584,6 +585,7 @@ void OnResult(Result* raw) {
 
     if (d.error) {
         SetWindowTextW(g_addr, g_path.c_str());
+        Crumbs_SetPath(g_path);
         if (!p.fallbackOpen.empty() && (p.fallbackAnyError || d.error == ERROR_DIRECTORY)) {
             ShowSummary();  // ce n'était pas un dossier : on l'ouvre, sans message d'erreur
             OpenWithShell(p.fallbackOpen);
@@ -668,6 +670,7 @@ void OnResult(Result* raw) {
     }
 
     SetWindowTextW(g_addr, g_path.c_str());
+    Crumbs_SetPath(g_path);
     SetWindowTextW(g_hwnd, (L"FastExplorer — " + (g_path.empty() ? std::wstring(L"Ce PC") : g_path)).c_str());
     ListView_SetItemCountEx(g_list, (int)d.entries.size(), refresh ? LVSICF_NOSCROLL : 0);
     if (refresh) {
@@ -735,6 +738,24 @@ void Refresh() {
     for (int e : SelectedEntries()) names.emplace_back(NameOf(e));
     const int f = FocusedEntry();
     Navigate(g_path, Nav::Refresh, f >= 0 ? NameOf(f) : L"", std::move(names));
+}
+
+// Barre d'adresse : fil d'Ariane, ou zone de saisie le temps de taper un chemin.
+void BeginAddressEdit() {
+    if (!IsWindowVisible(g_addr)) {
+        SetWindowTextW(g_addr, g_path.empty() ? L"Ce PC" : g_path.c_str());
+        ShowWindow(g_addr, SW_SHOW);
+        ShowWindow(g_crumbs, SW_HIDE);
+    }
+    SetFocus(g_addr);
+    Edit_SetSel(g_addr, 0, -1);
+}
+
+void EndAddressEdit() {
+    if (!IsWindowVisible(g_addr)) return;
+    ShowWindow(g_crumbs, SW_SHOW);
+    ShowWindow(g_addr, SW_HIDE);
+    SetWindowTextW(g_addr, g_path.c_str());
 }
 
 void NavigateAddress() {
@@ -1343,7 +1364,7 @@ void ApplyFont() {
         SelectObject(dc, old);
         ReleaseDC(g_hwnd, dc);
     }
-    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav})
+    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_nav, g_crumbs})
         SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
 }
 
@@ -1375,7 +1396,7 @@ void Layout() {
     const int editH = g_fontH + S(10);  // texte centré verticalement
     const int h = std::max(S(30), editH);
     // Un seul lot de déplacements : un repaint au lieu d'un par contrôle.
-    HDWP dwp = BeginDeferWindowPos(6);
+    HDWP dwp = BeginDeferWindowPos(8);
     auto place = [&](HWND w, int x, int y, int cx, int cy) {
         if (dwp) dwp = DeferWindowPos(dwp, w, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
         else MoveWindow(w, x, y, cx, cy, TRUE);
@@ -1387,6 +1408,7 @@ void Layout() {
     }
     x += S(4);
     place(g_addr, x, m + (h - editH) / 2, std::max(0, (int)rc.right - x - m), editH);
+    place(g_crumbs, x, m + (h - editH) / 2, std::max(0, (int)rc.right - x - m), editH);  // même place
     const int top = m + h + m;
     const int bodyH = std::max(0, (int)rc.bottom - top - statusH);
     // Volet de navigation, séparateur (déplaçable à la souris), liste.
@@ -1422,9 +1444,17 @@ void CreateChildren(HWND hwnd) {
     g_btnFwd = btn(L"→", ID_FWD);
     g_btnUp = btn(L"↑", ID_UP);
 
-    g_addr = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                             0, 0, 0, 0, hwnd, (HMENU)ID_ADDR, g_inst, nullptr);
-    Edit_SetCueBannerText(g_addr, L"Ce PC");
+    // Zone de saisie cachée : le fil d'Ariane occupe sa place, sauf pendant la saisie.
+    g_addr = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
+                             (HMENU)ID_ADDR, g_inst, nullptr);
+    CrumbHost crumbs;
+    crumbs.navigate = [](const std::wstring& path) {
+        Navigate(path, Nav::Normal);
+        SetFocus(g_list);
+    };
+    crumbs.edit = BeginAddressEdit;
+    crumbs.driveText = NavPane_DriveText;
+    g_crumbs = Crumbs_Create(hwnd, ID_CRUMBS, std::move(crumbs));
 
     g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_SHAREIMAGELISTS |
@@ -1483,7 +1513,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if ((HWND)wp == g_list) { ShowContextMenu(lp); return 0; }
             if ((HWND)wp == g_nav) { NavPane_ContextMenu(lp); return 0; }
             break;
-        case WM_APP_NAV: NavPane_OnResult(lp); return 0;
+        case WM_APP_NAV:
+            NavPane_OnResult(lp);
+            Crumbs_Update();  // noms des lecteurs peut-être connus maintenant
+            return 0;
         case WM_SETCURSOR:
             if ((HWND)wp == hwnd && LOWORD(lp) == HTCLIENT) {
                 POINT p;
@@ -1579,6 +1612,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case ID_BACK: GoBack(); SetFocus(g_list); return 0;
                 case ID_FWD: GoForward(); SetFocus(g_list); return 0;
                 case ID_UP: GoUp(); SetFocus(g_list); return 0;
+                case ID_ADDR:
+                    if (HIWORD(wp) == EN_KILLFOCUS) EndAddressEdit();
+                    return 0;
             }
             break;
         case WM_NOTIFY: {
@@ -1642,7 +1678,7 @@ bool HandleGlobalKeys(const MSG& m) {
             case VK_LEFT: GoBack(); return true;
             case VK_RIGHT: GoForward(); return true;
             case VK_UP: GoUp(); return true;
-            case 'D': SetFocus(g_addr); Edit_SetSel(g_addr, 0, -1); return true;
+            case 'D': BeginAddressEdit(); return true;
             case VK_RETURN:
                 if (focus == g_addr) return false;
                 ShowProperties();
@@ -1656,12 +1692,12 @@ bool HandleGlobalKeys(const MSG& m) {
         case VK_F5: Refresh(); return true;
         case 'L':
             if (!ctrl) return false;
-            SetFocus(g_addr);
-            Edit_SetSel(g_addr, 0, -1);
+            BeginAddressEdit();
             return true;
+        case VK_F4: BeginAddressEdit(); return true;
         case VK_TAB:
             if (focus == g_addr) SetFocus(g_list);
-            else { SetFocus(g_addr); Edit_SetSel(g_addr, 0, -1); }
+            else BeginAddressEdit();
             return true;
         case VK_RETURN:
             if (focus == g_addr) { NavigateAddress(); return true; }

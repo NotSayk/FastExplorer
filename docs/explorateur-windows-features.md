@@ -56,7 +56,7 @@ De haut en bas :
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| **Fil d'Ariane** (breadcrumb) | Chaque segment est cliquable | **P0** |
+| **Fil d'Ariane** (breadcrumb) | Chaque segment est cliquable | ✅ **P0** (segments, chevrons ▸ menu des sous-dossiers, « « » pour les segments qui débordent, clic dans le vide = saisie) |
 | Chevrons `>` entre les segments | Clic : menu des sous-dossiers frères, pour sauter latéralement | P1 |
 | Chevron le plus à gauche | Liste des emplacements racines (Bureau, Ce PC, Réseau…) | P2 |
 | Clic dans le vide de la barre | Bascule en mode texte, chemin complet sélectionné | ✅ (mode texte seul pour l'instant) |
@@ -491,7 +491,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 |---|---|---|
 | Alt+← / Alt+→ / **Retour arrière** | Précédent / Suivant / Précédent | ✅ (⚠️ Retour arrière) |
 | Alt+↑ | Dossier parent | ✅ |
-| Alt+D, Ctrl+L, F4 | Barre d'adresse (F4 : avec la liste déroulante) | ✅ (sauf F4) |
+| Alt+D, Ctrl+L, F4 | Barre d'adresse (F4 : avec la liste déroulante) | ✅ (F4 : sans liste déroulante, l'historique n'existe pas encore) |
 | Ctrl+E, Ctrl+F, F3 | Recherche | P0 |
 | F5, Ctrl+R | Actualiser | ✅ (F5) |
 | F6, Tab | Passer d'un volet à l'autre | 🟡 (Tab : adresse ↔ liste) |
@@ -605,7 +605,7 @@ Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre
 3. ✅ **Glisser-déposer** OLE, dans les deux sens.
 4. ✅ **Rafraîchissement automatique** : dossier affiché, arrivée / retrait des lecteurs dans Ce PC, dossier ou lecteur disparu → plus proche parent, éjection USB non bloquée.
 5. ✅ **Volet de navigation** : dossiers épinglés + arborescence de Ce PC ; libellés et jauges des lecteurs.
-6. **Fil d'Ariane** dans la barre d'adresse.
+6. ✅ **Fil d'Ariane** dans la barre d'adresse.
 7. **Affichage** : éléments cachés et système, masquage des extensions (en respectant les préférences de l'utilisateur).
 8. **Barre d'état** : résumé de la sélection (nombre, taille).
 9. **Recherche** dans le dossier courant (puis l'index MFT en P1 ⭐).

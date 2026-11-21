@@ -9,6 +9,7 @@
 #include "icons.h"
 #include "jobs.h"
 #include "listing.h"
+#include "crumbs.h"
 #include "navpane.h"
 #include "pins.h"
 #include "nt.h"
@@ -579,7 +580,28 @@ void TestPins() {
     RemoveTree(dir);
 }
 
-void TestFastCopy() {    const std::wstring base = Join(g_root, L"fast");
+void TestCrumbs() {
+    auto texts = [](const std::vector<Crumb>& c) {
+        std::wstring s;
+        for (const auto& x : c) s += x.text + L"|" + x.path + L";";
+        return s;
+    };
+    CHECK_STR(texts(Crumbs_Split(L"")), L"Ce PC|;");
+    CHECK_STR(texts(Crumbs_Split(L"C:\\")), L"Ce PC|;C:|C:\\;");
+    CHECK_STR(texts(Crumbs_Split(L"c:\\Dev\\Fast Explorer\\")),
+              L"Ce PC|;C:|C:\\;Dev|C:\\Dev;Fast Explorer|C:\\Dev\\Fast Explorer;");
+    const auto named = Crumbs_Split(L"D:\\a", [](const std::wstring& root) {
+        return root == L"D:\\" ? std::wstring(L"Données (D:)") : std::wstring();
+    });
+    CHECK_STR(texts(named), L"Ce PC|;Données (D:)|D:\\;a|D:\\a;");
+    CHECK_STR(texts(Crumbs_Split(L"\\\\srv\\partage\\x\\y")),
+              L"\\\\srv\\partage|\\\\srv\\partage;x|\\\\srv\\partage\\x;y|\\\\srv\\partage\\x\\y;");
+    CHECK_STR(texts(Crumbs_Split(L"\\\\srv\\partage")), L"\\\\srv\\partage|\\\\srv\\partage;");
+    CHECK_STR(texts(Crumbs_Split(L"C:\\a\\\\b")), L"Ce PC|;C:|C:\\;a|C:\\a;b|C:\\a\\b;");  // séparateur doublé
+}
+
+void TestFastCopy() {
+    const std::wstring base = Join(g_root, L"fast");
     const std::wstring src = Join(base, L"src"), dst = Join(base, L"dst");
     CreateDirectoryW(base.c_str(), nullptr);
     CreateDirectoryW(src.c_str(), nullptr);
@@ -908,6 +930,7 @@ int wmain() {
     TestEnumerateNearest();
     TestNavPane();
     TestPins();
+    TestCrumbs();
     TestFastCopy();
     TestFileOps();
     TestDrop();
