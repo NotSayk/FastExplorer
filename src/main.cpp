@@ -8,6 +8,9 @@
 //   paths.*    manipulation de chemins (pure, testée)
 //   listing.*  lecture d'un dossier, clés de tri, tri (sans UI, testé)
 //   jobs.*     tâches de fond avec annulation et interruption d'E/S
+//   shellmenu.* menus contextuels et verbes du Shell, raccourcis .lnk
+//   icons.*    icônes propres aux fichiers (exe, lnk…), thread dédié
+//   watch.*    surveillance du dossier affiché
 //   ui.*       fenêtre, ListView virtuelle, raccourcis
 
 #include "win.h"
@@ -19,6 +22,7 @@
 #include "util.h"
 
 #include <objbase.h>
+#include <ole2.h>
 #include <shellapi.h>
 
 #include <algorithm>
@@ -97,9 +101,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         start = (n && n < MAX_PATH) ? std::wstring(prof) : L"";
     }
 
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    // OLE (et pas seulement COM) : presse-papiers des verbes Copier/Couper du
+    // menu Shell, et plus tard glisser-déposer.
+    OleInitialize(nullptr);
     int rc = 1;
     if (Ui_Create(inst, show, start)) rc = Ui_Run();
-    CoUninitialize();
+    OleUninitialize();
     return rc;
 }

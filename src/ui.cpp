@@ -6,10 +6,13 @@
 
 #include "ui.h"
 
+#include "icons.h"
 #include "jobs.h"
 #include "listing.h"
 #include "paths.h"
+#include "shellmenu.h"
 #include "util.h"
+#include "watch.h"
 
 #include <commctrl.h>
 #include <commoncontrols.h>
@@ -32,9 +35,15 @@
 namespace {
 
 constexpr UINT WM_APP_RESULT = WM_APP + 1;
+constexpr UINT WM_APP_ICON = WM_APP + 2;        // lParam = IconResult*
+constexpr UINT WM_APP_DIRCHANGED = WM_APP + 3;  // wParam = id de surveillance
 constexpr UINT_PTR TIMER_LOADING = 1;
+constexpr UINT_PTR TIMER_WATCH = 2;
 constexpr UINT kLoadingDelayMs = 150;   // en dessous, aucun « Chargement… » (évite le clignotement)
 constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-plan
+// Rafraîchissement après un changement sur disque : regroupe les rafales
+// d'événements (copie de milliers de fichiers) et s'espace sur les gros dossiers.
+constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
 enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS };
 enum class Nav { Normal, Back, Forward, Refresh };
@@ -55,13 +64,23 @@ struct Pending {
     Nav nav = Nav::Normal;
     std::wstring focus;                  // nom à cibler
     std::vector<std::wstring> selected;  // noms à resélectionner (F5)
+    // Si le chemin n'est pas un dossier, ouvrir ceci à la place (raccourci .lnk
+    // vers un fichier, chemin de fichier tapé dans la barre d'adresse).
+    std::wstring fallbackOpen;
+    bool fallbackAnyError = false;  // raccourci : aussi si la cible a disparu (le Shell s'en occupe)
 };
 
-// Ce qui est affiché. `order` : ligne → index d'entrée.
+enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
+
+// Ce qui est affiché. `order` : ligne → index d'entrée ; `rowOf` : l'inverse.
 struct View {
     std::shared_ptr<const DirData> data;
     std::vector<uint32_t> order;
-    std::vector<int32_t> icons;  // par index d'entrée, -1 = à résoudre
+    std::vector<int> rowOf;
+    std::vector<int32_t> icons;     // par index d'entrée
+    std::vector<uint8_t> overlays;  // surimpression par index d'entrée
+    std::vector<uint8_t> iconState;
+    uint64_t serial = 0;            // identifie la vue auprès du thread d'icônes
     double sortMs = 0;
 };
 
@@ -80,6 +99,10 @@ int g_sortCol = COL_NAME;
 bool g_sortAsc = true;
 std::unordered_map<std::wstring, int> g_iconCache;
 double g_startupMs = -1;  // -1 = pas encore mesuré, 0 = déjà affiché
+uint64_t g_viewSerial = 0;
+uintptr_t g_watchId = 0;
+std::wstring g_watchPath;
+bool g_watchPending = false;  // un rafraîchissement est programmé
 
 int S(int v) { return MulDiv(v, (int)g_dpi, 96); }
 bool HasView() { return g_view.data != nullptr; }
@@ -89,6 +112,15 @@ const Entry& E(int idx) { return g_view.data->entries[idx]; }
 const wchar_t* NameOf(int idx) { return g_view.data->name(E(idx)); }
 
 void SetStatus(const std::wstring& s) { SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)s.c_str()); }
+
+// Ouvre un fichier avec son application associée (comme un double-clic dans l'Explorateur).
+void OpenWithShell(const std::wstring& full) {
+    std::wstring dir, child;
+    if (!ParentOf(full, dir, child)) dir.clear();
+    const HINSTANCE r = ShellExecuteW(g_hwnd, nullptr, full.c_str(), nullptr, dir.empty() ? nullptr : dir.c_str(),
+                                      SW_SHOWNORMAL);
+    if ((INT_PTR)r <= 32) SetStatus(L"Impossible d'ouvrir « " + full + L" » : " + ErrorText(GetLastError()));
+}
 
 void ShowSummary() {
     if (!HasView()) return;
@@ -150,13 +182,18 @@ std::vector<int> FindEntriesByNames(const std::vector<std::wstring>& names) {
     return v;
 }
 
+void RebuildRowOf() {
+    const int n = RowCount();
+    g_view.rowOf.assign(n, -1);
+    for (int r = 0; r < n; ++r) g_view.rowOf[g_view.order[r]] = r;
+}
+
 // Applique une sélection exprimée en index d'entrées (indépendante du tri).
 void ApplySelection(const std::vector<int>& sel, int focus, bool scroll) {
     ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
     const int n = RowCount();
     if (!n) return;
-    std::vector<int> rowOf(n);
-    for (int r = 0; r < n; ++r) rowOf[g_view.order[r]] = r;
+    const std::vector<int>& rowOf = g_view.rowOf;
     for (int e : sel)
         if (e >= 0 && e < n) ListView_SetItemState(g_list, rowOf[e], LVIS_SELECTED, LVIS_SELECTED);
     if (focus >= 0 && focus < n) {
@@ -226,9 +263,21 @@ void FillDispInfo(LVITEMW& it) {
     if (idx < 0) return;
     const Entry& e = E(idx);
     if (it.mask & LVIF_IMAGE) {
-        int& icon = g_view.icons[idx];
-        if (icon < 0) icon = IconFor(idx);
-        it.iImage = icon;
+        uint8_t& st = g_view.iconState[idx];
+        if (st == ICON_NONE) {
+            // Icône du type tout de suite ; l'icône propre (exe, lnk…) suit en tâche de fond.
+            g_view.icons[idx] = IconFor(idx);
+            st = ICON_GENERIC;
+            if (!g_view.data->isRoot() && NeedsOwnIcon(e.attr, NameOf(idx) + e.extOff, e.nameLen - e.extOff)) {
+                st = ICON_PENDING;
+                Icons_Request(g_view.serial, (uint32_t)idx, Join(g_path, NameOf(idx)));
+            }
+        }
+        it.iImage = g_view.icons[idx];
+    }
+    if (it.mask & LVIF_STATE) {  // surimpression (flèche de raccourci, état cloud)
+        it.state = INDEXTOOVERLAYMASK(g_view.overlays[idx]);
+        it.stateMask = LVIS_OVERLAYMASK;
     }
     if (!(it.mask & LVIF_TEXT) || !it.pszText || it.cchTextMax <= 0) return;
     wchar_t* out = it.pszText;
@@ -290,9 +339,11 @@ void AttachTarget(HWND hwnd) {
     if (Result* e = g_early.exchange(nullptr)) PostTo(hwnd, e);
 }
 
-void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::vector<std::wstring> selected = {}) {
+void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::vector<std::wstring> selected = {},
+              std::wstring fallbackOpen = {}, bool fallbackAnyError = false) {
     const CancelToken ct = Jobs_NewGeneration();
-    g_pending = Pending{true, path, nav, std::move(focus), std::move(selected)};
+    g_pending = Pending{true,           path, nav, std::move(focus), std::move(selected), std::move(fallbackOpen),
+                        fallbackAnyError};
     if (g_hwnd) SetTimer(g_hwnd, TIMER_LOADING, kLoadingDelayMs, nullptr);
     const int col = g_sortCol;
     const bool asc = g_sortAsc;
@@ -317,6 +368,7 @@ void ApplyOrder(std::vector<uint32_t> order, double ms) {
     const int focus = FocusedEntry();
     g_view.order = std::move(order);
     g_view.sortMs = ms;
+    RebuildRowOf();
     ApplySelection(sel, focus, true);
     InvalidateRect(g_list, nullptr, FALSE);
     ShowSummary();
@@ -329,7 +381,7 @@ void Resort(int col) {
 
     if (g_pending.active) {  // une navigation est en vol : on la relance avec le nouveau tri
         Pending p = g_pending;
-        Navigate(p.path, p.nav, p.focus, p.selected);
+        Navigate(p.path, p.nav, p.focus, p.selected, p.fallbackOpen, p.fallbackAnyError);
         return;
     }
     if (!HasView()) return;
@@ -368,9 +420,14 @@ void OnResult(Result* raw) {
     const DirData& d = *r->data;
 
     if (d.error) {
+        SetWindowTextW(g_addr, g_path.c_str());
+        if (!p.fallbackOpen.empty() && (p.fallbackAnyError || d.error == ERROR_DIRECTORY)) {
+            ShowSummary();  // ce n'était pas un dossier : on l'ouvre, sans message d'erreur
+            OpenWithShell(p.fallbackOpen);
+            return;
+        }
         SetStatus(L"Impossible d'ouvrir « " + (d.path.empty() ? std::wstring(L"Ce PC") : d.path) + L" » : " +
                   ErrorText(d.error));
-        SetWindowTextW(g_addr, g_path.c_str());
         if (!HasView()) Navigate(L"", Nav::Normal);  // démarrage raté → Ce PC
         return;
     }
@@ -398,12 +455,50 @@ void OnResult(Result* raw) {
     const bool freeze = HasView();
     if (freeze) SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
 
+    // Icônes : préréglées (lecteurs), sinon à résoudre à l'affichage. Sur un
+    // rafraîchissement du même dossier, on reprend celles déjà connues (pas
+    // de clignotement générique → propre, pas de nouvelle demande).
+    const size_t n = d.entries.size();
+    std::vector<int32_t> icons(n, -1);
+    std::vector<uint8_t> overlays(n, 0), states(n, ICON_NONE);
+    for (size_t i = 0; i < n; ++i)
+        if (d.entries[i].icon >= 0) { icons[i] = d.entries[i].icon; states[i] = ICON_OWN; }
+    if (refresh && HasView() && g_view.data->path == d.path) {
+        const DirData& old = *g_view.data;
+        std::unordered_map<std::wstring_view, int> oldIdx;
+        oldIdx.reserve(old.entries.size());
+        for (size_t i = 0; i < old.entries.size(); ++i)
+            oldIdx.emplace(std::wstring_view(old.name(old.entries[i]), old.entries[i].nameLen), (int)i);
+        for (size_t j = 0; j < n; ++j) {
+            auto it = oldIdx.find(std::wstring_view(d.name(d.entries[j]), d.entries[j].nameLen));
+            if (it == oldIdx.end()) continue;
+            const uint8_t st = g_view.iconState[it->second];
+            if (st != ICON_GENERIC && st != ICON_OWN) continue;  // une demande en vol sera refaite
+            icons[j] = g_view.icons[it->second];
+            overlays[j] = g_view.overlays[it->second];
+            states[j] = st;
+        }
+    }
+
     g_view.data = r->data;
     g_view.order = std::move(r->order);
     g_view.sortMs = r->sortMs;
-    g_view.icons.resize(d.entries.size());
-    for (size_t i = 0; i < d.entries.size(); ++i) g_view.icons[i] = d.entries[i].icon;
+    g_view.icons = std::move(icons);
+    g_view.overlays = std::move(overlays);
+    g_view.iconState = std::move(states);
+    g_view.serial = ++g_viewSerial;
+    Icons_SetSerial(g_view.serial);
+    RebuildRowOf();
     g_path = d.path;
+
+    // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
+    if (g_path.empty()) {
+        Watch_Stop();
+        g_watchPath.clear();
+    } else if (g_watchPath != g_path) {
+        g_watchPath = g_path;
+        Watch_Start(g_hwnd, WM_APP_DIRCHANGED, g_path, ++g_watchId);
+    }
 
     SetWindowTextW(g_addr, g_path.c_str());
     SetWindowTextW(g_hwnd, (L"FastExplorer — " + (g_path.empty() ? std::wstring(L"Ce PC") : g_path)).c_str());
@@ -441,20 +536,119 @@ void NavigateAddress() {
     std::wstring t(n + 1, L'\0');
     GetWindowTextW(g_addr, t.data(), n + 1);
     t.resize(n);
-    Navigate(NormalizePath(t, g_path), Nav::Normal);
+    const std::wstring path = NormalizePath(t, g_path);
+    Navigate(path, Nav::Normal, {}, {}, path);  // un fichier tapé dans la barre s'ouvre
     SetFocus(g_list);
 }
 
-void Activate(int row) {
-    const int idx = EntryAt(row);
+bool IsLnk(int idx) {
+    const Entry& e = E(idx);
+    return e.nameLen - e.extOff == 4 && _wcsicmp(NameOf(idx) + e.extOff, L".lnk") == 0;
+}
+
+void ActivateEntry(int idx) {
     if (idx < 0) return;
     const std::wstring full = Join(g_path, NameOf(idx));
     if (E(idx).isDir()) {
         Navigate(full, Nav::Normal);
-    } else {
-        const HINSTANCE r = ShellExecuteW(g_hwnd, nullptr, full.c_str(), nullptr, g_path.c_str(), SW_SHOWNORMAL);
-        if ((INT_PTR)r <= 32) SetStatus(L"Impossible d'ouvrir « " + full + L" » : " + ErrorText(GetLastError()));
+        return;
     }
+    // Raccourci : on navigue DANS FastExplorer si la cible est un dossier
+    // (le Shell ouvrirait l'Explorateur Windows). Sinon le Shell l'ouvre,
+    // y compris pour une cible disparue (il propose de la rechercher).
+    std::wstring target;
+    if (IsLnk(idx) && ResolveShortcut(full, target)) {
+        Navigate(NormalizePath(target, L""), Nav::Normal, {}, {}, full, true);
+        return;
+    }
+    OpenWithShell(full);
+}
+
+void Activate(int row) { ActivateEntry(EntryAt(row)); }
+
+// ───────────────────────────── Menu contextuel, propriétés ─────────────────────────────
+
+std::vector<std::wstring> NamesOf(const std::vector<int>& entries) {
+    std::vector<std::wstring> v;
+    v.reserve(entries.size());
+    for (int e : entries) v.emplace_back(NameOf(e));
+    return v;
+}
+
+void ShowContextMenu(LPARAM lp) {
+    if (!HasView()) return;
+    POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+    std::vector<int> sel = SelectedEntries();
+    if (pt.x == -1 && pt.y == -1) {  // clavier (Maj+F10, touche Menu) : sous l'élément ciblé
+        const int r = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED);
+        RECT rc{};
+        if (r >= 0 && !sel.empty() && ListView_GetItemRect(g_list, r, &rc, LVIR_LABEL)) pt = {rc.left + S(8), rc.bottom};
+        else pt = {S(8), S(8)};
+        ClientToScreen(g_list, &pt);
+    } else {
+        POINT c = pt;
+        ScreenToClient(g_list, &c);
+        LVHITTESTINFO hit{};
+        hit.pt = c;
+        if (ListView_HitTest(g_list, &hit) < 0) sel.clear();  // clic dans le vide : menu du dossier
+    }
+    const int single = sel.size() == 1 ? sel[0] : -1;
+    const bool ok = ShellMenu_Show(g_hwnd, g_path, NamesOf(sel), pt, GetKeyState(VK_SHIFT) < 0,
+                                   [single](const std::wstring& verb) {
+                                       // « Ouvrir » sur un dossier ou un raccourci : chez nous, pas dans l'Explorateur.
+                                       if (single >= 0 && (_wcsicmp(verb.c_str(), L"open") == 0 ||
+                                                           _wcsicmp(verb.c_str(), L"explore") == 0)) {
+                                           ActivateEntry(single);
+                                           return true;
+                                       }
+                                       return false;
+                                   });
+    if (!ok) SetStatus(L"Menu contextuel indisponible pour cet emplacement.");
+}
+
+// Alt+Entrée : propriétés de la sélection, ou du dossier courant si rien n'est sélectionné.
+void ShowProperties() {
+    if (!HasView()) return;
+    std::vector<std::wstring> names = NamesOf(SelectedEntries());
+    std::wstring folder = g_path;
+    if (names.empty()) {
+        std::wstring parent, child;
+        if (!ParentOf(g_path, parent, child)) return;  // Ce PC : rien à afficher
+        folder = parent;
+        names.push_back(child);
+    }
+    if (!ShellMenu_Invoke(g_hwnd, folder, names, "properties")) SetStatus(L"Propriétés indisponibles.");
+}
+
+void OnIcon(IconResult* raw) {
+    std::unique_ptr<IconResult> r(raw);
+    if (!HasView() || r->serial != g_view.serial || r->idx >= g_view.icons.size()) return;
+    g_view.icons[r->idx] = r->icon;
+    g_view.overlays[r->idx] = (uint8_t)r->overlay;
+    g_view.iconState[r->idx] = ICON_OWN;
+    const int row = g_view.rowOf[r->idx];
+    if (row >= 0) ListView_RedrawItems(g_list, row, row);
+}
+
+// Changement sur disque : rafraîchissement différé (regroupe les rafales), plus
+// espacé sur les gros dossiers pour ne pas relire 30 000 entrées en boucle.
+void OnDirChanged(uintptr_t id) {
+    if (id != g_watchId || g_watchPending) return;
+    double delay = kWatchMinDelayMs;
+    if (HasView()) delay = std::clamp(4 * (g_view.data->enumMs + g_view.data->keyMs + g_view.sortMs), kWatchMinDelayMs,
+                                      kWatchMaxDelayMs);
+    g_watchPending = true;
+    SetTimer(g_hwnd, TIMER_WATCH, (UINT)delay, nullptr);
+}
+
+void OnWatchTimer() {
+    KillTimer(g_hwnd, TIMER_WATCH);
+    if (g_pending.active) {  // une navigation est en cours : on réessaie plus tard
+        SetTimer(g_hwnd, TIMER_WATCH, (UINT)kWatchMinDelayMs, nullptr);
+        return;
+    }
+    g_watchPending = false;
+    Refresh();
 }
 
 // ───────────────────────────── Fenêtre ─────────────────────────────
@@ -552,6 +746,7 @@ void CreateChildren(HWND hwnd) {
                                  LVS_SHOWSELALWAYS,
                              0, 0, 0, 0, hwnd, (HMENU)ID_LIST, g_inst, nullptr);
     ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
+    ListView_SetCallbackMask(g_list, LVIS_OVERLAYMASK);  // surimpressions fournies par LVN_GETDISPINFO
     SetWindowTheme(g_list, L"Explorer", nullptr);
 
     struct {
@@ -582,13 +777,20 @@ void CreateChildren(HWND hwnd) {
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (LRESULT lr = 0; ShellMenu_HandleMessage(msg, wp, lp, &lr)) return lr;
     switch (msg) {
         case WM_CREATE:
             g_hwnd = hwnd;
             g_dpi = GetDpiForWindow(hwnd);
             CreateChildren(hwnd);
+            Icons_Start(hwnd, WM_APP_ICON);
             AttachTarget(hwnd);
             return 0;
+        case WM_CONTEXTMENU:
+            if ((HWND)wp == g_list) { ShowContextMenu(lp); return 0; }
+            break;
+        case WM_APP_ICON: OnIcon((IconResult*)lp); return 0;
+        case WM_APP_DIRCHANGED: OnDirChanged((uintptr_t)wp); return 0;
         case WM_SIZE: Layout(); return 0;
         case WM_SETFOCUS: SetFocus(g_list); return 0;
         case WM_DPICHANGED: {
@@ -612,6 +814,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               L"…");
                 return 0;
             }
+            if (wp == TIMER_WATCH) { OnWatchTimer(); return 0; }
             break;
         case WM_COMMAND:
             switch (LOWORD(wp)) {
@@ -634,6 +837,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_RESULT: OnResult((Result*)lp); return 0;
         case WM_DESTROY:
             g_target.store(nullptr);
+            Icons_Stop();
+            Watch_Stop();
             Jobs_NewGeneration();  // périme et interrompt la tâche en cours
             PostQuitMessage(0);
             return 0;
@@ -654,6 +859,10 @@ bool HandleGlobalKeys(const MSG& m) {
             case VK_RIGHT: GoForward(); return true;
             case VK_UP: GoUp(); return true;
             case 'D': SetFocus(g_addr); Edit_SetSel(g_addr, 0, -1); return true;
+            case VK_RETURN:
+                if (focus == g_addr) return false;
+                ShowProperties();
+                return true;
         }
         return false;
     }

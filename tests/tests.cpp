@@ -3,9 +3,16 @@
 
 #include "win.h"
 
+#include "icons.h"
 #include "jobs.h"
 #include "listing.h"
 #include "nt.h"
+#include "shellmenu.h"
+#include "watch.h"
+
+#include <objbase.h>
+#include <shlobj.h>
+#include <shobjidl.h>
 #include "paths.h"
 #include "util.h"
 
@@ -293,10 +300,105 @@ void TestCancelHungNetworkPath() {
     CHECK(err == ERROR_CANCELLED);
 }
 
+// ───────────────────────────── Bloc Shell ─────────────────────────────
+
+bool Own(uint32_t attr, const wchar_t* ext) { return NeedsOwnIcon(attr, ext, (uint32_t)wcslen(ext)); }
+
+void TestNeedsOwnIcon() {
+    CHECK(Own(FILE_ATTRIBUTE_ARCHIVE, L".exe"));
+    CHECK(Own(FILE_ATTRIBUTE_ARCHIVE, L".LNK"));  // insensible à la casse
+    CHECK(Own(FILE_ATTRIBUTE_ARCHIVE, L".ico"));
+    CHECK(!Own(FILE_ATTRIBUTE_ARCHIVE, L".txt"));
+    CHECK(!Own(FILE_ATTRIBUTE_ARCHIVE, L""));
+    CHECK(!Own(FILE_ATTRIBUTE_ARCHIVE, L".exe2"));
+    CHECK(!Own(FILE_ATTRIBUTE_DIRECTORY, L""));                              // dossier ordinaire
+    CHECK(Own(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY, L""));     // desktop.ini possible
+    CHECK(Own(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT, L""));  // jonction, lien
+    // Fichier cloud absent du disque : jamais (le lire le téléchargerait).
+    CHECK(!Own(FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_REPARSE_POINT, L".exe"));
+    CHECK(!Own(FILE_ATTRIBUTE_OFFLINE, L".lnk"));
+    CHECK(!Own(FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY, L""));
+}
+
+void TestShortcut() {
+    const std::wstring dir = Join(g_root, L"Adir");
+    const std::wstring lnk = Join(dir, L"vers zdir.lnk");
+    const std::wstring target = Join(g_root, L"zdir");
+    IShellLinkW* sl = nullptr;
+    CHECK(SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl))));
+    if (!sl) return;
+    sl->SetPath(target.c_str());
+    IPersistFile* pf = nullptr;
+    sl->QueryInterface(IID_PPV_ARGS(&pf));
+    CHECK(pf && SUCCEEDED(pf->Save(lnk.c_str(), TRUE)));
+    if (pf) pf->Release();
+    sl->Release();
+
+    std::wstring got;
+    CHECK(ResolveShortcut(lnk, got));
+    CHECK_STRI(got, target);
+    std::wstring none;
+    CHECK(!ResolveShortcut(Join(dir, L"absent.lnk"), none));
+    CHECK(!ResolveShortcut(Join(g_root, L"a2.txt"), none));  // pas un raccourci
+}
+
+void TestEnumerateFileIsNotDirectory() {
+    DirData d;
+    d.path = Join(g_root, L"a2.txt");
+    Enumerate(d);
+    CHECK(d.error == ERROR_DIRECTORY);  // permet d'ouvrir le fichier au lieu d'afficher une erreur
+    CHECK(d.entries.empty());
+}
+
+void TestWatch() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"FeTestSink";
+    RegisterClassW(&wc);
+    HWND sink = CreateWindowW(wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    CHECK(sink != nullptr);
+    if (!sink) return;
+    constexpr UINT kMsg = WM_APP + 9;
+    const std::wstring dir = Join(g_root, L"Adir");
+
+    auto waitFor = [&](uintptr_t id, double ms) {
+        const double t0 = NowMs();
+        MSG m;
+        while (NowMs() - t0 < ms) {
+            while (PeekMessageW(&m, sink, kMsg, kMsg, PM_REMOVE))
+                if (m.wParam == id) return NowMs() - t0;
+            Sleep(2);
+        }
+        return -1.0;
+    };
+
+    Watch_Start(sink, kMsg, dir, 41);
+    Sleep(150);  // le thread doit avoir ouvert la surveillance
+    MakeFile(Join(dir, L"nouveau.txt"), 1);
+    const double latency = waitFor(41, 3000);
+    CHECK(latency >= 0);
+    printf("  surveillance : changement signale en %.1f ms\n", latency);
+
+    Watch_Stop();
+    Sleep(100);
+    MSG m;
+    while (PeekMessageW(&m, sink, kMsg, kMsg, PM_REMOVE)) {}
+    MakeFile(Join(dir, L"apres_arret.txt"), 1);
+    CHECK(waitFor(41, 500) < 0);  // arrêtée : plus aucun message
+
+    Watch_Start(sink, kMsg, Join(g_root, L"nexiste_pas"), 42);  // dossier absent : pas de plantage
+    Sleep(100);
+    Watch_Stop();
+    DestroyWindow(sink);
+}
+
 }  // namespace
 
 int wmain() {
     if (!LoadNt()) { printf("ntdll introuvable\n"); return 1; }
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    TestNeedsOwnIcon();
     TestToNtPath();
     TestJoin();
     TestParentOf();
@@ -309,6 +411,9 @@ int wmain() {
     TestLongPath();
     TestParallelMatchesSequential();
     TestCancelHungNetworkPath();
+    TestShortcut();
+    TestEnumerateFileIsNotDirectory();
+    TestWatch();
     RemoveTree(g_root);
     printf("\n%d verifications OK, %d echec(s)\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -53,6 +53,15 @@ void EnumerateDir(DirData& d, const CancelToken& ct) {
         d.error = ct.cancelled() ? ERROR_CANCELLED : GetLastError();
         return;
     }
+    // FILE_LIST_DIRECTORY == FILE_READ_DATA : CreateFileW ouvre aussi un fichier.
+    // On le refuse explicitement, pour que l'appelant puisse l'ouvrir à la place.
+    FILE_BASIC_INFO bi{};
+    if (GetFileInformationByHandleEx(h, FileBasicInfo, &bi, sizeof bi) &&
+        !(bi.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        d.error = ERROR_DIRECTORY;
+        CloseHandle(h);
+        return;
+    }
 
     std::unique_ptr<BYTE[]> buf(new BYTE[kEnumBuf]);  // new garantit l'alignement 16 sur x64
     d.entries.reserve(256);

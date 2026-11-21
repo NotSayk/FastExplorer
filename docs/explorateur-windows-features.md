@@ -47,7 +47,7 @@ De haut en bas :
 | Historique déroulant | Clic droit (ou appui long) sur Précédent/Suivant : liste des derniers dossiers visités | P1 |
 | Dossier parent | Bouton ↑, Alt+↑ | ✅ |
 | Actualiser | F5, Ctrl+R, bouton | ✅ (F5) |
-| Rafraîchissement automatique | Le dossier se met à jour seul quand des fichiers sont créés, supprimés ou renommés | **P0** ⚙️ `ReadDirectoryChangesW` / `SHChangeNotifyRegister` |
+| Rafraîchissement automatique | Le dossier se met à jour seul quand des fichiers sont créés, supprimés ou renommés | ✅🟡 P0 (dossier affiché ; pas encore les lecteurs de Ce PC) ⚙️ `ReadDirectoryChangesW` / `SHChangeNotifyRegister` |
 | Ouvrir dans une nouvelle fenêtre | Ctrl+N, Ctrl+double-clic, Ctrl+Entrée | P1 |
 | Ouvrir dans un nouvel onglet | Clic milieu sur un dossier (contenu, volet de navigation, et depuis 2026 barre d'adresse et Accueil), menu contextuel | P1 |
 | Développer l'arborescence jusqu'au dossier courant | Ctrl+Maj+E (option « Développer jusqu'au dossier ouvert ») | P2 |
@@ -177,9 +177,9 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Icônes de type | Selon l'extension ; icônes propres aux `.exe`, `.ico`, `.lnk`, `.url` | 🟡 P0 (générique pour exe/lnk) ⚙️ `SHGetFileInfo` sans `USEFILEATTRIBUTES` pour ces types, en tâche de fond |
+| Icônes de type | Selon l'extension ; icônes propres aux `.exe`, `.ico`, `.lnk`, `.url` | ✅ P0 (thread dédié, icône du type affichée en attendant) ⚙️ `SHGetFileInfo` sans `USEFILEATTRIBUTES` pour ces types, en tâche de fond |
 | **Miniatures** | Images, vidéos, PDF, documents Office, polices ; dossier = aperçu des premiers fichiers | P1 ⚙️ `IThumbnailCache` / `IShellItemImageFactory`, cache `thumbcache_*.db` |
-| Surimpressions (overlays) | Flèche des raccourcis, cadenas, états de synchro cloud (nuage, coche verte), double flèche bleue (fichier compressé NTFS) | P1 ⚙️ `IShellIconOverlayIdentifier` (15 emplacements max) |
+| Surimpressions (overlays) | Flèche des raccourcis, cadenas, états de synchro cloud (nuage, coche verte), double flèche bleue (fichier compressé NTFS) | ✅ P1 (via `SHGFI_OVERLAYINDEX`) ⚙️ `IShellIconOverlayIdentifier` (15 emplacements max) |
 | Éléments masqués | Icône semi-transparente | P0 |
 | Couleur des fichiers compressés/chiffrés NTFS | Bleu / vert (option) | P3 |
 | Couper (Ctrl+X) | L'élément coupé devient semi-transparent jusqu'au collage | P1 |
@@ -278,9 +278,9 @@ comme arrière-plan, Pivoter (images), Monter (ISO/VHD), Graver…
 
 | Point | Prio |
 |---|---|
-| Afficher le menu **complet du Shell** (avec toutes les extensions installées) | **P0** ⚙️ `IContextMenu` / `IContextMenu2/3` via `IShellFolder::GetUIObjectOf` + `QueryContextMenu` / `InvokeCommand` |
-| Menu sur une zone vide | Affichage, Trier par, Regrouper par, Actualiser, Coller, Nouveau ▸, Propriétés, Ouvrir dans le Terminal | P0 |
-| Menu sur plusieurs éléments | Commandes communes | P0 |
+| Afficher le menu **complet du Shell** (avec toutes les extensions installées) | ✅ P0 (Maj = verbes étendus ; doublons d'extensions retirés) ⚙️ `IContextMenu` / `IContextMenu2/3` via `IShellFolder::GetUIObjectOf` + `QueryContextMenu` / `InvokeCommand` |
+| Menu sur une zone vide | Affichage, Trier par, Regrouper par, Actualiser, Coller, Nouveau ▸, Propriétés, Ouvrir dans le Terminal | ✅ P0 (menu Shell du dossier) |
+| Menu sur plusieurs éléments | Commandes communes | ✅ P0 |
 | Menu sur un lecteur | Formater, Éjecter, BitLocker, Propriétés | P1 |
 | Touche Menu / Maj+F10 au clavier | P0 |
 | Notre propre menu rapide (commandes internes) + accès au menu Shell | P1 |
@@ -344,7 +344,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 
 | Point | Prio |
 |---|---|
-| Ouvrir le dialogue de propriétés natif du Shell | **P0** ⚙️ `SHObjectProperties` / `SHMultiFileProperties` (gratuit et complet) |
+| Ouvrir le dialogue de propriétés natif du Shell | ✅ P0 (Alt+Entrée, menu ; dossier courant si rien n'est sélectionné) ⚙️ `SHObjectProperties` / `SHMultiFileProperties` (gratuit et complet) |
 | Notre propre panneau rapide (taille, dates, hash…) | P2 |
 
 ---
@@ -422,7 +422,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 
 | Type | Comportement | Prio |
 |---|---|---|
-| Raccourci `.lnk` | Flèche en surimpression, extension toujours masquée ; ouvrir = ouvrir la cible ; Propriétés ▸ Emplacement du fichier ; dossier : navigue dans la cible | **P0** ⚙️ `IShellLink` |
+| Raccourci `.lnk` | Flèche en surimpression, extension toujours masquée ; ouvrir = ouvrir la cible ; Propriétés ▸ Emplacement du fichier ; dossier : navigue dans la cible | ✅ P0 (cible dossier ouverte dans FastExplorer, sans `Resolve`) ⚙️ `IShellLink` |
 | Raccourci Internet `.url` | Ouvre le navigateur | P1 |
 | Lien symbolique (fichier, dossier) | Flèche ; le dossier s'ouvre comme un dossier ; colonne « Cible du lien » ⚠️ | P1 |
 | Jonction | Idem pour les dossiers ; jonctions système masquées (« Documents and Settings ») | P1 |
@@ -598,10 +598,10 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 
 Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre logique de dépendances :
 
-1. **Fondations Shell** : menu contextuel Shell complet, propriétés natives, icônes réelles (exe/lnk) en tâche de fond, raccourcis `.lnk`.
+1. ✅ **Fondations Shell** : menu contextuel Shell complet, propriétés natives, icônes réelles (exe/lnk) en tâche de fond, raccourcis `.lnk`.
 2. **Opérations de fichiers** : nouveau dossier, renommer (F2, validation), copier/couper/coller (presse-papiers interopérable), supprimer (Corbeille et définitif), moteur de copie avec progression et conflits.
 3. **Glisser-déposer** OLE, dans les deux sens.
-4. **Rafraîchissement automatique** (surveillance des changements) et arrivée des lecteurs.
+4. 🟡 **Rafraîchissement automatique** : fait pour le dossier affiché ; reste l'arrivée des lecteurs.
 5. **Volet de navigation** : dossiers épinglés + arborescence de Ce PC ; libellés et jauges des lecteurs.
 6. **Fil d'Ariane** dans la barre d'adresse.
 7. **Affichage** : éléments cachés et système, masquage des extensions (en respectant les préférences de l'utilisateur).
