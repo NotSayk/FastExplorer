@@ -375,21 +375,25 @@ void TestWatch() {
     constexpr UINT kMsg = WM_APP + 9;
     const std::wstring dir = Join(g_root, L"Adir");
 
-    auto waitFor = [&](uintptr_t id, double ms) {
+    // Attend le message `kind` pour `id` ; les autres sont traités comme l'interface le ferait.
+    auto waitFor = [&](uintptr_t id, LPARAM kind, double ms) {
         const double t0 = NowMs();
         MSG m;
         while (NowMs() - t0 < ms) {
-            while (PeekMessageW(&m, sink, kMsg, kMsg, PM_REMOVE))
-                if (m.wParam == id) return NowMs() - t0;
+            while (PeekMessageW(&m, sink, kMsg, kMsg, PM_REMOVE)) {
+                if (m.wParam != id) continue;
+                if (m.lParam == kWatchOpened) Watch_Opened(sink, id);
+                if (m.lParam == kind) return NowMs() - t0;
+            }
             Sleep(2);
         }
         return -1.0;
     };
 
     Watch_Start(sink, kMsg, dir, 41);
-    Sleep(150);  // le thread doit avoir ouvert la surveillance
+    CHECK(waitFor(41, kWatchOpened, 3000) >= 0);
     MakeFile(Join(dir, L"nouveau.txt"), 1);
-    const double latency = waitFor(41, 3000);
+    const double latency = waitFor(41, 0, 3000);
     CHECK(latency >= 0);
     printf("  surveillance : changement signale en %.1f ms\n", latency);
 
@@ -398,14 +402,51 @@ void TestWatch() {
     MSG m;
     while (PeekMessageW(&m, sink, kMsg, kMsg, PM_REMOVE)) {}
     MakeFile(Join(dir, L"apres_arret.txt"), 1);
-    CHECK(waitFor(41, 500) < 0);  // arrêtée : plus aucun message
+    CHECK(waitFor(41, 0, 500) < 0);  // arrêtée : plus aucun message
 
-    Watch_Start(sink, kMsg, Join(g_root, L"nexiste_pas"), 42);  // dossier absent : pas de plantage
-    Sleep(100);
+    Watch_Start(sink, kMsg, Join(g_root, L"nexiste_pas"), 42);  // dossier absent : signalé disparu
+    CHECK(waitFor(42, kWatchGone, 3000) >= 0);
     Watch_Stop();
+
+    // Dossier surveillé supprimé par une autre application : signalé disparu.
+    const std::wstring tmp = Join(g_root, L"Watched");
+    CreateDirectoryW(tmp.c_str(), nullptr);
+    Watch_Start(sink, kMsg, tmp, 43);
+    CHECK(waitFor(43, kWatchOpened, 3000) >= 0);
+    CHECK(RemoveDirectoryW(tmp.c_str()));  // partage DELETE : la surveillance ne bloque pas la suppression
+    CHECK(waitFor(43, kWatchGone, 3000) >= 0);
+    Watch_Stop();
+
+    // Éjection : Watch_Stop(true) rend le dossier vraiment libre (plus aucun handle ouvert).
+    CreateDirectoryW(tmp.c_str(), nullptr);
+    Watch_Start(sink, kMsg, tmp, 44);
+    CHECK(waitFor(44, kWatchOpened, 3000) >= 0);
+    Watch_Stop(true);
+    HANDLE ex = CreateFileW(tmp.c_str(), FILE_LIST_DIRECTORY, 0 /* exclusif */, nullptr, OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    CHECK(ex != INVALID_HANDLE_VALUE);
+    if (ex != INVALID_HANDLE_VALUE) CloseHandle(ex);
+    RemoveDirectoryW(tmp.c_str());
+    while (PeekMessageW(&m, sink, kMsg, kMsg, PM_REMOVE)) {}
     DestroyWindow(sink);
 }
 
+void TestEnumerateNearest() {
+    CHECK(IsGoneError(ERROR_PATH_NOT_FOUND));
+    CHECK(IsGoneError(ERROR_NOT_READY));
+    CHECK(!IsGoneError(ERROR_ACCESS_DENIED));  // pas « disparu » : on affiche l'erreur
+    DirData d;
+    d.path = Join(Join(g_root, L"Adir"), L"supprime\\sous");
+    EnumerateNearest(d, CancelToken{});
+    CHECK(d.error == 0);
+    CHECK_STR(d.path, Join(g_root, L"Adir"));
+    CHECK_STR(d.vanished, Join(Join(g_root, L"Adir"), L"supprime\\sous"));
+    DirData ok;
+    ok.path = g_root;
+    EnumerateNearest(ok, CancelToken{});
+    CHECK(ok.vanished.empty());
+    CHECK_STR(ok.path, g_root);
+}
 void TestFileNames() {
     CHECK_STR(CleanFileName(L"  rapport.txt  "), L"rapport.txt");
     CHECK_STR(CleanFileName(L"note..."), L"note");
@@ -656,6 +697,7 @@ int wmain() {
     TestPrepareMenu();
     TestFileNames();
     TestWatch();
+    TestEnumerateNearest();
     TestFileOps();
     TestDrop();
     RemoveTree(g_root);

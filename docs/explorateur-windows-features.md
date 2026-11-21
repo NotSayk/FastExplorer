@@ -47,7 +47,7 @@ De haut en bas :
 | Historique déroulant | Clic droit (ou appui long) sur Précédent/Suivant : liste des derniers dossiers visités | P1 |
 | Dossier parent | Bouton ↑, Alt+↑ | ✅ |
 | Actualiser | F5, Ctrl+R, bouton | ✅ (F5) |
-| Rafraîchissement automatique | Le dossier se met à jour seul quand des fichiers sont créés, supprimés ou renommés | ✅🟡 P0 (dossier affiché ; pas encore les lecteurs de Ce PC) ⚙️ `ReadDirectoryChangesW` / `SHChangeNotifyRegister` |
+| Rafraîchissement automatique | Le dossier se met à jour seul quand des fichiers sont créés, supprimés ou renommés | ✅ P0 (dossier affiché, lecteurs de Ce PC, dossier disparu → parent, éjection libérée) ⚙️ `ReadDirectoryChangesW` / `SHChangeNotifyRegister` |
 | Ouvrir dans une nouvelle fenêtre | Ctrl+N, Ctrl+double-clic, Ctrl+Entrée | P1 |
 | Ouvrir dans un nouvel onglet | Clic milieu sur un dossier (contenu, volet de navigation, et depuis 2026 barre d'adresse et Accueil), menu contextuel | P1 |
 | Développer l'arborescence jusqu'au dossier courant | Ctrl+Maj+E (option « Développer jusqu'au dossier ouvert ») | P2 |
@@ -600,7 +600,7 @@ Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre
 1. ✅ **Fondations Shell** : menu contextuel Shell complet, propriétés natives, icônes réelles (exe/lnk) en tâche de fond, raccourcis `.lnk`.
 2. ✅ **Opérations de fichiers** : nouveau dossier, renommer (F2, validation), copier/couper/coller (presse-papiers interopérable), supprimer (Corbeille et définitif), moteur de copie avec progression et conflits.
 3. ✅ **Glisser-déposer** OLE, dans les deux sens.
-4. 🟡 **Rafraîchissement automatique** : fait pour le dossier affiché ; reste l'arrivée des lecteurs.
+4. ✅ **Rafraîchissement automatique** : dossier affiché, arrivée / retrait des lecteurs dans Ce PC, dossier ou lecteur disparu → plus proche parent, éjection USB non bloquée.
 5. **Volet de navigation** : dossiers épinglés + arborescence de Ce PC ; libellés et jauges des lecteurs.
 6. **Fil d'Ariane** dans la barre d'adresse.
 7. **Affichage** : éléments cachés et système, masquage des extensions (en respectant les préférences de l'utilisateur).

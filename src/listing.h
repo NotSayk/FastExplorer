@@ -32,6 +32,7 @@ struct DirData {
     size_t nDirs = 0, nFiles = 0;
     DWORD error = 0;
     double enumMs = 0, keyMs = 0;
+    std::wstring vanished;  // EnumerateNearest : dossier demandé, disparu (sinon vide)
 
     bool isRoot() const { return path.empty(); }
     const wchar_t* name(const Entry& e) const { return pool.data() + e.nameOff; }
@@ -43,6 +44,14 @@ void SetParallel(Parallel p);
 
 // Lit le dossier (ou les lecteurs si d.path est vide) et calcule les clés de tri.
 void Enumerate(DirData& d, const CancelToken& ct = {});
+
+// Erreur signifiant « ce dossier n'existe plus ici » (supprimé, renommé,
+// lecteur ou média retiré, partage disparu), par opposition à un refus d'accès.
+bool IsGoneError(DWORD err);
+
+// Comme Enumerate, mais si le dossier a disparu, remonte au plus proche parent
+// existant (jusqu'à Ce PC) ; d.vanished garde alors le chemin demandé.
+void EnumerateNearest(DirData& d, const CancelToken& ct = {});
 
 // Permutation d'affichage : dossiers d'abord, puis la colonne demandée,
 // puis le nom (ordre naturel et linguistique de l'Explorateur). Ordre total

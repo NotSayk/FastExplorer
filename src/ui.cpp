@@ -17,6 +17,7 @@
 #include "watch.h"
 
 #include <commctrl.h>
+#include <dbt.h>
 #include <commoncontrols.h>
 #include <shellapi.h>
 #include <shlwapi.h>
@@ -43,9 +44,12 @@ constexpr UINT WM_APP_FILEOP = WM_APP + 4;      // lParam = FileOpResult*
 constexpr UINT WM_APP_EDITSEL = WM_APP + 5;     // renommage : sélection du nom sans l'extension
 constexpr UINT WM_APP_REEDIT = WM_APP + 6;      // renommage refusé : on rouvre la saisie
 constexpr UINT WM_APP_RECLAIM = WM_APP + 7;     // reprendre le premier plan au moteur de copie
+constexpr UINT WM_APP_SHELLNOTIFY = WM_APP + 8; // lecteur ou média ajouté / retiré (SHChangeNotifyRegister)
 constexpr UINT_PTR TIMER_LOADING = 1;
 constexpr UINT_PTR TIMER_WATCH = 2;
-constexpr UINT_PTR TIMER_AFTEROP = 3;  // resélection après une opération, différée pendant un renommage
+constexpr UINT_PTR TIMER_AFTEROP = 3;
+constexpr UINT_PTR TIMER_DRIVES = 4;  // Ce PC : regroupe les annonces d'arrivée / retrait de lecteurs
+constexpr UINT_PTR TIMER_EJECT = 5;   // éjection demandée : si elle échoue, on reprend la surveillance  // resélection après une opération, différée pendant un renommage
 constexpr UINT kLoadingDelayMs = 150;   // en dessous, aucun « Chargement… » (évite le clignotement)
 constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-plan
 // Rafraîchissement après un changement sur disque : regroupe les rafales
@@ -110,7 +114,12 @@ double g_startupMs = -1;  // -1 = pas encore mesuré, 0 = déjà affiché
 uint64_t g_viewSerial = 0;
 uintptr_t g_watchId = 0;
 std::wstring g_watchPath;
+std::wstring g_goneNote;  // « X n'est plus accessible » : reste affiché tant qu'on ne navigue pas ailleurs
+std::wstring g_watchFailed;  // surveillance impossible ici (droits, réseau) : pas de boucle de relances
 bool g_watchPending = false;  // un rafraîchissement est programmé
+ULONG g_shellNotify = 0;      // inscription aux annonces de lecteurs du Shell
+
+void RegisterShellNotify();
 
 // ── Opérations sur les fichiers ──
 bool g_editing = false;      // saisie d'un nom en cours : aucun rafraîchissement ne doit l'interrompre
@@ -172,7 +181,7 @@ void ShowSummary() {
         swprintf_s(s + k, _countof(s) - k, L"   •   démarrage %.0f ms", g_startupMs);
         g_startupMs = 0;  // affiché une seule fois
     }
-    SetStatus(s);
+    SetStatus(g_goneNote.empty() ? std::wstring(s) : g_goneNote + L"   •   " + s);
 }
 
 void UpdateButtons() {
@@ -397,10 +406,12 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
     if (g_hwnd) SetTimer(g_hwnd, TIMER_LOADING, kLoadingDelayMs, nullptr);
     const int col = g_sortCol;
     const bool asc = g_sortAsc;
-    Jobs_Spawn([ct, path, col, asc] {
+    const bool climb = nav == Nav::Refresh;  // dossier affiché disparu : on remonte, comme l'Explorateur
+    Jobs_Spawn([ct, path, col, asc, climb] {
         auto d = std::make_shared<DirData>();
         d->path = path;
-        Enumerate(*d, ct);
+        if (climb) EnumerateNearest(*d, ct);
+        else Enumerate(*d, ct);
         if (ct.cancelled()) return;
         auto* r = new Result{ct.gen, JobKind::Navigate};
         if (!d->error) {
@@ -517,7 +528,8 @@ void OnResult(Result* raw) {
         }
     }
 
-    const bool refresh = p.nav == Nav::Refresh;
+    // Remonté à un parent : ce n'est plus un rafraîchissement du même dossier.
+    const bool refresh = p.nav == Nav::Refresh && d.vanished.empty();
     // Un seul repaint, pas de clignotement. Inutile (et coûteux : ~13 ms) au
     // premier affichage, quand la liste est encore vide.
     const bool freeze = HasView();
@@ -564,8 +576,10 @@ void OnResult(Result* raw) {
     if (g_path.empty()) {
         Watch_Stop();
         g_watchPath.clear();
-    } else if (g_watchPath != g_path) {
+        g_watchFailed.clear();
+    } else if (g_watchPath != g_path && g_watchFailed != g_path) {
         g_watchPath = g_path;
+        g_watchFailed.clear();
         Watch_Start(g_hwnd, WM_APP_DIRCHANGED, g_path, ++g_watchId);
     }
 
@@ -583,8 +597,11 @@ void OnResult(Result* raw) {
     RedrawWindow(g_list, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
     UpdateButtons();
     if (g_startupMs < 0) g_startupMs = MsSinceProcessStart();  // premier affichage réellement peint
+    if (!d.vanished.empty()) g_goneNote = L"« " + d.vanished + L" » n'est plus accessible";
+    else if (p.nav != Nav::Refresh) g_goneNote.clear();
     ShowSummary();
     if (!g_path.empty()) WarmUpMenus(d);
+    RegisterShellNotify();
 
     // Nouvel élément créé par une commande du fond du dossier : renommage direct.
     if (g_expectNew.before) {
@@ -743,7 +760,7 @@ void CopyNames(const std::vector<std::wstring>& names, bool cut) {
     wchar_t s[128];
     swprintf_s(s, L"%zu élément%s %s dans le presse-papiers.", names.size(), names.size() > 1 ? L"s" : L"",
                cut ? L"coupé(s)" : L"copié(s)");
-    SetStatus(s);
+    SetStatus(g_goneNote.empty() ? std::wstring(s) : g_goneNote + L"   •   " + s);
 }
 
 void OnClipboardUpdate() {
@@ -1015,13 +1032,88 @@ void OnIcon(IconResult* raw) {
 
 // Changement sur disque : rafraîchissement différé (regroupe les rafales), plus
 // espacé sur les gros dossiers pour ne pas relire 30 000 entrées en boucle.
-void OnDirChanged(uintptr_t id) {
-    if (id != g_watchId || g_watchPending) return;
+void OnDirChanged(uintptr_t id, LPARAM kind) {
+    if (id != g_watchId) return;
+    if (kind == kWatchOpened) { Watch_Opened(g_hwnd, id); return; }
+    if (kind == kWatchGone) {  // dossier supprimé, lecteur retiré, réseau perdu
+        Watch_Stop();
+        g_watchFailed = g_watchPath;  // s'il est toujours lisible, on ne relance pas la surveillance
+        g_watchPath.clear();
+        if (!g_pending.active && !g_editing) Refresh();  // remonte au plus proche parent
+        else if (!g_watchPending) { g_watchPending = true; SetTimer(g_hwnd, TIMER_WATCH, (UINT)kWatchMinDelayMs, nullptr); }
+        return;
+    }
+    if (g_watchPending) return;
     double delay = kWatchMinDelayMs;
     if (HasView()) delay = std::clamp(4 * (g_view.data->enumMs + g_view.data->keyMs + g_view.sortMs), kWatchMinDelayMs,
                                       kWatchMaxDelayMs);
     g_watchPending = true;
     SetTimer(g_hwnd, TIMER_WATCH, (UINT)delay, nullptr);
+}
+
+// ── Lecteurs : arrivée, retrait, éjection ──
+
+wchar_t DriveOf(const std::wstring& p) {
+    return (p.size() >= 2 && p[1] == L':') ? (wchar_t)towupper(p[0]) : 0;
+}
+
+// Lecteurs annoncés (masque : bit 0 = A:). Ce PC se met à jour ; si le dossier
+// affiché était sur un lecteur retiré, on remonte (jusqu'à Ce PC).
+void OnDrivesChanged(DWORD removedMask) {
+    if (!HasView()) return;
+    const wchar_t d = DriveOf(g_path);
+    if (d && (removedMask & (1u << (d - L'A')))) {
+        Watch_Stop();
+        g_watchPath.clear();
+        SetTimer(g_hwnd, TIMER_EJECT, 50, nullptr);  // rafraîchit (remonte) dès que possible
+        return;
+    }
+    if (g_path.empty()) SetTimer(g_hwnd, TIMER_DRIVES, 300, nullptr);
+}
+
+LRESULT OnDeviceChange(WPARAM wp, LPARAM lp) {
+    const auto* hdr = (const DEV_BROADCAST_HDR*)lp;
+    if (!hdr) return TRUE;
+    if (hdr->dbch_devicetype == DBT_DEVTYP_HANDLE && wp == DBT_DEVICEQUERYREMOVE) {
+        // Éjection demandée du lecteur affiché : on le libère tout de suite
+        // (sinon Windows répond « périphérique en cours d'utilisation »).
+        Watch_Stop(true);
+        g_watchPath.clear();
+        ShellMenu_Discard();
+        SetTimer(g_hwnd, TIMER_EJECT, 3000, nullptr);  // éjection refusée ailleurs : on reprendra la surveillance
+        return TRUE;
+    }
+    if (hdr->dbch_devicetype == DBT_DEVTYP_VOLUME &&
+        (wp == DBT_DEVICEARRIVAL || wp == DBT_DEVICEREMOVECOMPLETE)) {
+        const auto* v = (const DEV_BROADCAST_VOLUME*)lp;
+        OnDrivesChanged(wp == DBT_DEVICEREMOVECOMPLETE ? v->dbcv_unitmask : 0);
+    }
+    return TRUE;
+}
+
+// Annonces du Shell (lecteur réseau connecté, média inséré…) : complètent WM_DEVICECHANGE.
+void OnShellNotify(WPARAM wp, LPARAM lp) {
+    PIDLIST_ABSOLUTE* pidls = nullptr;
+    LONG ev = 0;
+    HANDLE lock = SHChangeNotification_Lock((HANDLE)wp, (DWORD)lp, &pidls, &ev);
+    if (!lock) return;
+    DWORD removed = 0;
+    if ((ev & (SHCNE_DRIVEREMOVED | SHCNE_MEDIAREMOVED)) && pidls && pidls[0]) {
+        wchar_t path[MAX_PATH] = {};
+        if (SHGetPathFromIDListW(pidls[0], path))
+            if (const wchar_t d = DriveOf(path)) removed = 1u << (d - L'A');
+    }
+    SHChangeNotification_Unlock(lock);
+    OnDrivesChanged(removed);
+}
+
+void RegisterShellNotify() {
+    if (g_shellNotify || !g_hwnd) return;
+    SHChangeNotifyEntry e{nullptr, TRUE};  // tous les emplacements
+    g_shellNotify = SHChangeNotifyRegister(g_hwnd, SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
+                                           SHCNE_DRIVEADD | SHCNE_DRIVEREMOVED | SHCNE_MEDIAINSERTED |
+                                               SHCNE_MEDIAREMOVED,
+                                           WM_APP_SHELLNOTIFY, 1, &e);
 }
 
 void OnWatchTimer() {
@@ -1175,7 +1267,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if ((HWND)wp == g_list) { ShowContextMenu(lp); return 0; }
             break;
         case WM_APP_ICON: OnIcon((IconResult*)lp); return 0;
-        case WM_APP_DIRCHANGED: OnDirChanged((uintptr_t)wp); return 0;
+        case WM_APP_DIRCHANGED: OnDirChanged((uintptr_t)wp, lp); return 0;
+        case WM_DEVICECHANGE: return OnDeviceChange(wp, lp);
+        case WM_APP_SHELLNOTIFY: OnShellNotify(wp, lp); return 0;
         case WM_APP_FILEOP: OnFileOp((FileOpResult*)lp); return 0;
         case WM_APP_EDITSEL: OnEditSel(); return 0;
         case WM_APP_REEDIT: OnReedit(); return 0;
@@ -1218,6 +1312,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (wp == TIMER_WATCH) { OnWatchTimer(); return 0; }
             if (wp == TIMER_AFTEROP) { ApplyAfterOp(); return 0; }
+            if (wp == TIMER_DRIVES || wp == TIMER_EJECT) {
+                if (g_pending.active || g_editing) return 0;  // le minuteur reste armé : on réessaie
+                KillTimer(hwnd, wp);
+                if (HasView() && (wp == TIMER_EJECT || g_path.empty())) Refresh();
+                return 0;
+            }
             break;
         case WM_COMMAND:
             switch (LOWORD(wp)) {
@@ -1249,6 +1349,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ShellMenu_Discard();
             RemoveClipboardFormatListener(hwnd);
             DragDrop_RevokeTarget(g_list);
+            if (g_shellNotify) SHChangeNotifyDeregister(g_shellNotify);
             Clipboard_Flush();  // ce qui a été copié reste disponible après la fermeture
             Jobs_NewGeneration();  // périme et interrompt la tâche en cours
             PostQuitMessage(0);

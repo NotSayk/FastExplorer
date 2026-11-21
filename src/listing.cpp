@@ -230,3 +230,33 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc) {
     }
     return order;
 }
+
+bool IsGoneError(DWORD err) {
+    switch (err) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_NOT_READY:             // média retiré (CD, lecteur de cartes)
+        case ERROR_DEVICE_NOT_CONNECTED:  // clé USB arrachée
+        case ERROR_INVALID_DRIVE:
+        case ERROR_BAD_NETPATH:
+        case ERROR_BAD_NET_NAME:
+        case ERROR_NETNAME_DELETED:
+        case ERROR_UNRECOGNIZED_VOLUME:
+        case ERROR_DIRECTORY:             // remplacé par un fichier
+        case ERROR_DELETE_PENDING: return true;
+        default: return false;
+    }
+}
+
+void EnumerateNearest(DirData& d, const CancelToken& ct) {
+    const std::wstring wanted = d.path;
+    Enumerate(d, ct);
+    std::wstring parent, child;
+    while (d.error && IsGoneError(d.error) && !ct.cancelled() && ParentOf(d.path, parent, child)) {
+        const std::wstring p = parent;
+        d = DirData{};
+        d.path = p;
+        d.vanished = wanted;
+        Enumerate(d, ct);
+    }
+}
