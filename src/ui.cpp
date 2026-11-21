@@ -1093,6 +1093,21 @@ void RegisterDrop() {
     DragDrop_RegisterTarget(g_list, std::move(h));
 }
 
+// « Épingler dans FastExplorer » : Accès rapide propre à l'application, qui
+// marche même quand celui de Windows ne répond pas. Un dossier épinglé dans
+// Windows se désépingle par le menu du Shell (« Désépingler de l'Accès rapide »).
+std::vector<MenuExtra> PinExtras(const std::wstring& path, bool withOpen) {
+    std::vector<MenuExtra> x;
+    if (withOpen) x.push_back({L"Ouvrir", [path] { Navigate(path, Nav::Normal); }, true});
+    const NavPin pin = NavPane_PinOf(path);
+    if (pin == NavPin::Windows) return x;
+    const bool add = pin == NavPin::None;
+    x.push_back({add ? L"Épingler dans FastExplorer" : L"Désépingler de FastExplorer", [path, add] {
+                     if (!NavPane_Pin(path, add)) SetStatus(L"Impossible d'enregistrer les dossiers épinglés.");
+                 }});
+    return x;
+}
+
 void ShowContextMenu(LPARAM lp) {
     if (!HasView()) return;
     POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -1112,6 +1127,11 @@ void ShowContextMenu(LPARAM lp) {
     }
     // Les noms (et non des index) : la vue peut être rafraîchie pendant que le menu est ouvert.
     const std::vector<std::wstring> names = NamesOf(sel);
+    std::vector<MenuExtra> extras;
+    if (sel.size() == 1 && E(sel[0]).isDir()) {
+        const std::wstring dir = g_path.empty() ? names[0] : Join(g_path, names[0].c_str());  // Ce PC : un lecteur
+        extras = PinExtras(dir, true);
+    }
     const bool ok = ShellMenu_Show(g_hwnd, g_path, names, pt, GetKeyState(VK_SHIFT) < 0, [names](const std::wstring& verb) {
         auto is = [&](const wchar_t* v) { return _wcsicmp(verb.c_str(), v) == 0; };
         const int single = names.size() == 1 ? FindEntryByName(names[0]) : -1;
@@ -1129,7 +1149,7 @@ void ShowContextMenu(LPARAM lp) {
         if (is(L"NewFolder")) { NewFolder(); return true; }
         if (background) g_expectNew = {g_view.data, GetTickCount64() + 10000};
         return false;
-    });
+    }, extras);
     if (!ok) SetStatus(L"Menu contextuel indisponible pour cet emplacement.");
     SetTimer(g_hwnd, TIMER_PINNED, 800, nullptr);  // « Épingler à Accès rapide » a pu être choisi
 }
@@ -1161,7 +1181,7 @@ void ShowNavMenu(const std::wstring& path, POINT pt) {
         }
         if (is(L"paste")) { Paste(path); return true; }
         return false;
-    });
+    }, path.empty() ? std::vector<MenuExtra>{} : PinExtras(path, true));
     if (!ok) SetStatus(L"Menu contextuel indisponible pour cet emplacement.");
     SetTimer(g_hwnd, TIMER_PINNED, 800, nullptr);
 }

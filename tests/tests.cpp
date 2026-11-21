@@ -10,6 +10,7 @@
 #include "jobs.h"
 #include "listing.h"
 #include "navpane.h"
+#include "pins.h"
 #include "nt.h"
 #include "shellmenu.h"
 #include "watch.h"
@@ -518,11 +519,64 @@ void TestNavPane() {
     CHECK(info.size() == 2 && info[0].total > 0 && info[0].free <= info[0].total);
     CHECK(info.size() == 2 && info[1].total == 0);  // lecteur absent : inconnu, sans erreur
 
-    // Accès rapide : ce sont de vrais dossiers (le contenu dépend de la machine).
-    const auto pinned = NavPane_ReadPinned();
-    printf("  acces rapide : %zu dossier(s) epingle(s)\n", pinned.size());
-    for (const auto& p : pinned) CHECK(GetFileAttributesW(p.path.c_str()) != INVALID_FILE_ATTRIBUTES);
     RemoveTree(base);
+}
+
+void TestPins() {
+    // Fichiers d'épingles dans un dossier de test (pas dans %APPDATA%).
+    const std::wstring dir = Join(g_root, L"pins");
+    CreateDirectoryW(dir.c_str(), nullptr);
+    Pins_SetDir(dir);
+    const std::wstring a = Join(g_root, L"épinglé A"), b = Join(g_root, L"B"), gone = Join(g_root, L"disparu");
+    CreateDirectoryW(a.c_str(), nullptr);
+    CreateDirectoryW(b.c_str(), nullptr);
+
+    CHECK(Pins_LoadOwn().empty());
+    CHECK(Pins_AddOwn(a) && Pins_AddOwn(b) && Pins_AddOwn(gone));
+    CHECK(Pins_AddOwn(a));  // déjà épinglé : pas de doublon
+    auto own = Pins_LoadOwn();
+    CHECK(own.size() == 3);
+    if (own.size() == 3) CHECK_STR(own[0].path, a);  // relu tel quel (UTF-8)
+    std::wstring upper = b;
+    CharUpperBuffW(upper.data(), (DWORD)upper.size());
+    CHECK(Pins_IsOwn(upper));  // chemins comparés sans la casse
+    CHECK(Pins_RemoveOwn(upper) && !Pins_IsOwn(b) && Pins_LoadOwn().size() == 2);
+    CHECK(Pins_RemoveOwn(b));  // absent : rien à faire, pas une erreur
+    CHECK(Pins_AddOwn(b));
+
+    // Accès rapide de Windows injoignable : dernière copie connue + nos épingles.
+    CHECK(Pins_SaveSnapshot({{a, L"Mon A"}, {gone, L""}}));
+    const auto snap = Pins_LoadSnapshot();
+    CHECK(snap.size() == 2 && snap[0].text == L"Mon A" && snap[1].text.empty());
+    auto pins = NavPane_ReadPinned(false);
+    CHECK(pins.size() == 2);  // `gone` absent du disque : caché (des deux listes)
+    if (pins.size() == 2) {
+        CHECK_STR(pins[0].text, L"Mon A");
+        CHECK(pins[0].pin == NavPin::Own);  // épinglé des deux côtés : retirable chez nous
+        CHECK_STR(pins[1].path, b);
+        CHECK_STR(pins[1].text, L"B");
+        CHECK(pins[1].pin == NavPin::Own && !pins[1].hasChildren);
+    }
+    CHECK(NavPane_PinOf(gone) == NavPin::Own);  // volet jamais affiché : lu dans le fichier
+
+    // Plus rien d'épinglé nulle part : dossiers par défaut (Bureau, Documents…).
+    CHECK(Pins_SaveSnapshot({}) && Pins_RemoveOwn(a) && Pins_RemoveOwn(b) && Pins_RemoveOwn(gone));
+    pins = NavPane_ReadPinned(false);
+    CHECK(pins.size() >= 3);
+    for (const auto& p : pins) CHECK(p.pin == NavPin::None && GetFileAttributesW(p.path.c_str()) != INVALID_FILE_ATTRIBUTES);
+
+    // Accès rapide de Windows : de vrais dossiers (le contenu dépend de la machine),
+    // dont la copie est enregistrée pour plus tard.
+    pins = NavPane_ReadPinned();
+    size_t windows = 0;
+    for (const auto& p : pins) {
+        CHECK(GetFileAttributesW(p.path.c_str()) != INVALID_FILE_ATTRIBUTES);
+        windows += p.pin == NavPin::Windows;
+    }
+    printf("  acces rapide : %zu dossier(s) epingle(s) dans Windows\n", windows);
+    CHECK(Pins_LoadSnapshot().size() == windows);
+    Pins_SetDir(L"");
+    RemoveTree(dir);
 }
 
 void TestFastCopy() {    const std::wstring base = Join(g_root, L"fast");
@@ -853,6 +907,7 @@ int wmain() {
     TestWatch();
     TestEnumerateNearest();
     TestNavPane();
+    TestPins();
     TestFastCopy();
     TestFileOps();
     TestDrop();

@@ -22,10 +22,19 @@
 // Renvoie true si l'application le gère elle-même : le Shell ne l'exécute pas.
 using VerbFilter = std::function<bool(const std::wstring& verb)>;
 
+// Commande de l'application, ajoutée en tête du menu du Shell.
+struct MenuExtra {
+    std::wstring text;
+    std::function<void()> run;
+    bool onlyWithoutShell = false;  // seulement si le Shell ne fournit pas de menu
+};
+
 // Affiche le menu à `pt` (coordonnées écran) et exécute la commande choisie.
 // extended : Maj enfoncée (verbes étendus : « Copier en tant que chemin d'accès »…).
+// Si le Shell ne fournit aucun menu, les `extras` sont affichés seuls (false
+// s'il n'y en a pas non plus).
 bool ShellMenu_Show(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, POINT pt,
-                    bool extended, const VerbFilter& filter);
+                    bool extended, const VerbFilter& filter, const std::vector<MenuExtra>& extras = {});
 
 // Construit le menu à l'avance (≈100 ms de gestionnaires Shell), sur le thread
 // des menus : au survol d'un élément, puis au bouton droit enfoncé. ShellMenu_Show

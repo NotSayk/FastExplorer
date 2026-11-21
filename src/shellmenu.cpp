@@ -441,18 +441,47 @@ void ShellMenu_WarmUp(const std::wstring& folder, const std::vector<std::wstring
     else delete a;
 }
 
+namespace {
+constexpr UINT kExtraFirst = kLast + 1;  // identifiants des MenuExtra, après ceux du Shell
+
+// Ajoute les commandes de l'application en tête de `menu` (suivies d'un séparateur).
+void AddExtras(HMENU menu, const std::vector<MenuExtra>& extras, bool shell) {
+    UINT pos = 0;
+    for (size_t i = 0; i < extras.size(); ++i) {
+        if (shell && extras[i].onlyWithoutShell) continue;
+        InsertMenuW(menu, pos++, MF_BYPOSITION | MF_STRING, kExtraFirst + (UINT)i, extras[i].text.c_str());
+    }
+    if (pos && shell && GetMenuItemCount(menu) > (int)pos) InsertMenuW(menu, pos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
+}
+
+bool RunExtra(UINT cmd, const std::vector<MenuExtra>& extras) {
+    if (cmd < kExtraFirst || cmd - kExtraFirst >= extras.size()) return false;
+    if (extras[cmd - kExtraFirst].run) extras[cmd - kExtraFirst].run();
+    return true;
+}
+}  // namespace
+
 bool ShellMenu_Show(HWND owner, const std::wstring& folder, const std::vector<std::wstring>& names, POINT pt,
-                    bool extended, const VerbFilter& filter) {
+                    bool extended, const VerbFilter& filter, const std::vector<MenuExtra>& extras) {
     HWND mt = MenuThread();
-    if (!mt) return false;
     // Menu préparé au survol ou au bouton enfoncé : remis aussitôt (sinon construit maintenant).
     Take tk{Target{owner, folder, names, extended}};
-    if (!SendMessageW(mt, WM_MT_TAKE, 0, (LPARAM)&tk) || !tk.shown) return false;
+    if (!mt || !SendMessageW(mt, WM_MT_TAKE, 0, (LPARAM)&tk) || !tk.shown) {
+        // Pas de menu du Shell (emplacement inconnu de lui, Shell indisponible) : les nôtres seuls.
+        HMENU own = extras.empty() ? nullptr : CreatePopupMenu();
+        if (!own) return false;
+        AddExtras(own, extras, false);
+        const UINT cmd = (UINT)TrackPopupMenuEx(own, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, owner, nullptr);
+        DestroyMenu(own);
+        RunExtra(cmd, extras);
+        return true;
+    }
     Shown* s = tk.shown;
+    AddExtras(s->b.menu, extras, true);  // le menu est détruit après usage : on peut le modifier
     g_showing = s;
     const UINT cmd = (UINT)TrackPopupMenuEx(s->b.menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, owner, nullptr);
     g_showing = nullptr;
-    if (cmd >= kFirst) {
+    if (!RunExtra(cmd, extras) && cmd >= kFirst) {
         VerbReq v{s, cmd - kFirst};
         SendMessageW(mt, WM_MT_VERB, 0, (LPARAM)&v);
         if (!(filter && filter(v.verb))) {

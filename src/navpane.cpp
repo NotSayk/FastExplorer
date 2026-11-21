@@ -2,6 +2,7 @@
 
 #include "listing.h"
 #include "paths.h"
+#include "pins.h"
 
 #include <propsys.h>
 #include <shellapi.h>
@@ -109,7 +110,7 @@ HTREEITEM g_quick = nullptr, g_pc = nullptr;
 int g_folderIcon = 0;
 bool g_syncing = false;  // sélection faite par le programme : pas de navigation
 ULONGLONG g_pinnedAt = 0;
-bool g_pinnedLoading = false;
+bool g_pinnedLoading = false, g_pinnedAgain = false;  // Again : relire dès la lecture en cours finie
 
 struct Result {
     enum Type { Children, Pinned } type;
@@ -261,14 +262,42 @@ std::vector<NavFolder> NavPane_ReadChildren(const std::wstring& path) {
     return FoldersOf(d, true);
 }
 
-std::vector<NavFolder> NavPane_ReadPinned() {
-    std::vector<NavFolder> out;
+namespace {
+
+const wchar_t kQuickAccess[] = L"shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}";
+
+int SmallIcon(const std::wstring& path) {
+    SHFILEINFOW sfi{};
+    return SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof sfi, SHGFI_SYSICONINDEX | SHGFI_SMALLICON) ? sfi.iIcon : -1;
+}
+
+// Dossier local absent (clé USB retirée…) : pas affiché. Réseau : affiché sans
+// vérification (un serveur injoignable bloquerait la lecture plusieurs secondes).
+bool Present(const std::wstring& path) {
+    if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') return true;
+    return GetFileAttributesW(ToNtPath(path).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+NavFolder FromSaved(const SavedPin& p, NavPin pin) {
+    NavFolder f;
+    f.path = p.path;
+    f.text = p.text;
+    if (f.text.empty()) {
+        std::wstring parent, leaf;
+        f.text = ParentOf(p.path, parent, leaf) && !leaf.empty() ? leaf : p.path;
+    }
+    f.icon = SmallIcon(p.path);
+    f.hasChildren = false;
+    f.pin = pin;
+    return f;
+}
+
+// Épingles de l'Accès rapide de Windows ; false s'il ne répond pas.
+bool ReadShellPins(std::vector<NavFolder>& out) {
     ComPtr<IShellItem> qa;
-    if (FAILED(SHCreateItemFromParsingName(L"shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}", nullptr,
-                                           IID_PPV_ARGS(&qa))))
-        return out;
+    if (FAILED(SHCreateItemFromParsingName(kQuickAccess, nullptr, IID_PPV_ARGS(&qa)))) return false;
     ComPtr<IEnumShellItems> en;
-    if (FAILED(qa->BindToHandler(nullptr, BHID_EnumItems, IID_PPV_ARGS(&en)))) return out;
+    if (FAILED(qa->BindToHandler(nullptr, BHID_EnumItems, IID_PPV_ARGS(&en))) || !en) return false;
     PROPERTYKEY pinnedKey{};
     const bool havePinned = SUCCEEDED(PSGetPropertyKeyFromName(L"System.Home.IsPinned", &pinnedKey));
     for (ComPtr<IShellItem> it; en->Next(1, &it, nullptr) == S_OK; it.Reset()) {
@@ -288,14 +317,69 @@ std::vector<NavFolder> NavPane_ReadPinned() {
         } else {
             f.text = f.path;
         }
-        SHFILEINFOW sfi{};
-        if (SHGetFileInfoW(f.path.c_str(), 0, &sfi, sizeof sfi, SHGFI_SYSICONINDEX | SHGFI_SMALLICON)) f.icon = sfi.iIcon;
+        f.icon = SmallIcon(f.path);
         f.hasChildren = false;
+        f.pin = NavPin::Windows;
         out.push_back(std::move(f));
+    }
+    return true;
+}
+
+std::vector<NavFolder> DefaultFolders() {
+    std::vector<NavFolder> out;
+    for (const KNOWNFOLDERID* id : {&FOLDERID_Desktop, &FOLDERID_Downloads, &FOLDERID_Documents, &FOLDERID_Pictures,
+                                    &FOLDERID_Music, &FOLDERID_Videos}) {
+        PWSTR p = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(*id, KF_FLAG_DONT_VERIFY, nullptr, &p)) && p) {
+            SavedPin sp{p, {}};
+            SHFILEINFOW sfi{};  // nom localisé (« Bureau »…)
+            if (SHGetFileInfoW(p, 0, &sfi, sizeof sfi, SHGFI_DISPLAYNAME) && sfi.szDisplayName[0])
+                sp.text = sfi.szDisplayName;
+            if (Present(sp.path)) out.push_back(FromSaved(sp, NavPin::None));
+        }
+        CoTaskMemFree(p);
     }
     return out;
 }
 
+bool SamePath(const std::wstring& a, const std::wstring& b) {
+    return CompareStringOrdinal(a.c_str(), (int)a.size(), b.c_str(), (int)b.size(), TRUE) == CSTR_EQUAL;
+}
+
+std::vector<NavFolder> g_shownPins;  // dernier contenu affiché (thread de l'interface)
+
+}  // namespace
+
+std::vector<NavFolder> NavPane_ReadPinned(bool useShell) {
+    std::vector<NavFolder> out;
+    if (useShell && ReadShellPins(out)) {
+        std::vector<SavedPin> snap;
+        for (const auto& f : out) snap.push_back({f.path, f.text});
+        Pins_SaveSnapshot(snap);  // pour le jour où l'Accès rapide ne répondra plus
+    } else {
+        for (const auto& p : Pins_LoadSnapshot())
+            if (Present(p.path)) out.push_back(FromSaved(p, NavPin::Windows));
+    }
+    for (const auto& p : Pins_LoadOwn()) {
+        auto same = std::find_if(out.begin(), out.end(), [&](const NavFolder& f) { return SamePath(f.path, p.path); });
+        if (same != out.end()) same->pin = NavPin::Own;  // épinglé des deux côtés : retirable chez nous
+        else if (Present(p.path)) out.push_back(FromSaved(p, NavPin::Own));
+    }
+    if (out.empty()) out = DefaultFolders();
+    return out;
+}
+
+NavPin NavPane_PinOf(const std::wstring& path) {
+    for (const auto& f : g_shownPins)
+        if (SamePath(f.path, path)) return f.pin;
+    return Pins_IsOwn(path) ? NavPin::Own : NavPin::None;  // absent du disque, mais épinglé
+}
+
+bool NavPane_Pin(const std::wstring& path, bool pin) {
+    const bool ok = pin ? Pins_AddOwn(path) : Pins_RemoveOwn(path);
+    NavPane_RefreshPinned(true);
+    return ok;
+}
 HWND NavPane_Create(HWND parent, UINT id, UINT msg, NavHost host) {
     g_parent = parent;
     g_msg = msg;
@@ -330,7 +414,11 @@ void NavPane_SetImageList(HIMAGELIST il) {
 }
 
 void NavPane_RefreshPinned(bool force) {
-    if (!g_tree || g_pinnedLoading) return;
+    if (!g_tree) return;
+    if (g_pinnedLoading) {
+        g_pinnedAgain |= force;
+        return;
+    }
     if (!force && GetTickCount64() - g_pinnedAt < 2000) return;
     g_pinnedLoading = true;
     g_pinnedAt = GetTickCount64();
@@ -339,7 +427,7 @@ void NavPane_RefreshPinned(bool force) {
         const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         r->folders = NavPane_ReadPinned();
         PIDLIST_ABSOLUTE p = nullptr;
-        if (SUCCEEDED(SHParseDisplayName(L"shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}", nullptr, &p, 0, nullptr))) {
+        if (SUCCEEDED(SHParseDisplayName(kQuickAccess, nullptr, &p, 0, nullptr))) {
             SHFILEINFOW sfi{};
             if (SHGetFileInfoW((LPCWSTR)p, 0, &sfi, sizeof sfi, SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_SMALLICON))
                 r->rootIcon = sfi.iIcon;
@@ -363,6 +451,11 @@ void NavPane_OnResult(LPARAM lp) {
     if (!g_tree) return;
     if (r->type == Result::Pinned) {
         g_pinnedLoading = false;
+        g_shownPins = r->folders;
+        if (g_pinnedAgain) {
+            g_pinnedAgain = false;
+            NavPane_RefreshPinned(true);
+        }
         const bool first = !TreeView_GetChild(g_tree, g_quick);
         SyncChildren(g_quick, r->folders, Kind::Pinned);
         SetIcon(g_quick, r->rootIcon);

@@ -41,15 +41,31 @@ void NavPane_RefreshDrives();
 // Relit l'Accès rapide (au plus une fois toutes les 2 s, sauf `force`).
 void NavPane_RefreshPinned(bool force = false);
 
+// Épingle propre à FastExplorer (pins.*), indépendante de Windows.
+enum class NavPin {
+    None,     // pas dans l'Accès rapide (ou seulement parmi les dossiers par défaut)
+    Windows,  // épinglé dans l'Accès rapide de Windows
+    Own,      // épinglé dans FastExplorer
+};
+NavPin NavPane_PinOf(const std::wstring& path);
+// Épingle / retire dans FastExplorer puis rafraîchit le volet ; false si échec.
+bool NavPane_Pin(const std::wstring& path, bool pin);
+
 // ── Lectures (n'importe quel thread ; utilisées par le volet et les tests) ──
 struct NavFolder {
     std::wstring text;  // nom affiché
     std::wstring path;
     int icon = -1;      // icône système, -1 = dossier ordinaire
     bool hasChildren = true;
+    NavPin pin = NavPin::None;
 };
-// Dossiers épinglés de l'Accès rapide (COM initialisé).
-std::vector<NavFolder> NavPane_ReadPinned();
+// Contenu de l'Accès rapide (COM initialisé), dans cet ordre :
+//   1. les épingles de Windows ; si son Accès rapide ne répond pas (Explorateur
+//      désactivé, Windows allégé, stratégie…), leur dernière copie connue ;
+//   2. les épingles de FastExplorer qui n'y sont pas déjà ;
+//   3. si rien de tout ça : Bureau, Téléchargements, Documents, Images, Musique, Vidéos.
+// useShell = false : comme si l'Accès rapide de Windows ne répondait pas (tests).
+std::vector<NavFolder> NavPane_ReadPinned(bool useShell = true);
 // Sous-dossiers d'un dossier, dans l'ordre de l'Explorateur (sans les dossiers
 // protégés du système, cachés ET système). "" = lecteurs de Ce PC.
 std::vector<NavFolder> NavPane_ReadChildren(const std::wstring& path);
