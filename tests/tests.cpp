@@ -9,6 +9,7 @@
 #include "icons.h"
 #include "jobs.h"
 #include "listing.h"
+#include <shlwapi.h>
 #include "crumbs.h"
 #include "navpane.h"
 #include "pins.h"
@@ -666,7 +667,20 @@ void TestViewPrefs() {
     RemoveTree(nav);
 }
 
-void TestFastCopy() {    const std::wstring base = Join(g_root, L"fast");
+void TestSelectionText() {
+    CHECK_STR(SelectionText(0, false, 0), L"");
+    CHECK_STR(SelectionText(1, true, 0), L"1 élément sélectionné");          // dossier : pas de taille
+    CHECK_STR(SelectionText(3, true, 5000), L"3 éléments sélectionnés");     // mélange : pas de taille
+    CHECK_STR(SelectionText(2, false, 5000, false), L"2 éléments sélectionnés");  // lecteurs : jamais
+    wchar_t b[64];
+    StrFormatByteSizeEx(4740000, SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, b, _countof(b));  // format de la machine
+    CHECK_STR(SelectionText(3, false, 4740000), std::wstring(L"3 éléments sélectionnés  ") + b);
+    StrFormatByteSizeEx(0, SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, b, _countof(b));
+    CHECK_STR(SelectionText(1, false, 0), std::wstring(L"1 élément sélectionné  ") + b);  // fichier vide
+}
+
+void TestFastCopy() {
+    const std::wstring base = Join(g_root, L"fast");
     const std::wstring src = Join(base, L"src"), dst = Join(base, L"dst");
     CreateDirectoryW(base.c_str(), nullptr);
     CreateDirectoryW(src.c_str(), nullptr);
@@ -997,6 +1011,7 @@ int wmain() {
     TestPins();
     TestCrumbs();
     TestViewPrefs();
+    TestSelectionText();
     TestFastCopy();
     TestFileOps();
     TestDrop();

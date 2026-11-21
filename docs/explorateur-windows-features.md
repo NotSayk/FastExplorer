@@ -31,7 +31,7 @@ De haut en bas :
 | **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accès rapide épinglé + arborescence de Ce PC, séparateur ; Accueil, Galerie, Réseau, Linux à venir) |
 | **Zone de contenu** | La liste des éléments | ✅ P0 |
 | **Volet d'aperçu / de détails** (droite) | Aperçu du fichier, ou métadonnées | P1 |
-| **Barre d'état** (bas) | Nombre d'éléments, nombre et taille de la sélection, boutons Détails / Grandes icônes | ✅🟡 P0 |
+| **Barre d'état** (bas) | Nombre d'éléments, nombre et taille de la sélection, boutons Détails / Grandes icônes | ✅🟡 P0 (trois zones : contenu du dossier, sélection, temps de lecture ; boutons d'affichage à venir avec les autres vues) |
 
 ⚙️ Chaque volet se masque ou s'affiche via **Afficher ▸ Afficher**. L'état est mémorisé globalement.
 
@@ -201,7 +201,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Cases à cocher | Option d'affichage | P2 |
 | Déplacer le focus sans sélectionner | Ctrl+flèches, puis Ctrl+Espace pour (dé)sélectionner | ✅ (natif) |
 | **Recherche par frappe** | Taper le début d'un nom ; option alternative : « Taper dans la zone de recherche » | ✅ |
-| Résumé de sélection | Barre d'état : « 3 éléments sélectionnés, 12,4 Mo » | P0 |
+| Résumé de sélection | Barre d'état : « 3 éléments sélectionnés, 12,4 Mo » | ✅ P0 (taille seulement sans dossier sélectionné, comme l'Explorateur ; un seul calcul par rafale de changements) |
 
 ---
 
@@ -607,7 +607,7 @@ Regroupement des **P0** pour remplacer l'Explorateur au quotidien, dans un ordre
 5. ✅ **Volet de navigation** : dossiers épinglés + arborescence de Ce PC ; libellés et jauges des lecteurs.
 6. ✅ **Fil d'Ariane** dans la barre d'adresse.
 7. ✅ **Affichage** : éléments cachés et système, masquage des extensions (en respectant les préférences de l'utilisateur).
-8. **Barre d'état** : résumé de la sélection (nombre, taille).
+8. ✅ **Barre d'état** : résumé de la sélection (nombre, taille).
 9. **Recherche** dans le dossier courant (puis l'index MFT en P1 ⭐).
 
 Puis les **P1** : onglets, annuler/rétablir, aperçu, miniatures, taille des dossiers ⭐, double panneau ⭐,

@@ -6,10 +6,12 @@
 
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <winnetwk.h>
 
 #pragma comment(lib, "mpr")
 #pragma comment(lib, "advapi32")
+#pragma comment(lib, "shlwapi")
 
 #include <algorithm>
 #include <cstring>
@@ -223,6 +225,19 @@ void Enumerate(DirData& d, const CancelToken& ct) {
         BuildSortKeys(d);
         d.keyMs = NowMs() - t1;
     }
+}
+
+std::wstring SelectionText(size_t count, bool anyDir, uint64_t bytes, bool withSize) {
+    if (!count) return {};
+    wchar_t s[160];
+    swprintf_s(s, count > 1 ? L"%zu éléments sélectionnés" : L"%zu élément sélectionné", count);
+    std::wstring out = s;
+    if (withSize && !anyDir) {
+        wchar_t b[64];
+        if (SUCCEEDED(StrFormatByteSizeEx(bytes, SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, b, _countof(b))))
+            out += std::wstring(L"  ") + b;
+    }
+    return out;
 }
 
 ViewPrefs ReadViewPrefs() {

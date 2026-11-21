@@ -68,6 +68,11 @@ bool IsGoneError(DWORD err);
 // existant (jusqu'à Ce PC) ; d.vanished garde alors le chemin demandé.
 void EnumerateNearest(DirData& d, const CancelToken& ct = {});
 
+// Résumé d'une sélection pour la barre d'état, comme l'Explorateur :
+// « 3 éléments sélectionnés  4,52 Mo » ; taille seulement s'il n'y a que des
+// fichiers (withSize = false : jamais, p. ex. lecteurs de Ce PC). "" si rien.
+std::wstring SelectionText(size_t count, bool anyDir, uint64_t bytes, bool withSize = true);
+
 // Préférences d'affichage de l'Explorateur (communes avec lui).
 struct ViewPrefs {
     bool showHidden = true;        // éléments cachés

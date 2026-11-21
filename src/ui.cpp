@@ -48,6 +48,7 @@ constexpr UINT WM_APP_REEDIT = WM_APP + 6;      // renommage refusé : on rouvre
 constexpr UINT WM_APP_RECLAIM = WM_APP + 7;     // reprendre le premier plan au moteur de copie
 constexpr UINT WM_APP_SHELLNOTIFY = WM_APP + 8; // lecteur ou média ajouté / retiré (SHChangeNotifyRegister)
 constexpr UINT WM_APP_NAV = WM_APP + 9;         // résultat d'une lecture du volet de navigation
+constexpr UINT WM_APP_SELSUM = WM_APP + 10;     // sélection changée : résumé dans la barre d'état (une fois par rafale)
 constexpr UINT_PTR TIMER_LOADING = 1;
 constexpr UINT_PTR TIMER_WATCH = 2;
 constexpr UINT_PTR TIMER_AFTEROP = 3;
@@ -174,7 +175,16 @@ int EntryAt(int row) { return (row >= 0 && row < RowCount()) ? (int)g_view.order
 const Entry& E(int idx) { return g_view.data->entries[idx]; }
 const wchar_t* NameOf(int idx) { return g_view.data->name(E(idx)); }
 
-void SetStatus(const std::wstring& s) { SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)s.c_str()); }
+// Barre d'état : 0 = contenu du dossier et messages, 1 = sélection, 2 = temps de lecture.
+enum { SB_MAIN, SB_SEL, SB_PERF };
+void SetStatus(const std::wstring& s) { SendMessageW(g_status, SB_SETTEXTW, SB_MAIN, (LPARAM)s.c_str()); }
+void SetStatusPart(int part, const std::wstring& s) { SendMessageW(g_status, SB_SETTEXTW, part, (LPARAM)s.c_str()); }
+
+bool g_selPosted = false;
+void ScheduleSelectionSummary() {
+    if (g_selPosted || !g_hwnd) return;
+    g_selPosted = PostMessageW(g_hwnd, WM_APP_SELSUM, 0, 0) != 0;
+}
 
 // Ouvre un fichier avec son application associée (comme un double-clic dans l'Explorateur).
 void OpenWithShell(const std::wstring& full) {
@@ -194,13 +204,17 @@ void ShowSummary() {
     const size_t shown = g_view.order.size(), hidden = d.entries.size() - shown;
     wchar_t masked[64] = L"";
     if (hidden) swprintf_s(masked, L", %zu masqué%s", hidden, hidden > 1 ? L"s" : L"");
-    int k = swprintf_s(s, L"%zu éléments  (%zu dossiers, %zu fichiers%s)   •   lecture %.2f ms, clés %.2f ms, tri %.2f ms",
-                       shown, dirs, shown - dirs, masked, d.enumMs, d.keyMs, g_view.sortMs);
+    swprintf_s(s, L"%zu élément%s  (%zu dossier%s, %zu fichier%s%s)", shown, shown > 1 ? L"s" : L"", dirs,
+               dirs > 1 ? L"s" : L"", shown - dirs, shown - dirs > 1 ? L"s" : L"", masked);
+    SetStatus(g_goneNote.empty() ? std::wstring(s) : g_goneNote + L"   •   " + s);
+    wchar_t perf[160];
+    int k = swprintf_s(perf, L"lecture %.2f ms, clés %.2f ms, tri %.2f ms", d.enumMs, d.keyMs, g_view.sortMs);
     if (g_startupMs > 0 && k > 0) {
-        swprintf_s(s + k, _countof(s) - k, L"   •   démarrage %.0f ms", g_startupMs);
+        swprintf_s(perf + k, _countof(perf) - k, L"  •  démarrage %.0f ms", g_startupMs);
         g_startupMs = 0;  // affiché une seule fois
     }
-    SetStatus(g_goneNote.empty() ? std::wstring(s) : g_goneNote + L"   •   " + s);
+    SetStatusPart(SB_PERF, perf);
+    ScheduleSelectionSummary();
 }
 
 void UpdateButtons() {
@@ -572,6 +586,24 @@ void SortView() {
         auto* r = new Result{ct.gen, JobKind::Sort, data, std::move(order), NowMs() - t};
         Post(r);
     });
+}
+
+// « 3 éléments sélectionnés  4,52 Mo ». Une seule fois par rafale de
+// changements (Ctrl+A sur 100 000 éléments : un seul parcours).
+void ShowSelectionSummary() {
+    g_selPosted = false;
+    if (!HasView()) return SetStatusPart(SB_SEL, L"");
+    size_t count = 0;
+    bool anyDir = false;
+    uint64_t bytes = 0;
+    for (int r = -1; (r = ListView_GetNextItem(g_list, r, LVNI_SELECTED)) >= 0;) {
+        const int e = EntryAt(r);
+        if (e < 0) continue;
+        ++count;
+        if (E(e).isDir()) anyDir = true;
+        else bytes += E(e).size;
+    }
+    SetStatusPart(SB_SEL, SelectionText(count, anyDir, bytes, !g_view.data->isRoot()));
 }
 
 // Préférences d'affichage changées (ici, dans l'Explorateur ou les options des dossiers).
@@ -1449,6 +1481,11 @@ void Layout() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
     SendMessageW(g_status, WM_SIZE, 0, 0);
+    {  // zones de la barre d'état : sélection et temps de lecture à droite
+        const int perfW = S(340), selW = S(260);
+        int parts[3] = {std::max(S(120), (int)rc.right - perfW - selW), std::max(S(240), (int)rc.right - perfW), -1};
+        SendMessageW(g_status, SB_SETPARTS, 3, (LPARAM)parts);
+    }
     RECT rs;
     GetWindowRect(g_status, &rs);
     const int statusH = rs.bottom - rs.top;
@@ -1691,6 +1728,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (hdr->hwndFrom != g_list) break;
             switch (hdr->code) {
                 case LVN_GETDISPINFOW: FillDispInfo(((NMLVDISPINFOW*)lp)->item); return 0;
+                case LVN_ITEMCHANGED:
+                    if ((((NMLISTVIEW*)lp)->uChanged & LVIF_STATE) &&
+                        ((((NMLISTVIEW*)lp)->uNewState ^ ((NMLISTVIEW*)lp)->uOldState) & LVIS_SELECTED))
+                        ScheduleSelectionSummary();
+                    return 0;
+                case LVN_ODSTATECHANGED: ScheduleSelectionSummary(); return 0;  // plage (Maj+clic, Ctrl+A)
                 case NM_CUSTOMDRAW: return OnListCustomDraw((NMLVCUSTOMDRAW*)lp);
                 case LVN_ODFINDITEMW: return FindItem((NMLVFINDITEMW*)lp);
                 case LVN_COLUMNCLICK: Resort(((NMLISTVIEW*)lp)->iSubItem); return 0;
@@ -1703,6 +1746,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case WM_APP_RESULT: OnResult((Result*)lp); return 0;
+        case WM_APP_SELSUM: ShowSelectionSummary(); return 0;
         case WM_DESTROY:
             g_target.store(nullptr);
             Icons_Stop();
