@@ -3,6 +3,7 @@
 
 #include "win.h"
 
+#include "columns.h"
 #include "dragdrop.h"
 #include "fastcopy.h"
 #include "fileops.h"
@@ -24,10 +25,12 @@
 #include <objbase.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <propkey.h>
 #include "paths.h"
 #include "util.h"
 
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -365,6 +368,45 @@ void TestVolumeIndex() {
         bool trunc = false;
         CHECK(Index_Search(q, hits, trunc) == IndexStatus::Unavailable);
     }
+}
+
+void TestColumns() {
+    // Attributs, comme l'Explorateur.
+    CHECK(AttrText(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE) == L"RHA");
+    CHECK(AttrText(FILE_ATTRIBUTE_DIRECTORY) == L"D");
+    CHECK(AttrText(FILE_ATTRIBUTE_NORMAL).empty());
+
+    // Dates de création et d'accès lues avec le dossier.
+    DirData d;
+    d.path = g_root;
+    Enumerate(d);
+    bool dates = !d.entries.empty();
+    for (const Entry& e : d.entries) dates &= e.ctime > 0 && e.atime > 0;
+    CHECK(dates);
+    CHECK(SortOrder(d, COL_CTIME, true).size() == SortOrder(d, COL_NAME, true).size());
+
+    // Tri sur une propriété : sans valeur d'abord, nombres par valeur, texte en ordre naturel.
+    DirData p;
+    for (const wchar_t* n : {L"a", L"b", L"c", L"d"}) DirData_Add(p, n, 1, 0, 1, 0);
+    DirData_BuildKeys(p);
+    PropValues pv;
+    pv.Reset(4);
+    pv.text = {L"x10", L"", L"x9", L"x2"};
+    auto byText = Names(p, SortOrder(p, COL_PROP, true, {}, {}, nullptr, &pv));
+    CHECK((byText == std::vector<std::wstring>{L"b", L"d", L"c", L"a"}));
+    pv.text = {L"1 Mo", L"3 Ko", L"", L"2 Mo"};
+    pv.num = {1e6, 3e3, std::numeric_limits<double>::quiet_NaN(), 2e6};
+    auto byNum = Names(p, SortOrder(p, COL_PROP, false, {}, {}, nullptr, &pv));
+    CHECK((byNum == std::vector<std::wstring>{L"d", L"a", L"b", L"c"}));
+
+    // Identifiants de colonnes (mémoire des affichages).
+    ColSpec c;
+    CHECK(Columns_FromId(L"ctime", c) && c.key == COL_CTIME && Columns_Id(c) == L"ctime");
+    const ColSpec author = Columns_Prop(PKEY_Author);
+    CHECK(author.key == COL_PROP && !author.title.empty());
+    CHECK(Columns_FromId(Columns_Id(author), c) && SameCol(c, author));
+    CHECK(Columns_Prop(PKEY_Size).key == COL_SIZE);  // propriété déjà fournie par la lecture du dossier
+    CHECK(!Columns_FromId(L"inconnue", c));
 }
 
 void TestSearchFilters() {
@@ -1335,6 +1377,7 @@ int wmain() {
     TestFolderSize();
     TestVolumeIndex();
     TestSearchFilters();
+    TestColumns();
     TestEdgeCases();
     TestLongPath();
     TestParallelMatchesSequential();

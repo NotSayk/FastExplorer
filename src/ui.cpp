@@ -6,6 +6,7 @@
 
 #include "ui.h"
 
+#include "columns.h"
 #include "dragdrop.h"
 #include "fileops.h"
 #include "foldersize.h"
@@ -58,6 +59,8 @@ constexpr UINT WM_APP_TABEDIT = WM_APP + 11;    // Tab pendant un renommage : re
 constexpr UINT WM_APP_CMDFAIL = WM_APP + 12;    // commande tapée dans la barre d'adresse impossible (lParam = std::wstring*)
 constexpr UINT WM_APP_DIRSIZE = WM_APP + 14;    // taille d'un dossier calculée (lParam = DirSizeResult*)
 constexpr UINT WM_APP_THUMB = WM_APP + 16;      // miniature lue (lParam = ThumbResult*)
+constexpr UINT WM_APP_PROPS = WM_APP + 17;      // propriétés lues (lParam = PropResult*)
+constexpr UINT WM_APP_SAVEVIEW = WM_APP + 18;   // colonne redimensionnée ou déplacée : mémoriser l'affichage du dossier
 constexpr UINT WM_APP_INDEXDONE = WM_APP + 15;  // service de recherche installé / retiré (wParam = code, lParam = 1 : installé)
 constexpr UINT ID_SYS_INDEX = 0x0100;           // menu de la fenêtre : activer / désactiver la recherche instantanée
 constexpr UINT WM_APP_TESTDPI = WM_APP + 13;    // tests : comme WM_DPICHANGED (wParam = nouvelle échelle), que Windows
@@ -90,6 +93,15 @@ struct Result {
     double sortMs = 0;
 };
 
+// Affichage d'un dossier : mode, colonnes (dans l'ordre affiché), tri.
+struct FolderView {
+    int mode = 0;  // ViewMode
+    int px = 96;   // taille des icônes (mode icônes)
+    std::vector<ColSpec> cols = Columns_Default();
+    ColSpec sort = Columns_Builtin(COL_NAME);
+    bool asc = true;
+};
+
 // Navigation demandée mais pas encore affichée.
 struct Pending {
     bool active = false;
@@ -105,6 +117,7 @@ struct Pending {
     size_t steps = 1;               // Précédent / Suivant : pas d'historique franchis (liste déroulante)
     std::wstring command;           // barre d'adresse : si ce n'est pas un dossier, lancer ceci (« cmd », « wt »…)
     int top = -1;                   // retour sur un onglet : première ligne visible à rétablir
+    std::optional<FolderView> view; // autre dossier : son affichage mémorisé, appliqué avec le résultat
 };
 
 enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
@@ -124,6 +137,7 @@ struct View {
     std::vector<uint64_t> dirBytes; // taille calculée des dossiers (par index d'entrée)
     std::vector<uint8_t> dirState;  // SIZE_* (combinables)
     std::vector<int32_t> thumb;     // modes icônes : place de la miniature (THUMB_* si négatif)
+    std::vector<std::pair<PROPERTYKEY, PropValues>> props;  // colonnes de propriétés : valeurs lues
     uint64_t serial = 0;            // identifie la vue auprès du thread d'icônes
     double sortMs = 0;
 };
@@ -149,7 +163,8 @@ View g_view;
 std::wstring g_path;
 Pending g_pending;
 std::vector<std::wstring> g_back, g_fwd;
-int g_sortCol = COL_NAME;
+ColSpec g_sort = Columns_Builtin(COL_NAME);  // colonne de tri (même si elle n'est pas affichée)
+std::vector<ColSpec> g_cols = Columns_Default();  // sous-élément i du ListView = g_cols[i]
 bool g_sortAsc = true;
 std::unordered_map<std::wstring, int> g_iconCache;
 ViewPrefs g_prefs;              // éléments cachés, extensions : réglages de l'Explorateur
@@ -288,14 +303,23 @@ void UpdateButtons() {
     EnableWindow(g_btnUp, HasView() && !g_path.empty());
 }
 
+// Sous-élément affichant cette colonne (-1 : pas affichée).
+int ColIndex(const ColSpec& c) {
+    for (size_t i = 0; i < g_cols.size(); ++i)
+        if (SameCol(g_cols[i], c)) return (int)i;
+    return -1;
+}
+int ColIndex(int key) { return key == COL_PROP ? -1 : ColIndex(Columns_Builtin(key)); }
+
 void UpdateSortArrow() {
     HWND hdr = ListView_GetHeader(g_list);
-    for (int i = 0; i < COL_COUNT; ++i) {
+    const int sorted = ColIndex(g_sort);
+    for (int i = 0; i < (int)g_cols.size(); ++i) {
         HDITEMW hi{};
         hi.mask = HDI_FORMAT;
         Header_GetItem(hdr, i, &hi);
         hi.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
-        if (i == g_sortCol) hi.fmt |= g_sortAsc ? HDF_SORTUP : HDF_SORTDOWN;
+        if (i == sorted) hi.fmt |= g_sortAsc ? HDF_SORTUP : HDF_SORTDOWN;
         Header_SetItem(hdr, i, &hi);
     }
 }
@@ -504,7 +528,7 @@ void OnDirSize(DirSizeResult* raw) {
     g_view.dirState[e] = SIZE_KNOWN | (r->size.complete ? 0 : SIZE_PARTIAL);
     if (const int row = g_view.rowOf[e]; row >= 0) ListView_RedrawItems(g_list, row, row);
     if (ListView_GetItemState(g_list, g_view.rowOf[e], LVIS_SELECTED) & LVIS_SELECTED) ScheduleSelectionSummary();
-    if (g_sizeWaiting && --g_sizeWaiting == 0 && g_sortCol == COL_SIZE) SortView();  // tout est mesuré : on retrie
+    if (g_sizeWaiting && --g_sizeWaiting == 0 && g_sort.key == COL_SIZE) SortView();  // tout est mesuré : on retrie
 }
 
 // ───────────────────────────── Modes d'affichage ─────────────────────────────
@@ -522,6 +546,10 @@ uint32_t g_bigOverlays = 0;           // surimpressions déjà déclarées (bits
 int g_wheelAcc = 0;                   // Ctrl+molette : crans partiels (pavés tactiles)
 constexpr int kZoomPx[] = {32, 48, 64, 96, 128, 192, 256};
 
+bool g_frozen = false;                // liste gelée par OnResult : ne pas la redessiner en cours de route
+void ListRedraw(bool on) {
+    if (!g_frozen) SendMessageW(g_list, WM_SETREDRAW, on, 0);
+}
 bool g_compact = true;                // mode compact : lignes serrées (sinon espacées, comme l'Explorateur)
 
 // Modes qui utilisent g_bigList : icônes, mosaïques, contenu.
@@ -698,11 +726,8 @@ int BigImage(int idx, int sysIcon) {
     return th >= 0 ? th : SysSlot(sysIcon);
 }
 
-void SaveViewMode() {
-    const DWORD mode = (DWORD)g_viewMode, px = (DWORD)g_iconPx;
-    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"ViewMode", REG_DWORD, &mode, sizeof mode);
-    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"IconPx", REG_DWORD, &px, sizeof px);
-}
+void SaveFolderView();
+void SaveViewMode() { SaveFolderView(); }  // le mode est mémorisé pour le dossier affiché
 
 // Mosaïques et contenu : taille des cases. Contenu = une case par ligne, sur toute la largeur.
 void ApplyTileInfo() {
@@ -758,7 +783,7 @@ void ApplyViewMode(int mode, int px96, bool save = true) {
     g_viewMode = mode;
     if (px96) g_iconPx = std::clamp(px96, 32, 256);
     const int focus = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED);
-    SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
+    ListRedraw(false);
     ApplyRowSpacing();
     if (BigMode()) {
         if (!g_bigList || g_bigPx != S(BigPx96())) ResetBigList();
@@ -770,7 +795,7 @@ void ApplyViewMode(int mode, int px96, bool save = true) {
     ListView_SetView(g_list, kViews[mode]);
     ApplyTileInfo();
     if (focus >= 0) ListView_EnsureVisible(g_list, focus, FALSE);
-    SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
+    ListRedraw(true);
     InvalidateRect(g_list, nullptr, TRUE);
     if (save) SaveViewMode();
 }
@@ -819,6 +844,10 @@ void ViewByKey(int k) {
     }
 }
 
+void ChooseColumns();
+void ApplyViewToAll();
+void ResetFolderView();
+
 MenuExtra ViewMenu() {
     MenuExtra m;
     m.text = L"Affichage";
@@ -832,8 +861,79 @@ MenuExtra ViewMenu() {
              {L"Mosaïques\tCtrl+Maj+7", [] { ViewByKey(7); }, false, g_viewMode == VM_TILES},
              {L"Contenu\tCtrl+Maj+8", [] { ViewByKey(8); }, false, g_viewMode == VM_CONTENT},
              {},
-             {L"Mode compact", [] { SetCompact(!g_compact); }, false, g_compact}};
+             {L"Mode compact", [] { SetCompact(!g_compact); }, false, g_compact},
+             {},
+             {L"Choisir les colonnes…", [] { ChooseColumns(); }},
+             {L"Appliquer à tous les dossiers", [] { ApplyViewToAll(); }},
+             {L"Réinitialiser l'affichage de ce dossier", [] { ResetFolderView(); }}};
     return m;
+}
+// ───────────────────────────── Colonnes de propriétés ─────────────────────────────
+
+// Valeurs d'une propriété pour la vue (créées vides à la première demande).
+PropValues* PropsOf(const PROPERTYKEY& pk) {
+    if (!HasView()) return nullptr;
+    for (auto& [k, v] : g_view.props)
+        if (IsEqualPropertyKey(k, pk)) return &v;
+    g_view.props.emplace_back(pk, PropValues{});
+    g_view.props.back().second.Reset(g_view.data->entries.size());
+    return &g_view.props.back().second;
+}
+
+std::vector<uint8_t> g_propSortWait;  // tri sur une propriété : entrées dont on attend la valeur
+size_t g_propWaiting = 0;
+
+// Lit les propriétés manquantes d'une entrée (colonnes affichées, et colonne de tri).
+void RequestRowProps(int idx, bool urgent) {
+    std::vector<PROPERTYKEY> keys;
+    auto want = [&](const PROPERTYKEY& pk) {
+        PropValues* pv = PropsOf(pk);
+        if (!pv || pv->state[idx] != 0) return;
+        pv->state[idx] = 1;
+        keys.push_back(pk);
+    };
+    for (const ColSpec& c : g_cols)
+        if (c.key == COL_PROP) want(c.pk);
+    if (g_sort.key == COL_PROP) want(g_sort.pk);
+    if (keys.empty()) return;
+    constexpr uint32_t kNotLocal =
+        FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE;
+    Props_Request(g_view.serial, (uint32_t)idx, Join(g_path, NameOf(idx)), !(E(idx).attr & kNotLocal), std::move(keys),
+                  urgent);
+}
+
+// Tri sur une propriété : toutes les valeurs sont lues en arrière-plan, puis on retrie.
+void RequestSortProps() {
+    g_propWaiting = 0;
+    g_propSortWait.clear();
+    if (g_sort.key != COL_PROP || !HasView() || g_view.data->isRoot()) return;
+    PropValues* pv = PropsOf(g_sort.pk);
+    const size_t n = g_view.data->entries.size();
+    g_propSortWait.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (pv->state[i] == 2) continue;
+        g_propSortWait[i] = 1;
+        ++g_propWaiting;
+        if (pv->state[i] == 0) RequestRowProps((int)i, false);
+    }
+}
+
+void SortView();
+
+void OnProps(PropResult* raw) {
+    std::unique_ptr<PropResult> r(raw);
+    if (!HasView() || r->serial != g_view.serial || r->idx >= g_view.data->entries.size()) return;
+    for (size_t k = 0; k < r->keys.size(); ++k)
+        if (PropValues* pv = PropsOf(r->keys[k])) {
+            pv->text[r->idx] = std::move(r->text[k]);
+            pv->num[r->idx] = r->num[k];
+            pv->state[r->idx] = 2;
+        }
+    if (const int row = g_view.rowOf[r->idx]; row >= 0) ListView_RedrawItems(g_list, row, row);
+    if (g_propWaiting && r->idx < g_propSortWait.size() && g_propSortWait[r->idx]) {
+        g_propSortWait[r->idx] = 0;
+        if (--g_propWaiting == 0) SortView();  // tout est lu : on retrie
+    }
 }
 void FillDispInfo(LVITEMW& it) {
     const int idx = EntryAt(it.iItem);
@@ -863,15 +963,18 @@ void FillDispInfo(LVITEMW& it) {
         it.stateMask = LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED;
     }
     if (it.mask & LVIF_COLUMNS) {  // mosaïques, contenu : colonnes affichées sous le nom
-        static const UINT kTile[] = {COL_TYPE, COL_SIZE}, kContent[] = {COL_DATE, COL_SIZE, COL_TYPE};
-        const UINT* cols = g_viewMode == VM_CONTENT ? kContent : kTile;
-        const UINT n = g_viewMode == VM_CONTENT ? 3 : 2;
+        static UINT buf[3];
+        const int want[3] = {g_viewMode == VM_CONTENT ? COL_DATE : COL_TYPE, COL_SIZE,
+                             g_viewMode == VM_CONTENT ? COL_TYPE : -1};
+        UINT n = 0;
+        for (int k : want)
+            if (const int c = k >= 0 ? ColIndex(k) : -1; c > 0) buf[n++] = (UINT)c;
         if (it.puColumns) {  // tampon fourni par le ListView (cColumns = sa capacité)
             it.cColumns = std::min<UINT>(n, it.cColumns);
-            for (UINT i = 0; i < it.cColumns; ++i) it.puColumns[i] = cols[i];
+            for (UINT i = 0; i < it.cColumns; ++i) it.puColumns[i] = buf[i];
         } else {
             it.cColumns = n;
-            it.puColumns = (PUINT)cols;
+            it.puColumns = buf;
         }
         if ((it.mask & LVIF_COLFMT) && it.piColFmt)
             for (UINT i = 0; i < it.cColumns; ++i) it.piColFmt[i] = 0;
@@ -880,12 +983,14 @@ void FillDispInfo(LVITEMW& it) {
     wchar_t* out = it.pszText;
     const int cch = it.cchTextMax;
     out[0] = 0;
-    switch (it.iSubItem) {
+    if (it.iSubItem < 0 || it.iSubItem >= (int)g_cols.size()) return;
+    const bool root = g_view.data->isRoot();
+    switch (const ColSpec& col = g_cols[it.iSubItem]; col.key) {
         case COL_NAME:
             if (const DriveInfo* di = DriveOfEntry(idx))
                 wcsncpy_s(out, cch, DriveDisplayName(NameOf(idx), e.extra, *di).c_str(), _TRUNCATE);
             else {
-                const uint32_t hide = e.isDir() || g_view.data->isRoot()
+                const uint32_t hide = e.isDir() || root
                                           ? 0
                                           : HiddenExtLen(NameOf(idx), e.nameLen, e.extOff, g_prefs.showExtensions);
                 wcsncpy_s(out, cch, NameOf(idx), std::min<size_t>(e.nameLen - hide, (size_t)cch - 1));
@@ -903,7 +1008,7 @@ void FillDispInfo(LVITEMW& it) {
             } else if (st & SIZE_PENDING) wcsncpy_s(out, cch, L"…", _TRUNCATE);
             break;
         case COL_TYPE:
-            if (g_view.data->isRoot()) wcsncpy_s(out, cch, DriveTypeText(e.extra), _TRUNCATE);
+            if (root) wcsncpy_s(out, cch, DriveTypeText(e.extra), _TRUNCATE);
             else if (e.isDir()) wcsncpy_s(out, cch, L"Dossier de fichiers", _TRUNCATE);
             else if (e.extOff + 1 < e.nameLen) {
                 swprintf_s(out, cch, L"Fichier %s", NameOf(idx) + e.extOff + 1);
@@ -911,37 +1016,106 @@ void FillDispInfo(LVITEMW& it) {
             } else wcsncpy_s(out, cch, L"Fichier", _TRUNCATE);
             break;
         case COL_DATE:
-            if (!g_view.data->isRoot()) FormatDate(e.mtime, out, cch);  // Ce PC : jauge dessinée à la place
+            if (!root) FormatDate(e.mtime, out, cch);  // Ce PC : jauge dessinée à la place
+            break;
+        case COL_CTIME:
+            if (!root && e.ctime) FormatDate(e.ctime, out, cch);
+            break;
+        case COL_ATIME:
+            if (!root && e.atime) FormatDate(e.atime, out, cch);
+            break;
+        case COL_ATTR:
+            if (!root) wcsncpy_s(out, cch, AttrText(e.attr).c_str(), _TRUNCATE);
+            break;
+        case COL_PROP:
+            if (root) break;
+            if (PropValues* pv = PropsOf(col.pk)) {
+                if (pv->state[idx] == 0) RequestRowProps(idx, true);  // ligne visible : lue en priorité
+                wcsncpy_s(out, cch, pv->text[idx].c_str(), _TRUNCATE);
+            }
             break;
     }
 }
 
-// Ce PC : en-têtes adaptés aux lecteurs, colonne d'espace libre assez large.
-void UpdateColumnsForView() {
-    static bool rootCols = false;
-    static int savedSizeW = 0;
-    const bool root = HasView() && g_view.data->isRoot();
-    if (root == rootCols) return;
-    rootCols = root;
-    const wchar_t* names[COL_COUNT] = {L"Nom", L"Taille", L"Type", L"Modifié le"};
-    if (root) {
-        names[COL_SIZE] = L"Espace libre";
-        names[COL_DATE] = L"Utilisation";
+// Ce PC : colonnes adaptées aux lecteurs (pas celles des dossiers).
+std::vector<ColSpec> RootColumns() {
+    std::vector<ColSpec> v = {Columns_Builtin(COL_NAME), Columns_Builtin(COL_SIZE), Columns_Builtin(COL_TYPE),
+                              Columns_Builtin(COL_DATE)};
+    v[1].title = L"Espace libre";
+    v[1].width96 = 200;
+    v[3].title = L"Utilisation";
+    return v;
+}
+
+bool g_applyingCols = false;  // colonnes reconstruites par le programme : rien à mémoriser
+std::vector<ColSpec> g_folderCols = Columns_Default();  // colonnes des dossiers (hors Ce PC), dans l'ordre affiché
+
+// Colonnes affichées, dans l'ordre de l'en-tête, avec leur largeur actuelle.
+std::vector<ColSpec> CurrentColumns() {
+    const int n = (int)g_cols.size();
+    std::vector<int> order(n);
+    for (int i = 0; i < n; ++i) order[i] = i;
+    if (n) ListView_GetColumnOrderArray(g_list, n, order.data());
+    std::vector<ColSpec> v;
+    for (int d = 0; d < n; ++d) {
+        const int i = order[d];
+        if (i < 0 || i >= n) continue;
+        ColSpec c = g_cols[i];
+        if (g_viewMode == VM_DETAILS) c.width96 = std::max(1, MulDiv(ListView_GetColumnWidth(g_list, i), 96, (int)g_dpi));
+        else  // hors Détails, le ListView ne donne pas les largeurs : celles mémorisées
+            for (const ColSpec& f : g_folderCols)
+                if (SameCol(f, c)) c.width96 = f.width96;
+        v.push_back(std::move(c));
     }
-    for (int i = 0; i < COL_COUNT; ++i) {
+    return v;
+}
+
+std::wstring ColumnsKey(const std::vector<ColSpec>& cols) {
+    std::wstring s;
+    for (const auto& c : cols) s += Columns_Id(c) + L":" + std::to_wstring(c.width96) + L":" + c.title + L",";
+    return s;
+}
+
+// Reconstruit les colonnes du ListView. `cols` : dans l'ordre d'affichage. Le
+// Nom reste le sous-élément 0 (le ListView ne sait pas supprimer la colonne 0,
+// et c'est elle qu'on renomme) ; l'ordre affiché passe par l'ordre des colonnes.
+void ApplyColumns(std::vector<ColSpec> cols) {
+    auto isName = [](const ColSpec& c) { return c.key == COL_NAME; };
+    if (std::none_of(cols.begin(), cols.end(), isName)) cols.insert(cols.begin(), Columns_Builtin(COL_NAME));
+    const int nameAt = (int)(std::find_if(cols.begin(), cols.end(), isName) - cols.begin());
+    std::vector<ColSpec> sub{cols[nameAt]};
+    for (int i = 0; i < (int)cols.size(); ++i)
+        if (i != nameAt) sub.push_back(cols[i]);
+    std::vector<int> order(cols.size());
+    for (int d = 0; d < (int)cols.size(); ++d) order[d] = d == nameAt ? 0 : 1 + (d < nameAt ? d : d - 1);
+
+    g_applyingCols = true;
+    ListRedraw(false);
+    HWND hdr = ListView_GetHeader(g_list);
+    for (int i = Header_GetItemCount(hdr); i-- > 1;) ListView_DeleteColumn(g_list, i);
+    for (int i = 0; i < (int)sub.size(); ++i) {
         LVCOLUMNW c{};
-        c.mask = LVCF_TEXT;
-        c.pszText = (LPWSTR)names[i];
-        ListView_SetColumn(g_list, i, &c);
+        c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM;
+        c.pszText = (LPWSTR)sub[i].title.c_str();
+        c.cx = S(sub[i].width96);
+        c.fmt = i > 0 && sub[i].right ? LVCFMT_RIGHT : LVCFMT_LEFT;
+        c.iSubItem = i;
+        if (i == 0 && Header_GetItemCount(hdr) > 0) ListView_SetColumn(g_list, 0, &c);
+        else ListView_InsertColumn(g_list, i, &c);
     }
-    const int w = ListView_GetColumnWidth(g_list, COL_SIZE);
-    if (root && w < S(200)) {
-        savedSizeW = w;
-        ListView_SetColumnWidth(g_list, COL_SIZE, S(200));
-    } else if (!root && savedSizeW) {
-        ListView_SetColumnWidth(g_list, COL_SIZE, savedSizeW);
-        savedSizeW = 0;
-    }
+    g_cols = std::move(sub);
+    ListView_SetColumnOrderArray(g_list, (int)order.size(), order.data());
+    UpdateSortArrow();
+    ListRedraw(true);
+    InvalidateRect(g_list, nullptr, TRUE);
+    g_applyingCols = false;
+}
+
+// Ce PC ↔ dossier : colonnes à changer ?
+void UpdateColumnsForView() {
+    const bool root = HasView() && g_view.data->isRoot();
+    const std::vector<ColSpec>& want = root ? RootColumns() : g_folderCols;
+    if (ColumnsKey(want) != ColumnsKey(CurrentColumns())) ApplyColumns(want);
 }
 
 // Ce PC : jauge d'occupation de chaque lecteur (rouge au-delà de 90 %, comme l'Explorateur).
@@ -953,8 +1127,9 @@ LRESULT OnListCustomDraw(NMLVCUSTOMDRAW* cd) {
         case CDDS_ITEMPOSTPAINT: {
             const int row = (int)cd->nmcd.dwItemSpec;
             const DriveInfo* di = DriveOfEntry(EntryAt(row));
+            const int col = ColIndex(COL_DATE);
             RECT r;
-            if (!di || !di->total || !ListView_GetSubItemRect(g_list, row, COL_DATE, LVIR_BOUNDS, &r)) break;
+            if (!di || !di->total || col < 1 || !ListView_GetSubItemRect(g_list, row, col, LVIR_BOUNDS, &r)) break;
             const int h = std::max(S(6), (int)(r.bottom - r.top) / 2);
             RECT bar{r.left + S(6), r.top + (r.bottom - r.top - h) / 2, r.right - S(6), 0};
             bar.bottom = bar.top + h;
@@ -976,7 +1151,226 @@ LRESULT OnListCustomDraw(NMLVCUSTOMDRAW* cd) {
     }
     return CDRF_DODEFAULT;
 }
+// ───────────────────────────── Affichage mémorisé par dossier ─────────────────────────────
+//
+// HKCU\Software\FastExplorer\Views : une valeur par dossier dont on a changé
+// l'affichage (chemin en minuscules ; « ::pc » pour Ce PC), et « Default » pour
+// tous les autres. Texte : « mode|px|tri|croissant|colonne:largeur,… ».
 
+constexpr wchar_t kViewsKey[] = L"Software\\FastExplorer\\Views";
+constexpr DWORD kViewsMax = 5000;  // au-delà, on oublie les plus anciens
+
+std::wstring ViewName(const std::wstring& path) {
+    if (path.empty()) return L"::pc";
+    std::wstring s = path;
+    CharLowerBuffW(s.data(), (DWORD)s.size());
+    return s;
+}
+
+std::wstring EncodeView(const FolderView& v) {
+    std::wstring s = std::to_wstring(v.mode) + L"|" + std::to_wstring(v.px) + L"|" + Columns_Id(v.sort) + L"|" +
+                     (v.asc ? L"1" : L"0") + L"|";
+    for (size_t i = 0; i < v.cols.size(); ++i) s += (i ? L"," : L"") + Columns_Id(v.cols[i]) + L":" + std::to_wstring(v.cols[i].width96);
+    return s;
+}
+
+std::vector<std::wstring> Split(const std::wstring& s, wchar_t sep) {
+    std::vector<std::wstring> v;
+    size_t a = 0;
+    for (size_t b; (b = s.find(sep, a)) != std::wstring::npos; a = b + 1) v.push_back(s.substr(a, b - a));
+    v.push_back(s.substr(a));
+    return v;
+}
+
+bool DecodeView(const std::wstring& s, FolderView& v) {
+    const auto f = Split(s, L'|');
+    if (f.size() != 5) return false;
+    FolderView r;
+    r.mode = _wtoi(f[0].c_str());
+    r.px = std::clamp(_wtoi(f[1].c_str()), 32, 256);
+    if (r.mode < VM_DETAILS || r.mode > VM_CONTENT) return false;
+    if (!Columns_FromId(f[2], r.sort)) r.sort = Columns_Builtin(COL_NAME);
+    r.asc = f[3] != L"0";
+    r.cols.clear();
+    for (const auto& c : Split(f[4], L',')) {
+        const size_t colon = c.rfind(L':');
+        ColSpec spec;
+        if (colon == std::wstring::npos || !Columns_FromId(c.substr(0, colon), spec)) continue;
+        spec.width96 = std::clamp(_wtoi(c.c_str() + colon + 1), 1, 2000);
+        r.cols.push_back(std::move(spec));
+    }
+    if (r.cols.empty()) r.cols = Columns_Default();
+    v = std::move(r);
+    return true;
+}
+
+bool ReadView(const std::wstring& name, FolderView& v) {
+    DWORD cb = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kViewsKey, name.c_str(), RRF_RT_REG_SZ, nullptr, nullptr, &cb) != ERROR_SUCCESS || !cb)
+        return false;
+    std::wstring s(cb / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, kViewsKey, name.c_str(), RRF_RT_REG_SZ, nullptr, s.data(), &cb) != ERROR_SUCCESS)
+        return false;
+    s.resize(wcsnlen(s.c_str(), s.size()));
+    return DecodeView(s, v);
+}
+
+void WriteView(const std::wstring& name, const FolderView& v) {
+    const std::wstring s = EncodeView(v);
+    RegSetKeyValueW(HKEY_CURRENT_USER, kViewsKey, name.c_str(), REG_SZ, s.c_str(), (DWORD)((s.size() + 1) * sizeof(wchar_t)));
+}
+
+FolderView DefaultView() {
+    FolderView v;
+    if (ReadView(L"Default", v)) return v;
+    // Avant la mémoire par dossier, seul le mode était gardé (pour tous les dossiers).
+    const DWORD mode = RegDword(L"Software\\FastExplorer", L"ViewMode", VM_DETAILS);
+    v.mode = mode <= VM_CONTENT ? (int)mode : VM_DETAILS;
+    v.px = std::clamp((int)RegDword(L"Software\\FastExplorer", L"IconPx", 96), 32, 256);
+    return v;
+}
+
+FolderView ViewFor(const std::wstring& path) {
+    FolderView v;
+    return ReadView(ViewName(path), v) ? v : DefaultView();
+}
+
+FolderView CurrentView() {
+    FolderView v;
+    v.mode = g_viewMode;
+    v.px = g_iconPx;
+    v.cols = HasView() && g_view.data->isRoot() ? g_folderCols : CurrentColumns();  // Ce PC : colonnes fixes
+    v.sort = g_sort;
+    v.asc = g_sortAsc;
+    return v;
+}
+
+// Trop de dossiers mémorisés : on repart des plus récents (l'ordre des valeurs du registre suit leur création).
+void PruneViews() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kViewsKey, 0, KEY_READ | KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
+    DWORD n = 0;
+    RegQueryInfoKeyW(k, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &n, nullptr, nullptr, nullptr, nullptr);
+    if (n > kViewsMax) {
+        std::vector<std::wstring> old;
+        wchar_t name[2048];
+        for (DWORD i = 0; i < n - kViewsMax * 4 / 5; ++i) {
+            DWORD cch = 2048;
+            if (RegEnumValueW(k, i, name, &cch, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+            if (wcscmp(name, L"Default") != 0) old.emplace_back(name);
+        }
+        for (const auto& s : old) RegDeleteValueW(k, s.c_str());
+    }
+    RegCloseKey(k);
+}
+
+void SaveFolderView() {
+    if (!HasView() || !g_list) return;
+    const FolderView v = CurrentView();
+    if (!g_view.data->isRoot()) g_folderCols = v.cols;
+    const std::wstring name = ViewName(g_path);
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, kViewsKey, name.c_str());  // réécrite à la fin : la plus récente
+    WriteView(name, v);
+    static int writes = 0;
+    if (++writes % 64 == 1) PruneViews();
+}
+
+void RequestSortProps();
+
+// Applique l'affichage d'un dossier (mode, colonnes, tri) ; le tri de la vue suit.
+void ApplyFolderView(const FolderView& v) {
+    g_folderCols = v.cols;
+    g_sort = v.sort;
+    g_sortAsc = v.asc;
+    ApplyViewMode(v.mode, v.px, false);
+    UpdateColumnsForView();
+    UpdateSortArrow();
+}
+
+void Flash(const std::wstring& msg);
+
+// L'affichage courant devient celui de tous les dossiers (les réglages propres à chacun sont oubliés).
+void ApplyViewToAll() {
+    FolderView v = CurrentView();
+    v.cols = g_view.data && g_view.data->isRoot() ? g_folderCols : v.cols;
+    RegDeleteTreeW(HKEY_CURRENT_USER, kViewsKey);
+    WriteView(L"Default", v);
+    Flash(L"Cet affichage s'applique maintenant à tous les dossiers");
+}
+
+// Retour à l'affichage par défaut pour ce dossier.
+void ResetFolderView() {
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, kViewsKey, ViewName(g_path).c_str());
+    ApplyFolderView(DefaultView());
+    RequestSortProps();
+    SortView();
+}
+// ───────────────────────────── Choix des colonnes ─────────────────────────────
+
+bool g_saveViewPosted = false;
+void PostSaveView() {  // regroupe les changements d'une même action (ex. : ajuster toutes les colonnes)
+    if (g_applyingCols || g_saveViewPosted || !HasView()) return;
+    g_saveViewPosted = true;
+    PostMessageW(g_hwnd, WM_APP_SAVEVIEW, 0, 0);
+}
+
+void SetFolderColumns(const std::vector<ColSpec>& cols) {
+    ApplyColumns(cols);
+    SaveFolderView();
+    if (g_viewMode == VM_TILES || g_viewMode == VM_CONTENT) InvalidateRect(g_list, nullptr, TRUE);
+}
+
+// Ajuster toutes les colonnes à leur contenu (Ctrl+pavé numérique +).
+void FitColumns() {
+    if (g_viewMode != VM_DETAILS) return;
+    for (int i = 0; i < (int)g_cols.size(); ++i) {
+        ListView_SetColumnWidth(g_list, i, LVSCW_AUTOSIZE);
+        const int content = ListView_GetColumnWidth(g_list, i);
+        const int header = ListView_GetStringWidth(g_list, g_cols[i].title.c_str()) + S(24);
+        ListView_SetColumnWidth(g_list, i, std::max(content, header));
+    }
+}
+
+void ChooseColumns() {
+    auto cols = CurrentColumns();
+    if (Columns_ChooseDialog(g_hwnd, cols)) SetFolderColumns(cols);
+}
+
+// Clic droit sur l'en-tête : colonnes usuelles à cocher, « Plus… ».
+void ShowHeaderMenu(POINT pt) {
+    if (!HasView()) return;
+    const bool root = g_view.data->isRoot();  // Ce PC : colonnes fixes
+    std::vector<ColSpec> items = Columns_Common();
+    for (const ColSpec& c : g_cols)
+        if (c.key == COL_PROP && std::none_of(items.begin(), items.end(), [&](const ColSpec& x) { return SameCol(x, c); }))
+            items.push_back(c);
+    constexpr UINT kFit = 900, kMore = 901, kReset = 902;
+    HMENU m = CreatePopupMenu();
+    if (!root) {
+        AppendMenuW(m, MF_STRING | MF_CHECKED | MF_GRAYED, 0, L"Nom");
+        for (size_t i = 0; i < items.size(); ++i)
+            AppendMenuW(m, MF_STRING | (ColIndex(items[i]) >= 0 ? MF_CHECKED : 0), 1 + (UINT)i, items[i].title.c_str());
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    }
+    AppendMenuW(m, MF_STRING, kFit, L"Ajuster toutes les colonnes\tCtrl+Num +");
+    if (!root) {
+        AppendMenuW(m, MF_STRING, kReset, L"Colonnes par défaut");
+        AppendMenuW(m, MF_STRING, kMore, L"Plus…");
+    }
+    const UINT cmd = (UINT)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, nullptr);
+    DestroyMenu(m);
+    if (cmd == kFit) FitColumns();
+    else if (cmd == kMore) ChooseColumns();
+    else if (cmd == kReset) SetFolderColumns(Columns_Default());
+    else if (cmd >= 1 && cmd <= items.size()) {
+        auto cols = CurrentColumns();
+        const ColSpec& c = items[cmd - 1];
+        auto it = std::find_if(cols.begin(), cols.end(), [&](const ColSpec& x) { return SameCol(x, c); });
+        if (it != cols.end()) cols.erase(it);
+        else cols.push_back(c);
+        SetFolderColumns(cols);
+    }
+}
 // Marque les éléments coupés de la vue courante.
 void ApplyCutMarks() {
     const size_t n = HasView() ? g_view.data->entries.size() : 0;
@@ -1063,7 +1457,7 @@ bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, co
     // les premiers résultats (au-delà, la liste reste utilisable sans elles).
     struct Info {
         uint64_t size = 0;
-        int64_t mtime = 0;
+        int64_t mtime = 0, ctime = 0, atime = 0;
         uint32_t attr = 0;
         bool ok = false;
     };
@@ -1076,9 +1470,9 @@ bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, co
             WIN32_FILE_ATTRIBUTE_DATA fa;
             if (!GetFileAttributesExW(ToNtPath(Join(d.path, hits[i].path.c_str())).c_str(), GetFileExInfoStandard, &fa))
                 continue;
-            info[i] = {((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow,
-                       (int64_t)(((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime),
-                       fa.dwFileAttributes, true};
+            auto ft = [](const FILETIME& f) { return (int64_t)(((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime); };
+            info[i] = {((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow, ft(fa.ftLastWriteTime), ft(fa.ftCreationTime),
+                       ft(fa.ftLastAccessTime), fa.dwFileAttributes, true};
         }
     };
     std::vector<std::thread> th;
@@ -1093,7 +1487,7 @@ bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, co
         if ((spec.sized() || spec.dated()) &&
             (!x.ok || !spec.Accept(hits[i].path.c_str(), (uint32_t)hits[i].path.size(), attr, x.size, x.mtime)))
             continue;
-        DirData_Add(d, hits[i].path.c_str(), (uint32_t)hits[i].path.size(), attr, x.size, x.mtime);
+        DirData_Add(d, hits[i].path.c_str(), (uint32_t)hits[i].path.size(), attr, x.size, x.mtime, x.ctime, x.atime);
     }
     d.truncated = truncated;
     d.fromIndex = true;
@@ -1121,7 +1515,7 @@ void SearchAllDrives(DirData& d, const std::wstring& q, const ViewPrefs& prefs, 
         for (const Entry& e : one.entries) {
             if (d.entries.size() >= kSearchMaxResults) { d.truncated = true; break; }
             const std::wstring full = Join(root, one.name(e));
-            DirData_Add(d, full.c_str(), (uint32_t)full.size(), e.attr, e.size, e.mtime);
+            DirData_Add(d, full.c_str(), (uint32_t)full.size(), e.attr, e.size, e.mtime, e.ctime, e.atime);
         }
         d.truncated |= one.truncated;
     }
@@ -1140,8 +1534,10 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
     g_pending = Pending{true,           path, nav, std::move(focus), std::move(selected), std::move(fallbackOpen),
                         fallbackAnyError, q};
     if (g_hwnd) SetTimer(g_hwnd, TIMER_LOADING, kLoadingDelayMs, nullptr);
-    const int col = g_sortCol;
-    const bool asc = g_sortAsc;
+    // Autre dossier : son affichage mémorisé (le tri se fait déjà dans la tâche).
+    if (nav != Nav::Refresh) g_pending.view = ViewFor(path);
+    const int col = g_pending.view ? g_pending.view->sort.key : g_sort.key;
+    const bool asc = g_pending.view ? g_pending.view->asc : g_sortAsc;
     const bool climb = nav == Nav::Refresh && q.empty();  // dossier affiché disparu : on remonte, comme l'Explorateur
     Jobs_Spawn([ct, path, col, asc, climb, q, prefs = g_prefs, filter = g_filter] {
         auto d = std::make_shared<DirData>();
@@ -1190,12 +1586,20 @@ void ApplyOrder(std::vector<uint32_t> order, double ms) {
 
 void SortView();
 
-void Resort(int col) {
-    if (col == g_sortCol) g_sortAsc = !g_sortAsc;
-    else { g_sortCol = col; g_sortAsc = (col == COL_NAME || col == COL_TYPE); }
+void Resort(const ColSpec& col) {
+    if (SameCol(col, g_sort)) g_sortAsc = !g_sortAsc;
+    else {
+        g_sort = col;
+        g_sortAsc = col.key == COL_NAME || col.key == COL_TYPE || col.key == COL_ATTR || (col.key == COL_PROP && !col.right);
+    }
     UpdateSortArrow();
+    SaveFolderView();
+    RequestSortProps();
     SortView();
 }
+
+// Tri sur une propriété : ses valeurs (copiées pour un tri en arrière-plan).
+const PropValues* SortProps() { return g_sort.key == COL_PROP ? PropsOf(g_sort.pk) : nullptr; }
 
 // Retrie (et refiltre) la vue avec le tri et les préférences actuels.
 void SortView() {
@@ -1208,17 +1612,19 @@ void SortView() {
     auto data = g_view.data;
     if (data->entries.size() <= kSyncSortMax) {
         const double t = NowMs();
-        auto order = SortOrder(*data, g_sortCol, g_sortAsc, g_prefs, g_filter, &g_view.dirBytes);
+        auto order = SortOrder(*data, g_sort.key, g_sortAsc, g_prefs, g_filter, &g_view.dirBytes, SortProps());
         ApplyOrder(std::move(order), NowMs() - t);
         return;
     }
     const CancelToken ct = Jobs_NewGeneration();
-    const int c = g_sortCol;
+    const int c = g_sort.key;
     const bool asc = g_sortAsc;
+    std::optional<PropValues> props;
+    if (const PropValues* pv = SortProps()) props = *pv;
     SetStatus(L"Tri…");
-    Jobs_Spawn([ct, data, c, asc, prefs = g_prefs, filter = g_filter, sizes = g_view.dirBytes] {
+    Jobs_Spawn([ct, data, c, asc, prefs = g_prefs, filter = g_filter, sizes = g_view.dirBytes, props = std::move(props)] {
         const double t = NowMs();
-        auto order = SortOrder(*data, c, asc, prefs, filter, &sizes);
+        auto order = SortOrder(*data, c, asc, prefs, filter, &sizes, props ? &*props : nullptr);
         if (ct.cancelled()) return;
         auto* r = new Result{ct.gen, JobKind::Sort, data, std::move(order), NowMs() - t};
         Post(r);
@@ -1351,7 +1757,7 @@ void OnResult(Result* raw) {
     }
     // Tri ou filtre changé pendant la recherche (filtre : toujours, il réduit le travail).
     if (!d.query.empty() && !d.error && (d.entries.size() <= kSyncSortMax || !g_filter.empty()))
-        r->order = SortOrder(d, g_sortCol, g_sortAsc, g_prefs, g_filter);
+        r->order = SortOrder(d, g_sort.key, g_sortAsc, g_prefs, g_filter, nullptr, SortProps());
 
     if (d.error) {
         SetWindowTextW(g_addr, g_path.c_str());
@@ -1400,6 +1806,7 @@ void OnResult(Result* raw) {
     // premier affichage, quand la liste est encore vide.
     const bool freeze = HasView();
     if (freeze) SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
+    g_frozen = freeze;  // les changements d'affichage ne relâchent pas le gel
 
     // Icônes : préréglées (lecteurs), sinon à résoudre à l'affichage. Sur un
     // rafraîchissement du même dossier, on reprend celles déjà connues (pas
@@ -1408,10 +1815,15 @@ void OnResult(Result* raw) {
     std::vector<int32_t> icons(n, -1);
     std::vector<uint8_t> overlays(n, 0), states(n, ICON_NONE);
     std::vector<int32_t> thumbs(n, THUMB_UNKNOWN);
+    std::vector<std::pair<PROPERTYKEY, PropValues>> props;  // rafraîchissement : valeurs déjà lues reprises
     for (size_t i = 0; i < n; ++i)
         if (d.entries[i].icon >= 0) { icons[i] = d.entries[i].icon; states[i] = ICON_OWN; }
     if (refresh && HasView() && g_view.data->path == d.path) {
         const DirData& old = *g_view.data;
+        for (const auto& [k, v] : g_view.props) {
+            props.emplace_back(k, PropValues{});
+            props.back().second.Reset(n);
+        }
         std::unordered_map<std::wstring_view, int> oldIdx;
         oldIdx.reserve(old.entries.size());
         for (size_t i = 0; i < old.entries.size(); ++i)
@@ -1421,6 +1833,13 @@ void OnResult(Result* raw) {
             if (it == oldIdx.end()) continue;
             if ((size_t)it->second < g_view.thumb.size() && g_view.thumb[it->second] >= 0)
                 thumbs[j] = g_view.thumb[it->second];
+            for (size_t k = 0; k < props.size(); ++k) {
+                const PropValues& o = g_view.props[k].second;
+                if (o.state[it->second] != 2) continue;
+                props[k].second.text[j] = o.text[it->second];
+                props[k].second.num[j] = o.num[it->second];
+                props[k].second.state[j] = 2;
+            }
             const uint8_t st = g_view.iconState[it->second];
             if (st != ICON_GENERIC && st != ICON_OWN) continue;  // une demande en vol sera refaite
             icons[j] = g_view.icons[it->second];
@@ -1436,14 +1855,18 @@ void OnResult(Result* raw) {
     g_view.overlays = std::move(overlays);
     g_view.iconState = std::move(states);
     g_view.thumb = std::move(thumbs);
+    g_view.props = std::move(props);
     g_view.serial = ++g_viewSerial;
     Icons_SetSerial(g_view.serial);
     Thumbs_SetSerial(g_view.serial);
+    Props_SetSerial(g_view.serial);
     if (!refresh) TrimBigList();  // miniatures du dossier précédent : place libérée au besoin
     InitDirSizes();
-    if (g_sortCol == COL_SIZE && d.entries.size() <= kSyncSortMax &&
+    if (g_sort.key == COL_SIZE && d.entries.size() <= kSyncSortMax &&
         std::any_of(g_view.dirState.begin(), g_view.dirState.end(), [](uint8_t s) { return s != 0; }))
-        g_view.order = SortOrder(d, g_sortCol, g_sortAsc, g_prefs, g_filter, &g_view.dirBytes);
+        g_view.order = SortOrder(d, g_sort.key, g_sortAsc, g_prefs, g_filter, &g_view.dirBytes);
+    if (g_sort.key == COL_PROP && d.entries.size() <= kSyncSortMax && SortProps())
+        g_view.order = SortOrder(d, g_sort.key, g_sortAsc, g_prefs, g_filter, nullptr, SortProps());  // valeurs reprises
     RebuildRowOf();
     g_path = d.path;
     g_query = d.query;
@@ -1455,6 +1878,9 @@ void OnResult(Result* raw) {
     }
     ApplyCutMarks();
     RequestDirSizes();
+    if (p.view) ApplyFolderView(*p.view);  // autre dossier : son affichage
+    else UpdateColumnsForView();
+    RequestSortProps();
 
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
     if (g_path.empty()) {
@@ -1481,12 +1907,12 @@ void OnResult(Result* raw) {
         ApplySelection(f >= 0 ? std::vector<int>{f} : std::vector<int>{}, f, true);
     }
 
+    g_frozen = false;
     if (freeze) SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(g_list, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
     UpdateButtons();
     SyncTab();
     if (g_startupMs < 0) g_startupMs = MsSinceProcessStart();  // premier affichage réellement peint
-    UpdateColumnsForView();
     NavPane_ShowPath(g_path);
     NavPane_FolderListed(d);  // sous-dossiers affichés dans le volet : à jour sans relecture
     ShellMenu_Discard();  // contenu du dossier relu : le menu préparé peut ne plus être exact
@@ -2292,8 +2718,6 @@ void RegisterDrop() {
 struct Tab {
     std::wstring path, query, filter, focus;
     std::vector<std::wstring> back, fwd, selected;
-    int sortCol = COL_NAME;
-    bool sortAsc = true;
     int top = 0;
     std::shared_ptr<const DirData> data;
 };
@@ -2348,8 +2772,6 @@ void SaveTab() {
     t.filter = g_filter;
     t.back = g_back;
     t.fwd = g_fwd;
-    t.sortCol = g_sortCol;
-    t.sortAsc = g_sortAsc;
     t.selected = HasView() ? NamesOf(SelectedEntries()) : std::vector<std::wstring>{};
     const int f = HasView() ? FocusedEntry() : -1;
     t.focus = f >= 0 ? NameOf(f) : L"";
@@ -2364,9 +2786,7 @@ void ShowTab(size_t i) {
     const Tab t = g_tabList[i];
     g_back = t.back;
     g_fwd = t.fwd;
-    g_sortCol = t.sortCol;
-    g_sortAsc = t.sortAsc;
-    UpdateSortArrow();
+    ApplyFolderView(ViewFor(t.path));  // affichage mémorisé de son dossier
     g_filter = t.filter;
     g_goneNote.clear();
     g_searchSync = true;
@@ -2392,7 +2812,7 @@ void ShowTab(size_t i) {
     g_pending = std::move(p);
     auto* r = new Result{Jobs_NewGeneration().gen, JobKind::Navigate};
     r->data = t.data;
-    r->order = SortOrder(*t.data, g_sortCol, g_sortAsc, g_prefs, g_filter);
+    r->order = SortOrder(*t.data, g_sort.key, g_sortAsc, g_prefs, g_filter);
     OnResult(r);
     if (t.query.empty()) Refresh();  // changements faits pendant qu'on était ailleurs
 }
@@ -2411,8 +2831,6 @@ void NewTab(const std::wstring& path, bool activate) {
     SaveTab();
     Tab t;
     t.path = path;
-    t.sortCol = g_sortCol;
-    t.sortAsc = g_sortAsc;
     g_tabList.insert(g_tabList.begin() + (ptrdiff_t)g_tab + 1, std::move(t));
     if (!activate) {
         UpdateTabStrip();
@@ -3029,23 +3447,7 @@ void CreateChildren(HWND hwnd) {
     ListView_SetCallbackMask(g_list, LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED);  // fournis par LVN_GETDISPINFO
     SetWindowTheme(g_list, L"Explorer", nullptr);
 
-    struct {
-        const wchar_t* t;
-        int w;
-        int fmt;
-    } cols[COL_COUNT] = {{L"Nom", 380, LVCFMT_LEFT},
-                         {L"Taille", 110, LVCFMT_RIGHT},
-                         {L"Type", 170, LVCFMT_LEFT},
-                         {L"Modifié le", 170, LVCFMT_LEFT}};
-    for (int i = 0; i < COL_COUNT; ++i) {
-        LVCOLUMNW c{};
-        c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM;
-        c.pszText = (LPWSTR)cols[i].t;
-        c.cx = S(cols[i].w);
-        c.fmt = cols[i].fmt;
-        c.iSubItem = i;
-        ListView_InsertColumn(g_list, i, &c);
-    }
+    ApplyColumns(g_cols);
 
     NavHost nav;
     nav.navigate = [](const std::wstring& path) { Navigate(path, Nav::Normal); };
@@ -3075,6 +3477,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             NavPane_SetViewPrefs(g_prefs);
             Icons_Start(hwnd, WM_APP_ICON);
             Thumbs_Start(hwnd, WM_APP_THUMB);
+            Props_Start(hwnd, WM_APP_PROPS);
             DirSizes_Start(hwnd, WM_APP_DIRSIZE);
             AddClipboardFormatListener(hwnd);
             RegisterDrop();
@@ -3086,6 +3489,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(hwnd, TIMER_INDEXASK, 1500, nullptr);
             return 0;
         case WM_CONTEXTMENU:
+            if (HWND hh = ListView_GetHeader(g_list); ((HWND)wp == g_list || (HWND)wp == hh) && lp != -1) {
+                RECT hr;
+                const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+                if (IsWindowVisible(hh) && GetWindowRect(hh, &hr) && PtInRect(&hr, pt)) {  // en-tête : choix des colonnes
+                    ShowHeaderMenu(pt);
+                    return 0;
+                }
+            }
             if ((HWND)wp == g_list) { ShowContextMenu(lp); return 0; }
             if ((HWND)wp == g_nav) { NavPane_ContextMenu(lp); return 0; }
             if ((HWND)wp == g_btnBack || (HWND)wp == g_btnFwd) { ShowHistoryMenu((HWND)wp == g_btnBack); return 0; }
@@ -3123,6 +3534,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CAPTURECHANGED: g_splitDrag = false; return 0;
         case WM_APP_ICON: OnIcon((IconResult*)lp); return 0;
         case WM_APP_THUMB: OnThumb((ThumbResult*)lp); return 0;
+        case WM_APP_PROPS: OnProps((PropResult*)lp); return 0;
+        case WM_APP_SAVEVIEW:
+            g_saveViewPosted = false;
+            SaveFolderView();
+            return 0;
         case WM_APP_DIRSIZE: OnDirSize((DirSizeResult*)lp); return 0;
         case WM_APP_DIRCHANGED: OnDirChanged((uintptr_t)wp, lp); return 0;
         case WM_DEVICECHANGE: return OnDeviceChange(wp, lp);
@@ -3191,8 +3607,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (IsWindowVisible(c)) kids.push_back(c);
             for (HWND c : kids) SendMessageW(c, WM_SETREDRAW, FALSE, 0);
             const UINT nd = HIWORD(wp);
-            for (int i = 0; i < COL_COUNT; ++i)
+            g_applyingCols = true;
+            for (int i = 0; i < (int)g_cols.size(); ++i)
                 ListView_SetColumnWidth(g_list, i, MulDiv(ListView_GetColumnWidth(g_list, i), (int)nd, (int)g_dpi));
+            g_applyingCols = false;
             g_dpi = nd;
             ApplyFont();
             ApplyImageList();
@@ -3270,8 +3688,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 return 0;
             }
-            if (hdr->hwndFrom != g_list) break;
-            switch (hdr->code) {
+            if (hdr->hwndFrom == ListView_GetHeader(g_list)) {  // largeur ou ordre des colonnes changés
+                if (hdr->code == HDN_ENDDRAG || hdr->code == HDN_DIVIDERDBLCLICKW ||
+                    ((hdr->code == HDN_ITEMCHANGEDW || hdr->code == HDN_ITEMCHANGEDA) && ((NMHEADERW*)lp)->pitem &&
+                     (((NMHEADERW*)lp)->pitem->mask & HDI_WIDTH)))
+                    PostSaveView();
+                break;
+            }
+            if (hdr->hwndFrom != g_list) break;            switch (hdr->code) {
                 case LVN_GETDISPINFOW: FillDispInfo(((NMLVDISPINFOW*)lp)->item); return 0;
                 case LVN_ITEMCHANGED:
                     if ((((NMLISTVIEW*)lp)->uChanged & LVIF_STATE) &&
@@ -3281,7 +3705,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case LVN_ODSTATECHANGED: ScheduleSelectionSummary(); return 0;  // plage (Maj+clic, Ctrl+A)
                 case NM_CUSTOMDRAW: return OnListCustomDraw((NMLVCUSTOMDRAW*)lp);
                 case LVN_ODFINDITEMW: return FindItem((NMLVFINDITEMW*)lp);
-                case LVN_COLUMNCLICK: Resort(((NMLISTVIEW*)lp)->iSubItem); return 0;
+                case LVN_COLUMNCLICK:
+                    if (const int c = ((NMLISTVIEW*)lp)->iSubItem; c >= 0 && c < (int)g_cols.size()) Resort(g_cols[c]);
+                    return 0;
                 case NM_DBLCLK: {
                     const int e = HasView() ? EntryAt(((NMITEMACTIVATE*)lp)->iItem) : -1;
                     if (e >= 0 && E(e).isDir() && GetKeyState(VK_CONTROL) < 0) {  // Ctrl+double-clic : nouvelle fenêtre
@@ -3304,6 +3730,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_target.store(nullptr);
             Icons_Stop();
             Thumbs_Stop();
+            Props_Stop();
             DirSizes_Stop();
             Watch_Stop();
             ShellMenu_Discard(true);
@@ -3442,6 +3869,12 @@ bool HandleGlobalKeys(const MSG& m) {
             case VK_TAB: SwitchTab((g_tab + (sh ? n - 1 : 1)) % n); return true;
             case VK_PRIOR: SwitchTab((g_tab + n - 1) % n); return true;
             case VK_NEXT: SwitchTab((g_tab + 1) % n); return true;
+            case VK_ADD:  // Ctrl+pavé numérique + : ajuster toutes les colonnes
+                if (focus == g_list) {
+                    FitColumns();
+                    return true;
+                }
+                break;
         }
         if (sh && m.wParam >= '1' && m.wParam <= '8') {  // Ctrl+Maj+1…8 : mode d'affichage
             ViewByKey((int)(m.wParam - '0'));

@@ -144,9 +144,9 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Fonction | Détail | État |
 |---|---|---|
 | Colonnes par défaut | Nom, Modifié le, Type, Taille | ✅ |
-| **Choix des colonnes** | Clic droit sur l'en-tête : coche rapide + « Plus… » = plus de 300 propriétés (date de création, d'accès, auteur, dimensions, durée, débit, EXIF, attributs, propriétaire, chemin d'accès, état de synchro…) | P1 ⚙️ Property System (`IPropertyStore`, `PKEY_*`) |
+| **Choix des colonnes** | Clic droit sur l'en-tête : coche rapide + « Plus… » = plus de 300 propriétés (date de création, d'accès, auteur, dimensions, durée, débit, EXIF, attributs, propriétaire, chemin d'accès, état de synchro…) | ✅ P1 ⚙️ Property System (`IPropertyStore`, `PKEY_*`) : menu de l'en-tête (colonnes usuelles, « Plus… » avec filtre) ; dates de création / d'accès et attributs lus avec le dossier ; autres propriétés lues en arrière-plan (lignes visibles d'abord, cache seulement pour un fichier cloud) |
 | Redimensionner | Glisser le séparateur ; double-clic = ajuster au contenu | ✅ (natif ListView) |
-| Ajuster toutes les colonnes | Clic droit en-tête ▸ Ajuster toutes les colonnes / Ctrl+pavé num. « + » | P2 |
+| Ajuster toutes les colonnes | Clic droit en-tête ▸ Ajuster toutes les colonnes / Ctrl+pavé num. « + » | ✅ P2 |
 | Réordonner | Glisser l'en-tête | ✅ |
 | Trier | Clic sur l'en-tête, flèche de tri | ✅ |
 | **Filtres de colonne** | Survol de l'en-tête ▸ flèche ▾ : filtre par valeurs (« A–H », « Aujourd'hui », « Grand (128 Mo–1 Go) »…), cases multiples | P2 |
@@ -157,7 +157,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Trier par | Nom, Date, Type, Taille + toute colonne ; croissant/décroissant | ✅ (4 colonnes) |
+| Trier par | Nom, Date, Type, Taille + toute colonne ; croissant/décroissant | ✅ (toute colonne ; propriété : valeurs lues puis tri, nombres et dates par valeur) |
 | Tri naturel | `fichier2` avant `fichier10` (désactivable par stratégie de groupe) | ✅ |
 | Dossiers en premier | Toujours (sauf en regroupement) | ✅ |
 | **Regrouper par** | Nom (A–H, I–P…), Date (Aujourd'hui, Hier, Plus tôt cette semaine, Semaine dernière, Le mois dernier, Plus tôt cette année, Il y a longtemps), Type, Taille (Vide, Minuscule, Petit, Moyen, Grand, Très grand, Énorme, Gigantesque), toute propriété ; groupes repliables (clic sur l'en-tête de groupe) | P2 |
@@ -167,10 +167,10 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Vue mémorisée par dossier | Mode, colonnes, tri et regroupement mémorisés pour chaque dossier | P1 ⚙️ registre `Bags` / `BagMRU` (HKCU\…\Shell) |
+| Vue mémorisée par dossier | Mode, colonnes, tri et regroupement mémorisés pour chaque dossier | ✅ P1 (mode, colonnes, largeurs, ordre, tri ; dans `HKCU\Software\FastExplorer\Views`, 5000 dossiers au plus ; regroupement : avec le §4.4) |
 | **Type de dossier** | Éléments généraux, Documents, Images, Musique, Vidéos : détecté automatiquement selon le contenu, ou forcé (Propriétés ▸ Personnaliser) | P2 |
-| « Appliquer aux dossiers » | Options des dossiers ▸ Affichage : applique la vue courante à tous les dossiers du même type | P2 |
-| Réinitialiser les dossiers | Retour aux vues par défaut | P2 |
+| « Appliquer aux dossiers » | Options des dossiers ▸ Affichage : applique la vue courante à tous les dossiers du même type | ✅🟡 P2 (menu Affichage : à tous les dossiers ; pas encore par type de dossier) |
+| Réinitialiser les dossiers | Retour aux vues par défaut | ✅ P2 (menu Affichage : ce dossier ; « Appliquer à tous » efface les autres) |
 
 ### 4.6 Rendu des éléments
 
@@ -630,7 +630,7 @@ dossiers avant l'index…) :
     filtres de recherche (date, type, taille).
 16. ✅ **Modes d'affichage** : grandes / moyennes icônes, zoom continu (Ctrl+molette), Ctrl+Maj+1…8,
     mode compact, **miniatures** (cache système partagé avec l'Explorateur).
-17. **Colonnes** : choix des colonnes (Property System), vue mémorisée par dossier.
+17. ✅ **Colonnes** : choix des colonnes (Property System), vue mémorisée par dossier.
 18. **Volets d'aperçu et de détails** (Alt+P, Alt+Maj+P) : preview handlers hors processus, propriétés
     modifiables, sélection multiple, largeur réglable.
 19. **File d'attente de copies** ⭐ : opérations à la suite plutôt qu'en parallèle sur un même disque,

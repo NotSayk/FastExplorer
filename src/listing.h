@@ -4,11 +4,13 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
-enum Col { COL_NAME, COL_SIZE, COL_TYPE, COL_DATE, COL_COUNT };
+// Clés de tri. COL_PROP : propriété du Shell, valeurs fournies à SortOrder (PropValues).
+enum Col { COL_NAME, COL_SIZE, COL_TYPE, COL_DATE, COL_CTIME, COL_ATIME, COL_ATTR, COL_COUNT, COL_PROP = 100 };
 
 struct Entry {
     uint32_t nameOff;  // offset dans DirData::pool (nom terminé par \0)
@@ -20,7 +22,9 @@ struct Entry {
     uint32_t keyOff;   // clé de tri binaire dans DirData::keys
     uint32_t keyLen;
     uint64_t size;
-    int64_t mtime;     // FILETIME UTC
+    int64_t mtime;     // FILETIME UTC : modification
+    int64_t ctime;     // création (0 : inconnue)
+    int64_t atime;     // dernier accès (0 : inconnu)
     bool isDir() const { return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0; }
 };
 
@@ -53,6 +57,14 @@ struct DirData {
     bool isRoot() const { return path.empty() && query.empty(); }  // Ce PC (pas une recherche dans tout le PC)
     const wchar_t* name(const Entry& e) const { return pool.data() + e.nameOff; }
 };
+
+// Colonne Attributs : une lettre par attribut, comme l'Explorateur (« RHSA », « DA »…).
+constexpr uint32_t kShownAttrs = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM |
+                                 FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_COMPRESSED |
+                                 FILE_ATTRIBUTE_ENCRYPTED | FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_OFFLINE |
+                                 FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_PINNED | FILE_ATTRIBUTE_UNPINNED |
+                                 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+std::wstring AttrText(uint32_t attr);
 
 // Parallélisme des clés de tri et du tri (Auto = seulement pour les gros dossiers).
 enum class Parallel { Auto, Never, Always };
@@ -121,7 +133,8 @@ struct SearchSpec {
 SearchSpec ParseSearch(const std::wstring& q, int64_t now = 0);
 
 // Construction de résultats hors Enumerate / SearchTree (index de recherche).
-void DirData_Add(DirData& d, const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime);
+void DirData_Add(DirData& d, const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime,
+                 int64_t ctime = 0, int64_t atime = 0);
 void DirData_BuildKeys(DirData& d);  // à appeler une fois toutes les entrées ajoutées
 
 // Recherche récursive dans d.path (sous-dossiers compris, sans suivre les
@@ -160,5 +173,20 @@ uint32_t HiddenExtLen(const wchar_t* name, uint32_t nameLen, uint32_t extOff, bo
 // ni ceux dont le nom ne correspond pas à `nameFilter` (filtre instantané,
 // mêmes règles que NameMatches ; vide : aucun filtre).
 // dirSizes : taille calculée de chaque dossier (par index d'entrée), pour le tri par taille.
+// prop : valeurs de la colonne COL_PROP (par index d'entrée).
+struct PropValues;
 std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs = {},
-                                const std::wstring& nameFilter = {}, const std::vector<uint64_t>* dirSizes = nullptr);
+                                const std::wstring& nameFilter = {}, const std::vector<uint64_t>* dirSizes = nullptr,
+                                const PropValues* prop = nullptr);
+
+// Valeurs d'une colonne de propriété du Shell (auteur, dimensions, durée…), par index d'entrée.
+struct PropValues {
+    std::vector<std::wstring> text;  // texte affiché ("" : aucune valeur)
+    std::vector<double> num;         // clé de tri numérique ; NaN : trier sur le texte
+    std::vector<uint8_t> state;      // 0 : pas demandée, 1 : en cours de lecture, 2 : lue
+    void Reset(size_t n) {
+        text.assign(n, {});
+        num.assign(n, std::numeric_limits<double>::quiet_NaN());
+        state.assign(n, 0);
+    }
+};

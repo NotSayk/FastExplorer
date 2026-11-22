@@ -38,13 +38,16 @@ bool UseParallel(size_t n, size_t threshold) {
     return p == Parallel::Always || (p == Parallel::Auto && n >= threshold);
 }
 
-void AddEntry(DirData& d, const wchar_t* fn, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime) {
+void AddEntry(DirData& d, const wchar_t* fn, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime, int64_t ctime = 0,
+              int64_t atime = 0) {
     Entry e{};
     e.nameOff = (uint32_t)d.pool.size();
     e.nameLen = n;
     e.attr = attr;
     e.icon = -1;
     e.mtime = mtime;
+    e.ctime = ctime;
+    e.atime = atime;
     const bool dir = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
     e.size = dir ? 0 : size;
     e.extOff = n;
@@ -98,7 +101,8 @@ void EnumerateDir(DirData& d, const CancelToken& ct) {
             const WCHAR* fn = di->FileName;
             const bool dot = (n == 1 && fn[0] == L'.') || (n == 2 && fn[0] == L'.' && fn[1] == L'.');
             if (!dot)
-                AddEntry(d, fn, n, di->FileAttributes, (uint64_t)di->EndOfFile.QuadPart, di->LastWriteTime.QuadPart);
+                AddEntry(d, fn, n, di->FileAttributes, (uint64_t)di->EndOfFile.QuadPart, di->LastWriteTime.QuadPart,
+                 di->CreationTime.QuadPart, di->LastAccessTime.QuadPart);
             if (!di->NextEntryOffset) break;
             p += di->NextEntryOffset;
         }
@@ -456,8 +460,9 @@ bool SearchSpec::Accept(const wchar_t* name, uint32_t n, uint32_t attr, uint64_t
 
 bool NameMatches(const std::wstring& query, const wchar_t* name, uint32_t n) { return Matcher(query)(name, n); }
 
-void DirData_Add(DirData& d, const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime) {
-    AddEntry(d, name, n, attr, size, mtime);
+void DirData_Add(DirData& d, const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime, int64_t ctime,
+                 int64_t atime) {
+    AddEntry(d, name, n, attr, size, mtime, ctime, atime);
 }
 
 void DirData_BuildKeys(DirData& d) { BuildSortKeys(d); }
@@ -497,7 +502,7 @@ void SearchTree(DirData& d, const std::wstring& query, const ViewPrefs& prefs, c
 
     auto worker = [&] {
         std::unique_ptr<BYTE[]> buf(new BYTE[kEnumBuf]);
-        struct Hit { std::wstring rel; uint32_t attr; uint64_t size; int64_t mtime; };
+        struct Hit { std::wstring rel; uint32_t attr; uint64_t size; int64_t mtime, ctime, atime; };
         for (;;) {
             std::wstring rel;
             {
@@ -539,7 +544,8 @@ void SearchTree(DirData& d, const std::wstring& query, const ViewPrefs& prefs, c
                             if (hit || descend) {  // chemin construit seulement si utile
                                 std::wstring child = rel.empty() ? std::wstring(fn, n) : rel + L"\\" + std::wstring(fn, n);
                                 if (hit)
-                                    hits.push_back({child, attr, (uint64_t)di->EndOfFile.QuadPart, di->LastWriteTime.QuadPart});
+                                    hits.push_back({child, attr, (uint64_t)di->EndOfFile.QuadPart, di->LastWriteTime.QuadPart,
+                                    di->CreationTime.QuadPart, di->LastAccessTime.QuadPart});
                                 if (descend) subdirs.push_back(std::move(child));
                             }
                         }
@@ -557,7 +563,7 @@ void SearchTree(DirData& d, const std::wstring& query, const ViewPrefs& prefs, c
                     stop = true;
                     break;
                 }
-                AddEntry(acc, x.rel.c_str(), (uint32_t)x.rel.size(), x.attr, x.size, x.mtime);
+                AddEntry(acc, x.rel.c_str(), (uint32_t)x.rel.size(), x.attr, x.size, x.mtime, x.ctime, x.atime);
             }
             ++acc.scanned;
             changed |= !hits.empty();
@@ -712,7 +718,7 @@ uint32_t HiddenExtLen(const wchar_t* name, uint32_t nameLen, uint32_t extOff, bo
 }
 
 std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewPrefs& prefs, const std::wstring& nameFilter,
-                                const std::vector<uint64_t>* dirSizes) {
+                                const std::vector<uint64_t>* dirSizes, const PropValues* prop) {
     const uint32_t n = (uint32_t)d.entries.size();
     std::vector<uint32_t> order;
     order.reserve(n);
@@ -735,6 +741,7 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewP
     const BYTE* K = d.keys.data();
     const wchar_t* P = d.pool.data();
     const uint64_t* DS = dirSizes && dirSizes->size() == n ? dirSizes->data() : nullptr;
+    const PropValues* PV = prop && prop->text.size() == n && prop->num.size() == n ? prop : nullptr;
     auto cmp = [=](uint32_t ia, uint32_t ib) {
         const Entry& a = E[ia];
         const Entry& b = E[ib];
@@ -744,6 +751,21 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewP
                 c = DS && a.isDir() ? Cmp3(DS[ia], DS[ib]) : Cmp3(a.size, b.size);
                 break;
             case COL_DATE: c = Cmp3(a.mtime, b.mtime); break;
+            case COL_CTIME: c = Cmp3(a.ctime, b.ctime); break;
+            case COL_ATIME: c = Cmp3(a.atime, b.atime); break;
+            case COL_ATTR: c = Cmp3(a.attr & kShownAttrs, b.attr & kShownAttrs); break;
+            case COL_PROP:
+                if (PV) {
+                    // Sans valeur : en tête (comme l'Explorateur) ; nombres et dates : par valeur ; sinon texte naturel.
+                    const std::wstring &ta = PV->text[ia], &tb = PV->text[ib];
+                    const double na = PV->num[ia], nb = PV->num[ib];
+                    if (ta.empty() || tb.empty()) c = Cmp3(!ta.empty(), !tb.empty());
+                    else if (na == na && nb == nb) c = Cmp3(na, nb);
+                    else c = CompareStringEx(LOCALE_NAME_USER_DEFAULT, LINGUISTIC_IGNORECASE | SORT_DIGITSASNUMBERS,
+                                             ta.c_str(), (int)ta.size(), tb.c_str(), (int)tb.size(), nullptr, nullptr, 0) -
+                             CSTR_EQUAL;
+                }
+                break;
             case COL_TYPE:
                 c = CompareStringOrdinal(P + a.nameOff + a.extOff, (int)(a.nameLen - a.extOff), P + b.nameOff + b.extOff,
                                          (int)(b.nameLen - b.extOff), TRUE) - CSTR_EQUAL;
@@ -767,6 +789,19 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewP
         std::sort(mid, order.end(), cmp);
     }
     return order;
+}
+
+std::wstring AttrText(uint32_t attr) {
+    static const struct { uint32_t bit; wchar_t c; } kLetters[] = {
+        {FILE_ATTRIBUTE_READONLY, L'R'},  {FILE_ATTRIBUTE_HIDDEN, L'H'},     {FILE_ATTRIBUTE_SYSTEM, L'S'},
+        {FILE_ATTRIBUTE_ARCHIVE, L'A'},   {FILE_ATTRIBUTE_DIRECTORY, L'D'},  {FILE_ATTRIBUTE_COMPRESSED, L'C'},
+        {FILE_ATTRIBUTE_ENCRYPTED, L'E'}, {FILE_ATTRIBUTE_TEMPORARY, L'T'},  {FILE_ATTRIBUTE_OFFLINE, L'O'},
+        {FILE_ATTRIBUTE_REPARSE_POINT, L'L'}, {FILE_ATTRIBUTE_PINNED, L'P'}, {FILE_ATTRIBUTE_UNPINNED, L'U'},
+        {FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, L'M'}};
+    std::wstring s;
+    for (const auto& l : kLetters)
+        if (attr & l.bit) s += l.c;
+    return s;
 }
 
 const wchar_t* DriveTypeText(UINT t) {
