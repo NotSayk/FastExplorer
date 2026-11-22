@@ -21,6 +21,7 @@ struct FastProgress {
     std::atomic<uint64_t> bytesDone{0}, bytesTotal{0};
     std::atomic<uint32_t> filesDone{0}, filesTotal{0};
     std::atomic<bool> cancel{false};
+    std::atomic<bool> pause{false};  // en pause : les threads de copie attendent (entre deux blocs)
     bool move = false;
     ULONGLONG start = 0;  // GetTickCount64
 };

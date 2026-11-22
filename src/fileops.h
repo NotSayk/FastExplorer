@@ -74,10 +74,37 @@ struct FileOpsProgress {
     uint32_t filesDone = 0, filesTotal = 0;
     bool move = false;
     ULONGLONG start = 0;
+    uint32_t waiting = 0;  // copies en file d'attente (rempli même sans copie en cours)
 };
 bool FileOps_Progress(FileOpsProgress& p);
-// Annule les copies de notre moteur (ce qui est déjà copié reste).
+// Annule les copies de notre moteur et vide la file d'attente (ce qui est déjà copié reste).
 void FileOps_Cancel();
+
+// ── File d'attente des copies ──
+// Copier et déplacer (hors déplacement sur un même volume, instantané) passent
+// par une file : deux opérations qui touchent un même disque physique (ou un
+// même serveur) se suivent au lieu de se disputer les têtes de lecture ; sur
+// des disques différents, elles tournent en parallèle.
+
+struct FileOpJob {
+    uint64_t id = 0;
+    std::wstring title;           // « Copie de 3 éléments vers D:\Photos »
+    bool running = false;         // sinon en attente
+    bool paused = false;          // en attente : retenue ; en cours : en pause
+    bool shell = false;           // en cours dans le moteur du Shell (sa propre fenêtre, pas de pause ici)
+    bool move = false;
+    uint64_t bytesDone = 0, bytesTotal = 0;
+    uint32_t filesDone = 0, filesTotal = 0;
+    ULONGLONG start = 0;          // début de la copie (GetTickCount64), 0 si en attente
+};
+std::vector<FileOpJob> FileOps_Jobs();
+// En attente : retenir (ne démarre pas) ; en cours (notre moteur) : pause entre deux blocs.
+void FileOps_Pause(uint64_t id, bool pause);
+// Démarrer sans attendre son tour.
+void FileOps_StartNow(uint64_t id);
+void FileOps_CancelJob(uint64_t id);
+// Identifiant du disque physique (« disk:2 »), du serveur (« net:serveur ») ou du volume ; "" si inconnu.
+std::wstring FileOps_DiskKey(const std::wstring& path);
 
 // Confirmation de suppression, comme l'Explorateur : toujours pour une
 // suppression définitive ; vers la Corbeille selon le réglage de celle-ci.

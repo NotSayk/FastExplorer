@@ -7,6 +7,7 @@
 #include "ui.h"
 
 #include "columns.h"
+#include "copyqueue.h"
 #include "dragdrop.h"
 #include "fileops.h"
 #include "foldersize.h"
@@ -873,6 +874,7 @@ MenuExtra ViewMenu() {
              {L"Volet d'aperçu\tAlt+P", [] { TogglePane(PaneMode::Preview); }, false, Pane_Mode() == PaneMode::Preview},
              {L"Volet de détails\tAlt+Maj+P", [] { TogglePane(PaneMode::Details); }, false,
               Pane_Mode() == PaneMode::Details},
+             {L"File d'attente des copies…", [] { CopyQueue_Show(g_hwnd); }},
              {},
              {L"Choisir les colonnes…", [] { ChooseColumns(); }},
              {L"Appliquer à tous les dossiers", [] { ApplyViewToAll(); }},
@@ -2208,7 +2210,15 @@ std::wstring SizeText(uint64_t bytes) {
 // la barre des tâches (rien pour une opération de moins d'une demi-seconde).
 void OnProgressTimer() {
     FileOpsProgress p;
-    if (!FileOps_Progress(p)) {
+    const bool fast = FileOps_Progress(p);
+    // Une copie vient se mettre en file derrière une autre : la file s'affiche (sans prendre le focus).
+    static uint64_t shownFor = 0;
+    for (const FileOpJob& j : FileOps_Jobs())
+        if (!j.running && j.id > shownFor) {
+            shownFor = j.id;
+            CopyQueue_Show(g_hwnd, false);
+        }
+    if (!fast) {
         if (FileOps_Running() == 0) KillTimer(g_hwnd, TIMER_PROGRESS);
         if (g_progressShown) {
             g_progressShown = false;
@@ -2225,6 +2235,7 @@ void OnProgressTimer() {
     s += std::to_wstring(p.filesDone) + L" / " + std::to_wstring(p.filesTotal) + L" fichiers";
     if (bytes) s += L"   •   " + SizeText(p.bytesDone) + L" / " + SizeText(p.bytesTotal);
     if (total) s += L"   •   " + std::to_wstring(done * 100 / total) + L" %";
+    if (p.waiting) s += L"   •   " + std::to_wstring(p.waiting) + L" en attente";
     s += L"   •   Échap pour annuler";
     SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)s.c_str());
     TaskbarProgress(TBPF_NORMAL, done, total ? total : 1);
@@ -3766,6 +3777,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_NOTIFY: {
             auto* hdr = (NMHDR*)lp;
             if (LRESULT r = 0; NavPane_Notify(hdr, &r)) return r;
+            if (hdr->hwndFrom == g_status && hdr->code == NM_CLICK && FileOps_Running() > 0) {  // clic sur la progression
+                CopyQueue_Show(hwnd);
+                return 0;
+            }
             if (hdr->hwndFrom == g_tabBar) {
                 if (hdr->code == TCN_SELCHANGE) {
                     const int sel = TabCtrl_GetCurSel(g_tabBar);
@@ -4019,7 +4034,7 @@ bool HandleGlobalKeys(const MSG& m) {
                 return true;
             }
             FileOpsProgress p;
-            if (FileOps_Progress(p)) {  // copie en cours : on l'arrête (ce qui est copié reste)
+            if (FileOps_Progress(p) || p.waiting) {  // copie en cours ou en attente : on l'arrête (ce qui est copié reste)
                 FileOps_Cancel();
                 return true;
             }

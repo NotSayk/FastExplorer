@@ -4,6 +4,8 @@
 #include "paths.h"
 #include "shellmenu.h"
 
+#include <winioctl.h>
+#include <winnetwk.h>
 #include <restartmanager.h>
 #include <sddl.h>
 #include <shellapi.h>
@@ -13,16 +15,59 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
 
 #pragma comment(lib, "rstrtmgr.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "mpr.lib")
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
 std::atomic<int> g_running{0};
+
+// ───────────────────────────── File d'attente des copies ─────────────────────────────
+
+struct Job {
+    uint64_t id = 0;
+    std::wstring title;
+    bool move = false;
+    bool keysReady = false;            // disques connus (calculés sur le thread de l'opération)
+    std::vector<std::wstring> keys;    // disques touchés ; vide : n'en bloque aucun
+    bool running = false, hold = false, now = false, shell = false;
+    ULONGLONG start = 0;
+    FastProgress prog;                 // progression, annulation et pause de notre moteur
+};
+
+std::mutex g_qLock;
+std::condition_variable g_qCv;
+std::vector<std::shared_ptr<Job>> g_jobs;  // dans l'ordre d'arrivée
+uint64_t g_nextJob = 0;
+
+bool Shares(const Job& a, const Job& b) {
+    for (const auto& k : a.keys)
+        if (std::find(b.keys.begin(), b.keys.end(), k) != b.keys.end()) return true;
+    return false;
+}
+
+// Sous g_qLock. Premier arrivé, premier servi, par disque.
+bool CanStart(const Job& j) {
+    if (j.prog.cancel || j.now) return true;
+    if (j.hold || !j.keysReady) return false;
+    for (const auto& o : g_jobs) {
+        if (o.get() == &j) {
+            // Plus loin : seules les copies en cours comptent (« démarrer maintenant »).
+            for (const auto& later : g_jobs)
+                if (later.get() != &j && later->running && Shares(*later, j)) return false;
+            return true;
+        }
+        if (o->running ? Shares(*o, j) : (!o->hold && (!o->keysReady || Shares(*o, j)))) return false;
+    }
+    return true;
+}
 
 // Copies rapides en cours (progression affichée par l'interface).
 std::mutex g_fastLock;
@@ -42,7 +87,7 @@ struct FastReg {
 
 // Copie / déplacement par notre moteur (voir fastcopy.h). true : terminé ;
 // sinon `left` reçoit ce qui reste à confier au Shell (tout, s'il a refusé).
-bool TryFast(const FileOp& op, FileOpResult& r, HRESULT& hr, std::vector<std::wstring>& left) {
+bool TryFast(const FileOp& op, FileOpResult& r, HRESULT& hr, std::vector<std::wstring>& left, FastProgress& prog) {
     if ((op.kind != FileOpKind::Copy && op.kind != FileOpKind::Move) || op.folder.empty()) return false;
     std::vector<std::wstring> src = op.paths;
     for (const auto& p : op.items) {
@@ -62,7 +107,6 @@ bool TryFast(const FileOp& op, FileOpResult& r, HRESULT& hr, std::vector<std::ws
         hr = S_OK;  // tout était déjà dans la destination
         return true;
     }
-    FastProgress prog;
     prog.move = op.kind == FileOpKind::Move;
     prog.start = GetTickCount64();
     FastOutcome out;
@@ -224,14 +268,14 @@ HRESULT Restore(const FileOp& op, FileOpResult& r) {
     return first && r.created.empty() ? HRESULT_FROM_WIN32(first) : S_OK;
 }
 
-HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r) {
+HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r, Job* job) {
     if (op.kind == FileOpKind::NewFolder) return NewFolder(op, owner, r);
     if (op.kind == FileOpKind::Restore) return Restore(op, r);
     if (op.kind == FileOpKind::Rename && TryFastRename(op, r)) return S_OK;
 
     HRESULT hr = S_OK;
     std::vector<std::wstring> left;  // éléments que notre moteur rend au Shell
-    if (TryFast(op, r, hr, left)) return hr;
+    if (job && TryFast(op, r, hr, left, job->prog)) return hr;
     const bool rest = !left.empty();
 
     ComPtr<IFileOperation> fo;
@@ -298,6 +342,10 @@ HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r) {
     }
     if (!queued) return sources.empty() && !(op.paths.empty() && op.items.empty()) ? HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) : S_OK;
 
+    if (job) {
+        std::lock_guard<std::mutex> l(g_qLock);
+        job->shell = true;
+    }
     hr = fo->PerformOperations();
     BOOL ab = FALSE;
     fo->GetAnyOperationsAborted(&ab);
@@ -310,7 +358,46 @@ struct Task {
     HWND owner, target;
     UINT msg;
     FileOp op;
+    std::shared_ptr<Job> job;  // copie ou déplacement : sa place dans la file
 };
+
+bool IsUnc(const std::wstring& p) { return p.size() > 2 && p[0] == L'\\' && p[1] == L'\\' && p[2] != L'?' && p[2] != L'.'; }
+
+std::wstring VolumeOf(const std::wstring& p) {
+    wchar_t v[MAX_PATH] = {};
+    return GetVolumePathNameW(p.c_str(), v, MAX_PATH) ? std::wstring(v) : std::wstring();
+}
+
+// Attend son tour dans la file (disques libres), puis passe « en cours ».
+void WaitTurn(Job& job, const FileOp& op, const std::vector<std::wstring>& sources) {
+    std::vector<std::wstring> keys;
+    const std::wstring dv = VolumeOf(op.folder);
+    bool sameVolume = op.kind == FileOpKind::Move && !dv.empty() && !sources.empty();
+    for (const auto& s : sources) sameVolume = sameVolume && _wcsicmp(VolumeOf(s).c_str(), dv.c_str()) == 0;
+    if (!sameVolume) {  // déplacement sur un même volume : renommages instantanés, il ne gêne personne
+        auto add = [&](const std::wstring& p) {
+            std::wstring k = FileOps_DiskKey(p);
+            if (!k.empty() && std::find(keys.begin(), keys.end(), k) == keys.end()) keys.push_back(std::move(k));
+        };
+        add(op.folder);
+        for (const auto& s : sources) add(s);
+    }
+    std::unique_lock<std::mutex> l(g_qLock);
+    job.keys = std::move(keys);
+    job.keysReady = true;
+    g_qCv.notify_all();
+    g_qCv.wait(l, [&] { return CanStart(job); });
+    job.running = true;
+    job.hold = false;
+    job.start = GetTickCount64();
+    g_qCv.notify_all();
+}
+
+void Leave(const std::shared_ptr<Job>& job) {
+    std::lock_guard<std::mutex> l(g_qLock);
+    g_jobs.erase(std::remove(g_jobs.begin(), g_jobs.end(), job), g_jobs.end());
+    g_qCv.notify_all();
+}
 
 DWORD WINAPI Run(void* p) {
     std::unique_ptr<Task> t((Task*)p);
@@ -334,7 +421,14 @@ DWORD WINAPI Run(void* p) {
         buf.resize(wcslen(buf.c_str()));
         r->sources.push_back(std::move(buf));
     }
-    r->hr = SUCCEEDED(init) ? Perform(t->op, t->owner, *r) : init;
+    if (t->job) WaitTurn(*t->job, t->op, r->sources);
+    if (t->job && t->job->prog.cancel) {  // annulée avant son tour : rien n'a été fait
+        r->aborted = true;
+        r->hr = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    } else {
+        r->hr = SUCCEEDED(init) ? Perform(t->op, t->owner, *r, t->job.get()) : init;
+    }
+    if (t->job) Leave(t->job);
     if (r->hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION) || r->hr == HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION)) {
         const std::wstring who = FileOps_Lockers(r->sources);
         if (!who.empty()) r->detail = L"ouvert dans " + who;
@@ -356,7 +450,31 @@ CLIPFORMAT DropEffectFormat() {
 }  // namespace
 
 void FileOps_Start(HWND owner, HWND target, UINT msg, FileOp op) {
-    auto* t = new Task{owner, target, msg, std::move(op)};
+    auto* t = new Task{owner, target, msg, std::move(op), nullptr};
+    if (t->op.kind == FileOpKind::Copy || t->op.kind == FileOpKind::Move) {
+        auto job = std::make_shared<Job>();
+        job->move = t->op.kind == FileOpKind::Move;
+        const size_t n = t->op.paths.size() + t->op.items.size();
+        std::wstring what;
+        if (n == 1 && t->op.paths.size() == 1) {
+            std::wstring parent, leaf;
+            what = ParentOf(t->op.paths[0], parent, leaf) ? L"« " + leaf + L" »" : L"« " + t->op.paths[0] + L" »";
+        } else if (n == 1) {  // collage : un élément Shell (nom tiré de son identifiant, sans accès disque)
+            PWSTR name = nullptr;
+            if (SUCCEEDED(SHGetNameFromIDList(t->op.items[0].get(), SIGDN_PARENTRELATIVEPARSING, &name)) && name)
+                what = L"« " + std::wstring(name) + L" »";
+            else
+                what = L"1 élément";
+            CoTaskMemFree(name);
+        } else {
+            what = std::to_wstring(n) + (n > 1 ? L" éléments" : L" élément");
+        }
+        job->title = (job->move ? L"Déplacement de " : L"Copie de ") + what + L" vers " + t->op.folder;
+        std::lock_guard<std::mutex> l(g_qLock);  // inscrite tout de suite : l'ordre d'arrivée est gardé
+        job->id = ++g_nextJob;
+        g_jobs.push_back(job);
+        t->job = std::move(job);
+    }
     ++g_running;
     HANDLE th = CreateThread(nullptr, 0, Run, t, 0, nullptr);
     if (th) {
@@ -368,6 +486,7 @@ void FileOps_Start(HWND owner, HWND target, UINT msg, FileOp op) {
     r->kind = t->op.kind;
     r->folder = t->op.folder;
     r->hr = HRESULT_FROM_WIN32(GetLastError());
+    if (t->job) Leave(t->job);
     delete t;
     if (!PostMessageW(target, msg, 0, (LPARAM)r)) delete r;
 }
@@ -376,6 +495,10 @@ int FileOps_Running() { return g_running.load(); }
 
 bool FileOps_Progress(FileOpsProgress& p) {
     p = FileOpsProgress{};
+    {
+        std::lock_guard<std::mutex> q(g_qLock);
+        for (const auto& j : g_jobs) p.waiting += j->running ? 0 : 1;
+    }
     std::lock_guard<std::mutex> l(g_fastLock);
     for (const FastProgress* f : g_fast) {
         p.bytesDone += f->bytesDone;
@@ -389,8 +512,98 @@ bool FileOps_Progress(FileOpsProgress& p) {
 }
 
 void FileOps_Cancel() {
-    std::lock_guard<std::mutex> l(g_fastLock);
-    for (FastProgress* f : g_fast) f->cancel = true;
+    {
+        std::lock_guard<std::mutex> l(g_fastLock);
+        for (FastProgress* f : g_fast) f->cancel = true;
+    }
+    std::lock_guard<std::mutex> q(g_qLock);
+    for (const auto& j : g_jobs)
+        if (!j->running || !j->shell) j->prog.cancel = true;  // le Shell a sa propre fenêtre et son bouton
+    g_qCv.notify_all();
+}
+
+std::vector<FileOpJob> FileOps_Jobs() {
+    std::vector<FileOpJob> v;
+    std::lock_guard<std::mutex> l(g_qLock);
+    for (const auto& j : g_jobs) {
+        FileOpJob o;
+        o.id = j->id;
+        o.title = j->title;
+        o.running = j->running;
+        o.paused = j->running ? j->prog.pause.load() : j->hold;
+        o.shell = j->shell;
+        o.move = j->move;
+        o.bytesDone = j->prog.bytesDone;
+        o.bytesTotal = j->prog.bytesTotal;
+        o.filesDone = j->prog.filesDone;
+        o.filesTotal = j->prog.filesTotal;
+        o.start = j->start;
+        v.push_back(std::move(o));
+    }
+    return v;
+}
+
+template <class F>
+void WithJob(uint64_t id, F f) {
+    std::lock_guard<std::mutex> l(g_qLock);
+    for (const auto& j : g_jobs)
+        if (j->id == id) f(*j);
+    g_qCv.notify_all();
+}
+
+void FileOps_Pause(uint64_t id, bool pause) {
+    WithJob(id, [&](Job& j) {
+        if (j.running) j.prog.pause = pause && !j.shell;
+        else j.hold = pause;
+    });
+}
+
+void FileOps_StartNow(uint64_t id) {
+    WithJob(id, [](Job& j) {
+        j.now = true;
+        j.hold = false;
+    });
+}
+
+void FileOps_CancelJob(uint64_t id) {
+    WithJob(id, [](Job& j) {
+        j.prog.cancel = true;
+        j.prog.pause = false;
+    });
+}
+
+std::wstring FileOps_DiskKey(const std::wstring& path) {
+    std::wstring vol = VolumeOf(path);
+    if (vol.empty()) {
+        if (!IsUnc(path)) return L"";
+        vol = path;
+    }
+    if (IsUnc(vol)) {  // \\serveur\partage : le serveur
+        const size_t e = vol.find(L'\\', 2);
+        std::wstring s = vol.substr(2, e == std::wstring::npos ? std::wstring::npos : e - 2);
+        CharLowerBuffW(s.data(), (DWORD)s.size());
+        return L"net:" + s;
+    }
+    if (GetDriveTypeW(vol.c_str()) == DRIVE_REMOTE) {
+        wchar_t remote[MAX_PATH] = {};
+        DWORD n = MAX_PATH;
+        const std::wstring drive = vol.substr(0, 2);
+        if (WNetGetConnectionW(drive.c_str(), remote, &n) == NO_ERROR && IsUnc(remote)) return FileOps_DiskKey(remote);
+        return L"net:" + drive;
+    }
+    wchar_t guid[MAX_PATH] = {};
+    if (!GetVolumeNameForVolumeMountPointW(vol.c_str(), guid, MAX_PATH)) return L"vol:" + vol;
+    std::wstring dev = guid;
+    if (!dev.empty() && dev.back() == L'\\') dev.pop_back();  // \\?\Volume{…} : le volume lui-même
+    HANDLE h = CreateFileW(dev.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        STORAGE_DEVICE_NUMBER sdn{};
+        DWORD got = 0;
+        const bool ok = DeviceIoControl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0, &sdn, sizeof sdn, &got, nullptr) != FALSE;
+        CloseHandle(h);
+        if (ok) return L"disk:" + std::to_wstring(sdn.DeviceNumber);  // deux partitions d'un même disque : même clé
+    }
+    return L"vol:" + std::wstring(guid);
 }
 
 bool ConfirmDelete(HWND owner, const std::vector<std::wstring>& names, bool permanent) {

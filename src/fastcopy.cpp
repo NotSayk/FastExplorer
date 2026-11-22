@@ -89,6 +89,11 @@ bool Inventory(Top& t, const FastProgress& prog) {
     return true;
 }
 
+// Pause demandée (file d'attente des copies) : on attend, sans rien fermer.
+void WaitWhilePaused(const FastProgress& p) {
+    while (p.pause && !p.cancel) Sleep(50);
+}
+
 struct CopyCtx {
     FastProgress* prog;
     uint64_t last = 0;
@@ -100,6 +105,7 @@ DWORD CALLBACK OnProgress(LARGE_INTEGER, LARGE_INTEGER done, LARGE_INTEGER, LARG
     const uint64_t now = (uint64_t)done.QuadPart;
     c->prog->bytesDone += now - c->last;
     c->last = now;
+    WaitWhilePaused(*c->prog);
     return c->prog->cancel ? PROGRESS_CANCEL : PROGRESS_CONTINUE;
 }
 
@@ -207,6 +213,7 @@ bool FastTransfer(const std::vector<std::wstring>& sources, const std::wstring& 
     if (sameVolume) {
         prog.filesTotal = (uint32_t)tops.size();
         for (auto& t : tops) {
+            WaitWhilePaused(prog);
             if (prog.cancel) {
                 out.cancelled = true;
                 break;
@@ -266,6 +273,7 @@ bool FastTransfer(const std::vector<std::wstring>& sources, const std::wstring& 
     auto worker = [&] {
         for (size_t i; (i = next++) < jobs.size();) {
             Job& j = jobs[i];
+            WaitWhilePaused(prog);
             if (prog.cancel) return;
             if (j.top->failed) continue;
             CopyCtx ctx{&prog};

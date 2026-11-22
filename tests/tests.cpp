@@ -1361,6 +1361,89 @@ void TestDrop() {
     CHECK(waitFor(Join(src, L"dans_sous.txt"), false));
 }
 
+void TestCopyQueue() {
+    wchar_t win[MAX_PATH];
+    GetWindowsDirectoryW(win, MAX_PATH);
+    const std::wstring kWin = FileOps_DiskKey(win), kRoot = FileOps_DiskKey(g_root);
+    CHECK(!kWin.empty());
+    CHECK_STR(FileOps_DiskKey(Join(win, L"System32")), kWin);  // même volume : même clé
+    CHECK_STR(FileOps_DiskKey(L"\\\\Serveur\\partage\\x"), L"net:serveur");
+    printf("  disques : %ls, %ls\n", kWin.c_str(), kRoot.c_str());
+
+    HWND sink = CreateWindowW(L"FeTestSink", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    constexpr UINT kMsg = WM_APP + 11;
+    const std::wstring base = Join(g_root, L"queue");
+    CreateDirectoryW(base.c_str(), nullptr);
+    const std::wstring big = Join(base, L"gros.bin");
+    {
+        HANDLE h = CreateFileW(big.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        std::string block(1 << 20, 'x');
+        DWORD w = 0;
+        for (int i = 0; i < 64; ++i) WriteFile(h, block.data(), (DWORD)block.size(), &w, nullptr);
+        CloseHandle(h);
+    }
+    auto copyTo = [&](const wchar_t* sub) {
+        const std::wstring d = Join(base, sub);
+        CreateDirectoryW(d.c_str(), nullptr);
+        FileOp op;
+        op.kind = FileOpKind::Copy;
+        op.folder = d;
+        op.paths = {big};
+        op.silent = true;
+        FileOps_Start(nullptr, sink, kMsg, std::move(op));
+        return Join(d, L"gros.bin");
+    };
+    auto waitResults = [&](int n) {
+        std::vector<std::unique_ptr<FileOpResult>> v;
+        const double t0 = NowMs();
+        MSG m;
+        while ((int)v.size() < n && NowMs() - t0 < 20000) {
+            if (PeekMessageW(&m, sink, kMsg, kMsg, PM_REMOVE)) v.emplace_back((FileOpResult*)m.lParam);
+            else Sleep(2);
+        }
+        return v;
+    };
+    auto state = [](uint64_t id, bool& running, bool& paused) {
+        for (const auto& j : FileOps_Jobs())
+            if (j.id == id) {
+                running = j.running;
+                paused = j.paused;
+                return true;
+            }
+        return false;
+    };
+
+    // A puis B sur le même disque : B attend. Retenue, B ne démarre pas même après A.
+    const std::wstring a = copyTo(L"a"), b = copyTo(L"b");
+    auto jobs = FileOps_Jobs();
+    CHECK(jobs.size() == 2);
+    if (jobs.size() != 2) return;
+    const uint64_t idB = jobs[1].id;
+    CHECK(jobs[0].title.find(L"gros.bin") != std::wstring::npos);
+    FileOps_Pause(idB, true);
+    auto r = waitResults(1);  // A
+    CHECK(r.size() == 1 && SUCCEEDED(r[0]->hr));
+    CHECK(Exists(a));
+    Sleep(200);
+    bool running = true, paused = false;
+    CHECK(state(idB, running, paused) && !running && paused);
+    CHECK(!Exists(b));
+    FileOps_Pause(idB, false);  // reprise : B passe
+    r = waitResults(1);
+    CHECK(r.size() == 1 && SUCCEEDED(r[0]->hr));
+    CHECK(Exists(b));
+
+    // C retenue puis annulée : rien n'est copié, résultat « annulé ».
+    const std::wstring c = copyTo(L"c");
+    jobs = FileOps_Jobs();
+    if (!jobs.empty()) FileOps_CancelJob(jobs.back().id);
+    r = waitResults(1);
+    CHECK(r.size() == 1 && r[0]->aborted && !FileOps_IsFailure(*r[0]));
+    CHECK(FileOps_Jobs().empty());
+    DestroyWindow(sink);
+    RemoveTree(base);
+}
+
 void TestPane() {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
@@ -1434,6 +1517,7 @@ int wmain() {
     TestSearch();
     TestFastCopy();
     TestFileOps();
+    TestCopyQueue();  // après TestFileOps : classe de fenêtre FeTestSink
     TestDrop();
     RemoveTree(g_root);
     printf("\n%d verifications OK, %d echec(s)\n", g_pass, g_fail);

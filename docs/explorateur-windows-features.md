@@ -551,7 +551,7 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | **Taille des dossiers** | Calcul en tâche de fond, colonne Taille remplie pour les dossiers, cache | ✅ P1 ⭐ (3 threads en priorité d'E/S basse, jonctions non suivies, « ≥ » si un sous-dossier est illisible, tri par taille, cache de 30 s périmé par les opérations de fichiers ; F5 recalcule ; pas sur les lecteurs réseau et optiques) |
 | **Recherche instantanée** sur tout le disque | Index MFT + journal USN (à la *Everything*) | ✅ P1 ⭐ (service `FastExplorerIndex` installé une fois, en un clic : table des fichiers NTFS lue en < 1 s, suivie par le journal USN ; canal nommé réservé à l'utilisateur, serveur vérifié ; ~140 ms dans tout le PC, 79 000 résultats en 0,7 s ; sans service : parcours des dossiers, Ce PC = tous les disques locaux) |
 | **Double panneau** (à la Total Commander) | Deux listes côte à côte, F5/F6 copier/déplacer vers l'autre panneau | P1 ⭐ |
-| **File d'attente de copies** | Copies mises en file (pas en parallèle sur le même disque), pause/reprise, reprise après erreur, vérification | P1 ⭐ |
+| **File d'attente de copies** | Copies mises en file (pas en parallèle sur le même disque), pause/reprise, reprise après erreur, vérification | ✅ P1 ⭐ (file par disque physique ou serveur, en parallèle sur des disques différents ; fenêtre « File d'attente des copies » : suspendre / reprendre, démarrer maintenant, annuler ; s'ouvre seule quand une copie attend son tour) ; reprise après erreur et vérification : P2 |
 | **Renommage par lot avancé** | Motifs, expressions régulières, compteur, casse, aperçu avant/après | P2 ⭐ |
 | **Filtre instantané** du dossier courant | Taper pour filtrer la liste (sans lancer de recherche) | ✅ ⭐ (bloc 11 : zone de recherche, à chaque frappe, sans lire le disque ; filtre aussi des résultats de recherche ; mêmes règles que la recherche) |
 | **Raccourcis personnalisables** | Table de raccourcis éditable | P2 ⭐ |
@@ -633,7 +633,7 @@ dossiers avant l'index…) :
 17. ✅ **Colonnes** : choix des colonnes (Property System), vue mémorisée par dossier.
 18. ✅ **Volets d'aperçu et de détails** (Alt+P, Alt+Maj+P) : preview handlers hors processus, propriétés
     modifiables, sélection multiple, largeur réglable.
-19. **File d'attente de copies** ⭐ : opérations à la suite plutôt qu'en parallèle sur un même disque,
+19. ✅ **File d'attente de copies** ⭐ : opérations à la suite plutôt qu'en parallèle sur un même disque,
     pause / reprise, liste visible.
 20. **Double panneau** ⭐ (à la Total Commander), sur la base des onglets.
 21. **Corbeille et Accueil** : parcourir, restaurer, vider ; page d'Accueil (Accès rapide, récents).
