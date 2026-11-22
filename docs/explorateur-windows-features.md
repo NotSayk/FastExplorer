@@ -364,11 +364,11 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Parcourir un ZIP comme un dossier | Double-clic : naviguer, glisser des fichiers dehors, ouvrir (extraction temporaire) | P1 |
-| Extraire tout | Assistant avec choix de destination | P1 |
-| Compresser | ZIP (historique) ; **7z et TAR** (23H2+) avec options : format, niveau de compression, méthode | P1 |
-| Lecture native | RAR, 7z, TAR, GZ, BZ2, XZ, ZSTD… (via libarchive, 23H2+), formats étendus en 26H2 | P1 |
-| Performances | Extraction ZIP native réputée lente (améliorée en 2024–2025) | ⭐ opportunité |
+| Parcourir un ZIP comme un dossier | Double-clic : naviguer, glisser des fichiers dehors, ouvrir (extraction temporaire) | ✅ P1 (bloc 22 : notre propre lecteur ZIP — ZIP64, noms UTF-8 / OEM, dates NTFS —, chemin « a.zip\sous-dossier », lecture seule ; ouvrir, Ctrl+C et glisser extraient dans un dossier temporaire par archive ; ZIP dans un ZIP parcouru aussi ; F5 / F6 en double panneau = extraction vers l'autre panneau) |
+| Extraire tout | Assistant avec choix de destination | ✅ P1 (« Extraire tout » dans un dossier au nom de l'archive, « Extraire vers… » avec choix du dossier ; depuis la vue de l'archive : on entre dans le dossier extrait ; jamais d'écrasement : « nom (2) ») |
+| Compresser | ZIP (historique) ; **7z et TAR** (23H2+) avec options : format, niveau de compression, méthode | ✅🟡 P1 (ZIP : « Compresser dans un fichier ZIP », nommé d'après le premier élément, renommage proposé aussitôt ; 7z / TAR et options à venir) |
+| Lecture native | RAR, 7z, TAR, GZ, BZ2, XZ, ZSTD… (via libarchive, 23H2+), formats étendus en 26H2 | ✅🟡 P1 (extraction de 7z, RAR, TAR, GZ, BZ2, XZ, ZSTD, CAB par le tar.exe de Windows ; seul le ZIP se parcourt) |
+| Performances | Extraction ZIP native réputée lente (améliorée en 2024–2025) | ✅ ⭐ (DEFLATE à nous : extraction sur 8 threads, compression par blocs de 1 Mo en parallèle, fichiers déjà compressés stockés tels quels, progression et annulation dans la file des copies) |
 
 ---
 
@@ -637,7 +637,7 @@ dossiers avant l'index…) :
     pause / reprise, liste visible.
 20. ✅ **Double panneau** ⭐ (à la Total Commander), sur la base des onglets.
 21. ✅ **Corbeille et Accueil** : parcourir, restaurer, vider ; page d'Accueil (Accès rapide, récents).
-22. **Archives** : parcourir un ZIP comme un dossier, extraire tout, compresser.
+22. ✅ **Archives** : parcourir un ZIP comme un dossier, extraire tout, compresser.
 23. **Réseau** : lister les partages d'un serveur (`\\serveur`).
 24. **Barre de commandes et menu rapide** : nos commandes courantes en un clic, accès au menu du Shell,
     renommage multiple.

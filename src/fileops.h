@@ -17,7 +17,11 @@
 
 // Restore : remet des éléments de la Corbeille à leur place d'origine (annuler une suppression).
 // RestoreBin : idem depuis la vue Corbeille (paths = éléments $R…). EmptyBin : vider la Corbeille.
-enum class FileOpKind { Copy, Move, Delete, Rename, NewFolder, Restore, RestoreBin, EmptyBin };
+// Extract : paths[0] = archive, folder = destination. Compress : paths → folder\newName (.zip).
+enum class FileOpKind { Copy, Move, Delete, Rename, NewFolder, Restore, RestoreBin, EmptyBin, Extract, Compress };
+
+// Suite donnée par l'interface à une extraction (renvoyée telle quelle).
+enum class ThenDo { Nothing, Open, Clipboard, Show };
 
 struct FileOp {
     FileOpKind kind = FileOpKind::Copy;
@@ -34,6 +38,12 @@ struct FileOp {
     DWORD clipSeq = 0;
     int64_t since = 0;                // Restore : supprimés depuis ce moment (FILETIME UTC)
     int tag = 0;                      // renvoyé tel quel (annuler / rétablir)
+    // Extract :
+    std::wstring innerBase;              // dossier de l'archive où sont les éléments ("" : racine)
+    std::vector<std::wstring> inner;     // éléments à extraire (vide : tout)
+    bool newFolder = false;              // dans un nouveau dossier au nom de l'archive (« Extraire tout »)
+    bool overwrite = false;              // remplacer ce qui existe (dossier temporaire)
+    ThenDo then = ThenDo::Nothing;
 };
 
 struct FileOpResult {
@@ -52,6 +62,7 @@ struct FileOpResult {
     int64_t started = 0;                // début de l'opération (FILETIME UTC)
     int tag = 0;                        // = FileOp::tag
     std::wstring detail;                // explication d'un échec (« ouvert dans Word »…), sinon vide
+    ThenDo then = ThenDo::Nothing;      // = FileOp::then
 };
 
 // Remet `original` (chemin complet d'avant la suppression) depuis la Corbeille
@@ -84,6 +95,7 @@ struct FileOpsProgress {
     uint64_t bytesDone = 0, bytesTotal = 0;
     uint32_t filesDone = 0, filesTotal = 0;
     bool move = false;
+    const wchar_t* label = nullptr;  // « Extraction »… (nullptr : copie / déplacement)
     ULONGLONG start = 0;
     uint32_t waiting = 0;  // copies en file d'attente (rempli même sans copie en cours)
 };

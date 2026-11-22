@@ -1,5 +1,7 @@
 #include "fileops.h"
 
+#include "archive.h"
+
 #include "fastcopy.h"
 #include "paths.h"
 #include "shellmenu.h"
@@ -294,7 +296,73 @@ HRESULT RestoreBin(const FileOp& op, FileOpResult& r) {
     return first && !done ? HRESULT_FROM_WIN32(first) : S_OK;
 }
 
+// Nom libre dans `dir` : « nom », sinon « nom (2) »… (extension gardée pour un fichier).
+std::wstring FreeName(const std::wstring& dir, const std::wstring& name, bool isDir) {
+    auto taken = [&](const std::wstring& n) { return GetFileAttributesW(ToNtPath(Join(dir, n.c_str())).c_str()) != INVALID_FILE_ATTRIBUTES; };
+    if (!taken(name)) return name;
+    std::wstring stem = name, ext;
+    const size_t dot = name.rfind(L'.');
+    if (!isDir && dot != std::wstring::npos && dot > 0) {
+        stem = name.substr(0, dot);
+        ext = name.substr(dot);
+    }
+    for (int i = 2; i < 10000; ++i)
+        if (std::wstring n = stem + L" (" + std::to_wstring(i) + L")" + ext; !taken(n)) return n;
+    return name;
+}
+
+HRESULT ExtractOp(const FileOp& op, FileOpResult& r, Job* job) {
+    if (op.paths.empty()) return E_INVALIDARG;
+    FastProgress local;
+    FastProgress& prog = job ? job->prog : local;
+    prog.label = L"Extraction";
+    prog.start = GetTickCount64();
+    std::wstring dest = op.folder, made;
+    if (op.newFolder) {
+        std::wstring parent, leaf;
+        if (!ParentOf(op.paths[0], parent, leaf)) leaf = op.paths[0];
+        made = FreeName(op.folder, Archive_Stem(leaf), true);
+        dest = Join(op.folder, made.c_str());
+    }
+    ExtractOptions o;
+    o.base = op.innerBase;
+    o.items = op.inner;
+    o.overwrite = op.overwrite;
+    std::vector<std::wstring> created;
+    DWORD e;
+    {
+        FastReg reg(prog);
+        e = Archive_Extract(op.paths[0], dest, o, prog, &created, &r.detail);
+    }
+    r.aborted = prog.cancel;
+    if (op.newFolder) {
+        if (GetFileAttributesW(dest.c_str()) != INVALID_FILE_ATTRIBUTES && !RemoveDirectoryW(dest.c_str())) r.created = {made};
+    } else {
+        for (auto& c : created)
+            if (!c.empty()) r.created.push_back(std::move(c));
+    }
+    return e ? HRESULT_FROM_WIN32(e) : S_OK;
+}
+
+HRESULT CompressOp(const FileOp& op, FileOpResult& r, Job* job) {
+    FastProgress local;
+    FastProgress& prog = job ? job->prog : local;
+    prog.label = L"Compression";
+    prog.start = GetTickCount64();
+    const std::wstring name = FreeName(op.folder, op.newName, false);
+    DWORD e;
+    {
+        FastReg reg(prog);
+        e = Zip_Create(Join(op.folder, name.c_str()), op.paths, prog, &r.detail);
+    }
+    r.aborted = prog.cancel;
+    if (!e) r.created = {name};
+    return e ? HRESULT_FROM_WIN32(e) : S_OK;
+}
+
 HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r, Job* job) {
+    if (op.kind == FileOpKind::Extract) return ExtractOp(op, r, job);
+    if (op.kind == FileOpKind::Compress) return CompressOp(op, r, job);
     if (op.kind == FileOpKind::NewFolder) return NewFolder(op, owner, r);
     if (op.kind == FileOpKind::Restore) return Restore(op, r);
     if (op.kind == FileOpKind::RestoreBin) return RestoreBin(op, r);
@@ -443,6 +511,7 @@ DWORD WINAPI Run(void* p) {
     r->newName = t->op.newName;
     r->permanent = t->op.permanent;
     r->tag = t->op.tag;
+    r->then = t->op.then;
     FILETIME now;
     GetSystemTimeAsFileTime(&now);
     r->started = (int64_t)(((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime);
@@ -483,7 +552,24 @@ CLIPFORMAT DropEffectFormat() {
 
 void FileOps_Start(HWND owner, HWND target, UINT msg, FileOp op) {
     auto* t = new Task{owner, target, msg, std::move(op), nullptr};
-    if (t->op.kind == FileOpKind::Copy || t->op.kind == FileOpKind::Move) {
+    if (t->op.kind == FileOpKind::Extract || t->op.kind == FileOpKind::Compress) {
+        auto job = std::make_shared<Job>();
+        std::wstring parent, leaf;
+        if (t->op.kind == FileOpKind::Extract) {
+            if (!t->op.paths.empty() && !ParentOf(t->op.paths[0], parent, leaf)) leaf = t->op.paths[0];
+            job->title = L"Extraction de « " + leaf + L" » vers " + t->op.folder;
+        } else {
+            const size_t n = t->op.paths.size();
+            job->title = L"Compression de " + (n == 1 && ParentOf(t->op.paths[0], parent, leaf) ? L"« " + leaf + L" »"
+                                                                                                   : std::to_wstring(n) + L" éléments") +
+                         L" dans « " + t->op.newName + L" »";
+        }
+        job->now = t->op.then != ThenDo::Nothing;  // ouvrir / copier un élément : sans attendre la file
+        std::lock_guard<std::mutex> l(g_qLock);
+        job->id = ++g_nextJob;
+        g_jobs.push_back(job);
+        t->job = std::move(job);
+    } else if (t->op.kind == FileOpKind::Copy || t->op.kind == FileOpKind::Move) {
         auto job = std::make_shared<Job>();
         job->move = t->op.kind == FileOpKind::Move;
         const size_t n = t->op.paths.size() + t->op.items.size();
@@ -538,6 +624,7 @@ bool FileOps_Progress(FileOpsProgress& p) {
         p.filesDone += f->filesDone;
         p.filesTotal += f->filesTotal;
         p.move |= f->move;
+        if (f->label) p.label = f->label;
         if (!p.start || f->start < p.start) p.start = f->start;
     }
     return !g_fast.empty();

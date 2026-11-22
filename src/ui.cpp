@@ -21,6 +21,7 @@
 #include "panes.h"
 #include "paths.h"
 #include "places.h"
+#include "archive.h"
 #include "shellmenu.h"
 #include "util.h"
 #include "watch.h"
@@ -514,7 +515,7 @@ void ForgetSizes(const std::wstring& path) {
 }
 
 bool SizesWanted(const DirData& d) {
-    if (d.isRoot() || d.isVirtual() || !d.query.empty() || d.path.size() < 2) return false;
+    if (d.isRoot() || d.isVirtual() || d.inArchive() || !d.query.empty() || d.path.size() < 2) return false;
     if (d.path[0] == L'\\' && d.path[1] == L'\\') return false;  // UNC
     const wchar_t root[4] = {d.path[0], L':', L'\\', 0};
     const UINT t = GetDriveTypeW(root);
@@ -764,7 +765,8 @@ int BigImage(int idx, int sysIcon) {
         const Entry& e = E(idx);
         th = THUMB_NONE;
         // Dossier : aperçu de ses premiers fichiers, lisible à partir de 48 px.
-        if (!g_view.data->isRoot() && Thumbs_Wanted(e.attr, e.size) && !(e.isDir() && g_bigPx < S(48))) {
+        if (!g_view.data->isRoot() && !g_view.data->inArchive() && Thumbs_Wanted(e.attr, e.size) &&
+            !(e.isDir() && g_bigPx < S(48))) {
             th = THUMB_PENDING;
             Thumbs_Request(g_view.serial, (uint32_t)idx, FullPath(idx), g_bigPx);
         }
@@ -959,7 +961,7 @@ void RequestRowProps(int idx, bool urgent) {
 void RequestSortProps() {
     g_propWaiting = 0;
     g_propSortWait.clear();
-    if (g_sort.key != COL_PROP || !HasView() || g_view.data->isRoot()) return;
+    if (g_sort.key != COL_PROP || !HasView() || g_view.data->isRoot() || g_view.data->inArchive()) return;
     PropValues* pv = PropsOf(g_sort.pk);
     const size_t n = g_view.data->entries.size();
     g_propSortWait.assign(n, 0);
@@ -998,7 +1000,7 @@ void FillDispInfo(LVITEMW& it) {
             // Icône du type tout de suite ; l'icône propre (exe, lnk…) suit en tâche de fond.
             g_view.icons[idx] = IconFor(idx);
             st = ICON_GENERIC;
-            if (!g_view.data->isRoot() && NeedsOwnIcon(e.attr, NameOf(idx) + e.extOff, e.nameLen - e.extOff)) {
+            if (!g_view.data->isRoot() && !g_view.data->inArchive() && NeedsOwnIcon(e.attr, NameOf(idx) + e.extOff, e.nameLen - e.extOff)) {
                 st = ICON_PENDING;
                 Icons_Request(g_view.serial, (uint32_t)idx, FullPath(idx));
             }
@@ -1122,8 +1124,15 @@ std::vector<ColSpec> VirtualColumns(const std::wstring& path) {
     return v;
 }
 
-// Colonnes imposées (Ce PC, Corbeille, Accueil) : ni mémorisées ni appliquées aux dossiers.
-bool FixedColumns() { return HasView() && (g_view.data->isRoot() || g_view.data->isVirtual()); }
+// Archive : ce que le répertoire du ZIP sait (pas de propriétés du Shell).
+std::vector<ColSpec> ArchiveColumns() {
+    return {Columns_Builtin(COL_NAME), Columns_Builtin(COL_DATE), Columns_Builtin(COL_TYPE), Columns_Builtin(COL_SIZE)};
+}
+
+// Colonnes imposées (Ce PC, Corbeille, Accueil, archives) : ni mémorisées ni appliquées aux dossiers.
+bool FixedColumns() {
+    return HasView() && (g_view.data->isRoot() || g_view.data->isVirtual() || g_view.data->inArchive());
+}
 
 bool g_applyingCols = false;  // colonnes reconstruites par le programme : rien à mémoriser
 std::vector<ColSpec> g_folderCols = Columns_Default();  // colonnes des dossiers (hors Ce PC), dans l'ordre affiché
@@ -1192,7 +1201,10 @@ void ApplyColumns(std::vector<ColSpec> cols) {
 // Ce PC ↔ dossier : colonnes à changer ?
 void UpdateColumnsForView() {
     const bool root = HasView() && g_view.data->isRoot();
-    const std::vector<ColSpec> want = root ? RootColumns() : InVirtual() ? VirtualColumns(g_view.data->path) : g_folderCols;
+    const std::vector<ColSpec> want = root                               ? RootColumns()
+                                      : InVirtual()                        ? VirtualColumns(g_view.data->path)
+                                      : HasView() && g_view.data->inArchive() ? ArchiveColumns()
+                                                                           : g_folderCols;
     if (ColumnsKey(want) != ColumnsKey(CurrentColumns())) ApplyColumns(want);
 }
 
@@ -1633,6 +1645,8 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
             Recycle_Enumerate(*d, ct);
         } else if (path == kHomePath) {
             Home_Enumerate(*d, pins, ct);
+        } else if (std::wstring arc, inner; Archive_Split(path, arc, inner)) {
+            Archive_Enumerate(*d, ct);  // ZIP : parcouru comme un dossier (pas de recherche dedans)
         } else if (!q.empty()) {
             if (SearchIndexed(*d, q, prefs, ct)) {
                 // index : tout est là d'un coup
@@ -1750,7 +1764,7 @@ void UpdatePane() {
     if (Pane_Mode() == PaneMode::None) return;
     std::vector<PaneItem> items;
     std::wstring title, text;
-    if (HasView() && !g_view.data->isRoot()) {
+    if (HasView() && !g_view.data->isRoot() && !g_view.data->inArchive()) {
         for (int r = -1; (r = ListView_GetNextItem(g_list, r, LVNI_SELECTED)) >= 0 && items.size() < 100;) {
             const int e = EntryAt(r);
             if (e < 0) continue;
@@ -2031,7 +2045,7 @@ void OnResult(Result* raw) {
     }
 
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
-    if (g_path.empty() || IsVirtualPath(g_path)) {
+    if (g_path.empty() || IsVirtualPath(g_path) || d.inArchive()) {
         Watch_Stop();
         g_watchPath.clear();
         g_watchFailed.clear();
@@ -2067,7 +2081,7 @@ void OnResult(Result* raw) {
     if (!d.vanished.empty()) g_goneNote = L"« " + d.vanished + L" » n'est plus accessible";
     else if (p.nav != Nav::Refresh) g_goneNote.clear();
     ShowSummary();
-    if (!g_path.empty() && !d.isVirtual()) WarmUpMenus(d);
+    if (!g_path.empty() && !d.isVirtual() && !d.inArchive()) WarmUpMenus(d);
     RegisterShellNotify();
 
     // Nouvel élément créé par une commande du fond du dossier : renommage direct.
@@ -2243,8 +2257,123 @@ bool IsLnk(int idx) {
     return e.nameLen - e.extOff == 4 && _wcsicmp(NameOf(idx) + e.extOff, L".lnk") == 0;
 }
 
+// ───────────────────────────── Archives ─────────────────────────────
+//
+// Un ZIP se parcourt comme un dossier (« C:\x\a.zip\sous-dossier »), en lecture
+// seule. Ouvrir, copier ou glisser un élément l'extrait d'abord dans un dossier
+// temporaire propre à l'archive ; F5 / « Extraire vers… » l'extraient ailleurs.
+
+void StartOp(FileOp op);
+std::vector<std::wstring> NamesOf(const std::vector<int>& entries);
+
+bool InArchive() { return HasView() && g_view.data->inArchive(); }
+
+// Dossier interne affiché (« sous\dossier », "" à la racine de l'archive).
+std::wstring ArchiveInner() {
+    const DirData& d = *g_view.data;
+    return d.path.size() > d.archive.size() + 1 ? d.path.substr(d.archive.size() + 1) : std::wstring();
+}
+
+// Dossier temporaire des éléments ouverts depuis `archive` (un par archive).
+std::wstring ArchiveTemp(const std::wstring& archive) {
+    wchar_t tmp[MAX_PATH + 1] = {};
+    const DWORD n = GetTempPathW(MAX_PATH + 1, tmp);
+    uint32_t h = 2166136261u;  // FNV-1a du chemin, sans la casse
+    for (wchar_t c : archive) {
+        h ^= (uint32_t)towlower(c);
+        h *= 16777619u;
+    }
+    wchar_t hex[16];
+    swprintf_s(hex, L"%08x", h);
+    std::wstring parent, leaf;
+    if (!ParentOf(archive, parent, leaf)) leaf = L"archive";
+    return (n ? std::wstring(tmp, n) : std::wstring(L"C:\\Windows\\Temp\\")) + L"FastExplorer\\Archives\\" +
+           Archive_Stem(leaf) + L"-" + hex;
+}
+
+// Sélection (sinon l'élément ciblé) de la vue d'archive.
+std::vector<int> ArchivePicks() {
+    std::vector<int> sel = SelectedEntries();
+    if (sel.empty())
+        if (const int f = FocusedEntry(); f >= 0) sel.push_back(f);
+    return sel;
+}
+
+// Extrait des éléments de l'archive affichée. dest vide : dossier temporaire (remplacé).
+void ExtractEntries(const std::vector<int>& entries, ThenDo then, const std::wstring& dest = {}) {
+    if (!InArchive() || entries.empty()) return;
+    FileOp op;
+    op.kind = FileOpKind::Extract;
+    op.paths = {g_view.data->archive};
+    op.innerBase = ArchiveInner();
+    op.inner = NamesOf(entries);
+    op.then = then;
+    op.overwrite = dest.empty();
+    op.folder = dest.empty() ? ArchiveTemp(g_view.data->archive) : dest;
+    StartOp(std::move(op));
+}
+
+// Toute l'archive. newFolder : dans « dest\nom de l'archive » (« Extraire tout »).
+void ExtractArchive(const std::wstring& archive, const std::wstring& dest, bool newFolder, ThenDo then) {
+    FileOp op;
+    op.kind = FileOpKind::Extract;
+    op.paths = {archive};
+    op.folder = dest;
+    op.newFolder = newFolder;
+    op.then = then;
+    StartOp(std::move(op));
+    std::wstring parent, leaf;
+    if (!ParentOf(archive, parent, leaf)) leaf = archive;
+    Flash(L"Extraction de « " + leaf + L" »…");
+}
+
+// Choix d'un dossier (« Extraire vers… »). Vide : annulé.
+std::wstring PickFolder(const std::wstring& initial, const wchar_t* title) {
+    IFileOpenDialog* dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return {};
+    DWORD o = 0;
+    dlg->GetOptions(&o);
+    dlg->SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dlg->SetTitle(title);
+    IShellItem* f = nullptr;
+    if (!initial.empty() && SUCCEEDED(SHCreateItemFromParsingName(initial.c_str(), nullptr, IID_PPV_ARGS(&f)))) {
+        dlg->SetFolder(f);
+        f->Release();
+    }
+    std::wstring out;
+    IShellItem* r = nullptr;
+    if (dlg->Show(g_hwnd) == S_OK && SUCCEEDED(dlg->GetResult(&r))) {
+        PWSTR s = nullptr;
+        if (SUCCEEDED(r->GetDisplayName(SIGDN_FILESYSPATH, &s)) && s) out = s;
+        CoTaskMemFree(s);
+        r->Release();
+    }
+    dlg->Release();
+    return out;
+}
+
+// « Compresser dans un fichier ZIP » : à côté des éléments, nommé d'après le premier.
+void CompressEntries(const std::vector<int>& entries) {
+    if (entries.empty() || !HasView() || g_view.data->isRoot() || g_view.data->isVirtual() || g_view.data->inArchive())
+        return;
+    FileOp op;
+    op.kind = FileOpKind::Compress;
+    op.folder = g_path;
+    for (int e : entries) op.paths.push_back(Join(g_path, NameOf(e)));
+    std::wstring stem = NameOf(entries[0]);
+    if (!E(entries[0]).isDir())
+        if (const size_t dot = stem.rfind(L'.'); dot != std::wstring::npos && dot > 0) stem.resize(dot);
+    op.newName = stem + L".zip";
+    StartOp(std::move(op));
+    Flash(L"Compression dans « " + stem + L".zip »…");
+}
+
 void ActivateEntry(int idx) {
     if (idx < 0) return;
+    if (InArchive() && !E(idx).isDir()) {  // extrait (dossier temporaire) puis ouvert
+        ExtractEntries({idx}, ThenDo::Open);
+        return;
+    }
     if (g_view.data->path == kBinPath) {  // comme l'Explorateur : un élément supprimé ne s'ouvre pas
         Flash(L"Restaurez l'élément pour l'ouvrir (clic droit ▸ Restaurer)");
         return;
@@ -2257,6 +2386,10 @@ void ActivateEntry(int idx) {
     // Raccourci : on navigue DANS FastExplorer si la cible est un dossier
     // (le Shell ouvrirait l'Explorateur Windows). Sinon le Shell l'ouvre,
     // y compris pour une cible disparue (il propose de la rechercher).
+    if (!InArchive() && Archive_IsZip(NameOf(idx))) {  // ZIP : on entre dedans (illisible : le Shell l'ouvre)
+        Navigate(full, Nav::Normal, {}, {}, full, true);
+        return;
+    }
     std::wstring target;
     if (IsLnk(idx) && ResolveShortcut(full, target)) {
         Navigate(NormalizePath(target, L""), Nav::Normal, {}, {}, full, true);
@@ -2278,7 +2411,9 @@ std::vector<std::wstring> NamesOf(const std::vector<int>& entries) {
 
 // ───────────────────────────── Opérations sur les fichiers ─────────────────────────────
 
-bool CanModify() { return HasView() && !g_view.data->isRoot() && !g_view.data->isVirtual(); }
+bool CanModify() {
+    return HasView() && !g_view.data->isRoot() && !g_view.data->isVirtual() && !g_view.data->inArchive();
+}
 
 void StartOp(FileOp op) {
     FileOps_Start(g_hwnd, g_hwnd, WM_APP_FILEOP, std::move(op));
@@ -2331,7 +2466,7 @@ void OnProgressTimer() {
     g_progressShown = true;
     const bool bytes = p.bytesTotal > 0;
     const uint64_t done = bytes ? p.bytesDone : p.filesDone, total = bytes ? p.bytesTotal : p.filesTotal;
-    std::wstring s = p.move ? L"Déplacement : " : L"Copie : ";
+    std::wstring s = p.label ? std::wstring(p.label) + L" : " : p.move ? L"Déplacement : " : L"Copie : ";
     s += std::to_wstring(p.filesDone) + L" / " + std::to_wstring(p.filesTotal) + L" fichiers";
     if (bytes) s += L"   •   " + SizeText(p.bytesDone) + L" / " + SizeText(p.bytesTotal);
     if (total) s += L"   •   " + std::to_wstring(done * 100 / total) + L" %";
@@ -2605,6 +2740,43 @@ void OnFileOp(FileOpResult* raw) {
         case FileOpKind::Move:
             if (!c.empty()) AfterOpSelect(r->folder, c, c[0]);  // sinon la surveillance suffit
             break;
+        case FileOpKind::Compress:
+            if (!c.empty()) AfterOpSelect(r->folder, {c[0]}, c[0], c[0]);  // nom proposé, à modifier aussitôt
+            break;
+        case FileOpKind::Extract: {
+            if (FileOps_IsFailure(*r) || r->aborted || c.empty()) break;
+            const std::wstring first = Join(r->folder, c[0].c_str());
+            switch (r->then) {
+                case ThenDo::Open: {
+                    const DWORD a = GetFileAttributesW(first.c_str());
+                    if (Archive_IsZip(c[0]) || (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)))
+                        Navigate(first, Nav::Normal);  // ZIP dans le ZIP : parcouru aussi
+                    else
+                        OpenWithShell(first);
+                    break;
+                }
+                case ThenDo::Clipboard: {
+                    std::vector<std::wstring> full;
+                    for (const auto& n : c) full.push_back(Join(r->folder, n.c_str()));
+                    if (Clipboard_Put(g_hwnd, L"", full, false))
+                        SetStatus(std::to_wstring(full.size()) + (full.size() > 1 ? L" éléments copiés" : L" élément copié") +
+                                  L" dans le presse-papiers.");
+                    else
+                        SetStatus(L"Impossible d'utiliser le presse-papiers.");
+                    break;
+                }
+                case ThenDo::Show:
+                    Navigate(first, Nav::Normal);
+                    SetFocus(g_list);
+                    break;
+                default:
+                    if (HasView() && _wcsicmp(g_path.c_str(), r->folder.c_str()) == 0) AfterOpSelect(r->folder, c, c[0]);
+                    else Flash(L"Extrait dans " + r->folder);
+                    break;
+            }
+            break;
+        }
+        default: break;
     }
 }
 
@@ -2661,6 +2833,11 @@ void BinEmpty() {
 }
 
 void CopyNames(const std::vector<std::wstring>& names, bool cut) {
+    if (InArchive()) {  // extraits dans le dossier temporaire, puis mis dans le presse-papiers
+        if (cut) Flash(L"Archive en lecture seule : copiez (Ctrl+C) puis collez ailleurs");
+        else ExtractEntries(ArchivePicks(), ThenDo::Clipboard);
+        return;
+    }
     if (InVirtual() && !InBin() && !cut) {  // Accueil : copie des fichiers eux-mêmes (dossiers différents)
         const auto t = TargetsOf(SelectedEntries());
         if (!t.empty() && Clipboard_Put(g_hwnd, L"", t, false))
@@ -2920,6 +3097,33 @@ void ReclaimForeground() {
 
 void StartDrag(POINT client) {
     if (!HasView()) return;
+    if (InArchive()) {  // extraction immédiate dans le dossier temporaire, puis glisser de ces fichiers
+        const auto sel = SelectedEntries();
+        if (sel.empty()) return;
+        const std::wstring archive = g_view.data->archive, tmp = ArchiveTemp(archive);
+        ExtractOptions o;
+        o.base = ArchiveInner();
+        o.items = NamesOf(sel);
+        o.overwrite = true;
+        if (Archive_SizeOf(archive, o) > 200ull << 20) {
+            Flash(L"Trop volumineux pour un glisser : utilisez « Extraire vers… » (clic droit)");
+            return;
+        }
+        FastProgress prog;
+        std::vector<std::wstring> created;
+        std::wstring detail;
+        const HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        const DWORD e = Archive_Extract(archive, tmp, o, prog, &created, &detail);
+        SetCursor(old);
+        if (e || created.empty()) {
+            SetStatus(L"Extraction impossible : " + ErrorText(e ? e : ERROR_FILE_NOT_FOUND) +
+                      (detail.empty() ? L"" : L" (" + detail + L")"));
+            return;
+        }
+        DragDrop_Start(g_list, tmp, created, client);
+        ShellMenu_Discard();
+        return;
+    }
     if (InVirtual()) {  // Accueil : les vrais fichiers (copie) ; Corbeille : rien à glisser
         if (InBin()) return;
         const auto t = TargetsOf(SelectedEntries());
@@ -2950,12 +3154,14 @@ void RegisterDropOn(int k) {
     // Liste inactive (double panneau) : dépôt dans son dossier, ou dans un de ses sous-dossiers.
     h.folder = [k] {
         const std::wstring& p = k == g_side ? g_path : g_passive.path;
+        const View& v = k == g_side ? g_view : g_passive.view;
+        if (v.data && v.data->inArchive()) return std::wstring();  // archive : lecture seule
         return IsVirtualPath(p) ? std::wstring() : p;  // Corbeille, Accueil : pas de dépôt
     };
     h.hit = [k](POINT c, std::wstring& name) {
         if (k != g_side) {
             const View& v = g_passive.view;
-            if (!g_dual || !v.data || !g_passive.query.empty() || v.data->isVirtual()) return -1;
+            if (!g_dual || !v.data || !g_passive.query.empty() || v.data->isVirtual() || v.data->inArchive()) return -1;
             LVHITTESTINFO hit{};
             hit.pt = c;
             const int row = ListView_HitTest(g_lists[k], &hit);
@@ -3265,6 +3471,7 @@ void ReloadPassive() {
         d->path = path;
         if (path == kBinPath) Recycle_Enumerate(*d);
         else if (path == kHomePath) Home_Enumerate(*d, pins);
+        else if (std::wstring arc, inner; Archive_Split(path, arc, inner)) Archive_Enumerate(*d);
         else Enumerate(*d);
         if (!PostMessageW(hwnd, WM_APP_PASSIVE, 0, (LPARAM)d)) delete d;
     }).detach();
@@ -3355,6 +3562,17 @@ void TransferToOther(bool move) {
     const std::wstring dest = g_passive.path;
     if (dest.empty() || IsVirtualPath(dest) || !g_passive.query.empty()) {
         Flash(L"L'autre panneau ne montre pas un dossier");
+        return;
+    }
+    if (g_passive.view.data && g_passive.view.data->inArchive()) {
+        Flash(L"L'autre panneau montre une archive (lecture seule)");
+        return;
+    }
+    if (InArchive()) {  // F5 / F6 depuis une archive : extraction vers l'autre panneau
+        const auto sel = ArchivePicks();
+        if (sel.empty()) return;
+        ExtractEntries(sel, ThenDo::Nothing, dest);
+        Flash(L"Extraction de " + std::to_wstring(sel.size()) + (sel.size() > 1 ? L" éléments" : L" élément") + L" vers " + dest);
         return;
     }
     if (_wcsicmp(dest.c_str(), g_path.c_str()) == 0 && g_query.empty()) {
@@ -3561,6 +3779,50 @@ void ShowVirtualMenu(POINT pt, const std::vector<int>& sel) {
     }
 }
 
+// Vue d'archive : nos commandes (le Shell ne connaît pas ces chemins).
+void ShowArchiveMenu(POINT pt, const std::vector<int>& sel) {
+    const std::wstring archive = g_view.data->archive;
+    std::wstring parent, leaf;
+    if (!ParentOf(archive, parent, leaf)) return;
+    enum : UINT { kOpen = 1, kExtractTo, kCopy, kPaths, kAll, kAllTo, kRefresh, kProps };
+    HMENU m = CreatePopupMenu();
+    if (!sel.empty()) {
+        AppendMenuW(m, MF_STRING, kOpen, L"Ouvrir");
+        AppendMenuW(m, MF_STRING, kExtractTo, L"Extraire vers…");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, kCopy, L"Copier\tCtrl+C");
+        AppendMenuW(m, MF_STRING, kPaths, L"Copier en tant que chemin d'accès\tCtrl+Maj+C");
+        SetMenuDefaultItem(m, kOpen, FALSE);
+    } else {
+        AppendMenuW(m, MF_STRING, kAll, (L"Extraire tout dans « " + Archive_Stem(leaf) + L" »").c_str());
+        AppendMenuW(m, MF_STRING, kAllTo, L"Extraire tout vers…");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, kRefresh, L"Actualiser\tF5");
+        AppendMenuW(m, MF_STRING, kProps, L"Propriétés de l'archive\tAlt+Entrée");
+    }
+    const UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    DestroyMenu(m);
+    switch (cmd) {
+        case kOpen:
+            for (int e : sel) ActivateEntry(e);
+            break;
+        case kExtractTo:
+            if (const std::wstring to = PickFolder(parent, L"Extraire vers"); !to.empty()) ExtractEntries(sel, ThenDo::Nothing, to);
+            break;
+        case kCopy: CopyNames({}, false); break;
+        case kPaths: CopyPaths(NamesOf(sel)); break;
+        case kAll: ExtractArchive(archive, parent, true, ThenDo::Show); break;
+        case kAllTo:
+            if (const std::wstring to = PickFolder(parent, L"Extraire tout vers"); !to.empty())
+                ExtractArchive(archive, to, false, ThenDo::Nothing);
+            break;
+        case kRefresh: Refresh(); break;
+        case kProps:
+            if (!ShellMenu_Invoke(g_hwnd, parent, {leaf}, "properties")) SetStatus(L"Propriétés indisponibles.");
+            break;
+    }
+}
+
 void ShowContextMenu(LPARAM lp) {
     if (!HasView()) return;
     POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -3582,6 +3844,10 @@ void ShowContextMenu(LPARAM lp) {
         ShowVirtualMenu(pt, sel);
         return;
     }
+    if (InArchive()) {
+        ShowArchiveMenu(pt, sel);
+        return;
+    }
     // Les noms (et non des index) : la vue peut être rafraîchie pendant que le menu est ouvert.
     const std::vector<std::wstring> names = NamesOf(sel);
     std::vector<MenuExtra> extras;
@@ -3594,6 +3860,17 @@ void ShowContextMenu(LPARAM lp) {
         extras.push_back(ViewMenu());
         extras.push_back({L"Afficher les éléments masqués", ToggleHidden, false, g_prefs.showHidden});
         extras.push_back({L"Afficher les extensions de noms de fichiers", ToggleExtensions, false, g_prefs.showExtensions});
+    }
+    if (!names.empty() && !g_path.empty() && !g_view.data->isVirtual()) {  // archives : extraire, compresser
+        if (names.size() == 1 && !E(sel[0]).isDir() && Archive_IsArchive(names[0])) {
+            const std::wstring arc = Join(g_path, names[0].c_str()), here = g_path;
+            extras.push_back({L"Extraire tout", [arc, here] { ExtractArchive(arc, here, true, ThenDo::Nothing); }});
+            extras.push_back({L"Extraire vers…", [arc, here] {
+                                  const std::wstring to = PickFolder(here, L"Extraire vers");
+                                  if (!to.empty()) ExtractArchive(arc, to, false, ThenDo::Nothing);
+                              }});
+        }
+        extras.push_back({L"Compresser dans un fichier ZIP", [names] { CompressEntries(FindEntriesByNames(names)); }});
     }
     if ((!names.empty() || !g_path.empty()) && GetKeyState(VK_SHIFT) >= 0)  // Maj : le Shell la propose déjà
         extras.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C", [names] { CopyPaths(names); }});
@@ -3677,7 +3954,7 @@ void ShowNavMenu(const std::wstring& path, POINT pt) {
 // pas sélectionné, la sélection entière sinon, le fond du dossier dans le vide.
 // Si la prédiction se révèle fausse, ShellMenu_Show reconstruit simplement.
 void PrepareContextMenu(LPARAM lp, bool shift) {
-    if (!HasView() || InVirtual()) return;
+    if (!HasView() || InVirtual() || g_view.data->inArchive()) return;
     LVHITTESTINFO hit{};
     hit.pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
     const int row = ListView_HitTest(g_list, &hit);
@@ -3693,6 +3970,12 @@ void PrepareContextMenu(LPARAM lp, bool shift) {
 // Alt+Entrée : propriétés de la sélection, ou du dossier courant si rien n'est sélectionné.
 void ShowProperties() {
     if (!HasView()) return;
+    if (InArchive()) {  // celles du fichier d'archive lui-même
+        std::wstring parent, leaf;
+        if (!ParentOf(g_view.data->archive, parent, leaf) || !ShellMenu_Invoke(g_hwnd, parent, {leaf}, "properties"))
+            SetStatus(L"Propriétés indisponibles.");
+        return;
+    }
     if (InVirtual()) {  // élément réel (Accueil) ; Corbeille : celui qui est dans $Recycle.Bin
         const auto sel = SelectedEntries();
         std::wstring parent, leaf;

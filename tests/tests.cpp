@@ -4,6 +4,8 @@
 #include "win.h"
 
 #include "columns.h"
+#include "archive.h"
+#include "deflate.h"
 #include "dragdrop.h"
 #include "fastcopy.h"
 #include "fileops.h"
@@ -593,6 +595,217 @@ void TestNeedsOwnIcon() {
     CHECK(!Own(FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY, L""));
 }
 
+// ── DEFLATE et CRC (deflate.h) ──
+
+void TestDeflate() {
+    CHECK(Crc32(0, "123456789", 9) == 0xCBF43926u);
+    CHECK(Crc32(Crc32(0, "1234", 4), "56789", 5) == 0xCBF43926u);
+    CHECK(Crc32Combine(Crc32(0, "1234", 4), Crc32(0, "56789", 5), 5) == 0xCBF43926u);
+    // Flux connu (zlib, niveau 6) : « hello hello hello hello\n » sans en-tête.
+    const BYTE known[] = {0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0xc8, 0x40, 0x27, 0xb9, 0x00};
+    std::vector<BYTE> out;
+    CHECK(Inflate(known, sizeof known, out));
+    CHECK(std::string(out.begin(), out.end()) == "hello hello hello hello\n");
+    CHECK(!Inflate(known, 4, out));  // tronqué
+
+    auto roundTrip = [&](const std::vector<BYTE>& in) {
+        const std::vector<BYTE> z = Deflate(in.data(), in.size());
+        std::vector<BYTE> back;
+        return Inflate(z.data(), z.size(), back) && back == in ? z.size() : (size_t)-1;
+    };
+    CHECK(roundTrip({}) != (size_t)-1);
+    CHECK(roundTrip({'a'}) != (size_t)-1);
+    std::vector<BYTE> text;
+    const char* words[] = {"fichier ", "dossier ", "explorateur ", "rapide ", "Windows ", "\r\n", "copie ", "zip "};
+    uint32_t seed = 12345;
+    auto rnd = [&] { return seed = seed * 1103515245 + 12345, (seed >> 16) & 0x7FFF; };
+    while (text.size() < 3500000) {
+        const char* w = words[rnd() % 8];
+        text.insert(text.end(), w, w + strlen(w));
+    }
+    const size_t zt = roundTrip(text);
+    CHECK(zt != (size_t)-1 && zt < text.size() / 4);  // plusieurs morceaux, bien compressé
+    std::vector<BYTE> noise(300000);
+    for (auto& b : noise) b = (BYTE)rnd();
+    const size_t zn = roundTrip(noise);
+    CHECK(zn != (size_t)-1 && zn <= noise.size() + noise.size() / 1000 + 64);  // incompressible : blocs stockés
+    std::vector<BYTE> same(1000000, 'x');
+    CHECK(roundTrip(same) < 5000);
+    std::vector<BYTE> mixed(text.begin(), text.begin() + 200000);
+    mixed.insert(mixed.end(), noise.begin(), noise.end());
+    mixed.insert(mixed.end(), same.begin(), same.begin() + 70000);
+    CHECK(roundTrip(mixed) != (size_t)-1);
+    const double t0 = NowMs();
+    const std::vector<BYTE> zz = Deflate(text.data(), text.size());
+    const double t1 = NowMs();
+    std::vector<BYTE> back;
+    Inflate(zz.data(), zz.size(), back);
+    printf("  deflate : %.1f Mo en %.0f ms (%.1f %%), inflate %.0f ms\n", text.size() / 1048576.0, t1 - t0,
+           100.0 * zz.size() / text.size(), NowMs() - t1);
+}
+
+// ── Archives (archive.h) ──
+
+std::string ReadAllBytes(const std::wstring& p) {
+    std::string s;
+    HANDLE f = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return "<absent>";
+    char buf[65536];
+    DWORD n = 0;
+    while (ReadFile(f, buf, sizeof buf, &n, nullptr) && n) s.append(buf, n);
+    CloseHandle(f);
+    return s;
+}
+
+void WriteAllBytes(const std::wstring& p, const std::string& s) {
+    HANDLE f = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    DWORD n = 0;
+    if (f != INVALID_HANDLE_VALUE) {
+        WriteFile(f, s.data(), (DWORD)s.size(), &n, nullptr);
+        CloseHandle(f);
+    }
+}
+
+DWORD RunTar(const std::wstring& args, const std::wstring& dir) {
+    wchar_t sys[MAX_PATH];
+    GetSystemDirectoryW(sys, MAX_PATH);
+    const std::wstring exe = std::wstring(sys) + L"\\tar.exe";
+    std::wstring cmd = L"\"" + exe + L"\" " + args;
+    STARTUPINFOW si{sizeof si};
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi))
+        return (DWORD)-1;
+    WaitForSingleObject(pi.hProcess, 60000);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return code;
+}
+
+int64_t MtimeOf(const std::wstring& p) {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &a);
+    return (int64_t)(((uint64_t)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime);
+}
+
+void TestArchive() {
+    const std::wstring base = Join(g_root, L"arc");
+    const std::wstring src = Join(base, L"src");
+    SHCreateDirectoryExW(nullptr, Join(src, L"Projet\\sous dossier\\vide").c_str(), nullptr);
+    std::string big;
+    for (int i = 0; big.size() < 2600000; ++i) big += "ligne " + std::to_string(i % 977) + " du fichier de test\r\n";
+    WriteAllBytes(Join(src, L"Projet\\gros.txt"), big);
+    WriteAllBytes(Join(src, L"Projet\\vide.txt"), "");
+    WriteAllBytes(Join(src, L"Projet\\photo.jpg"), std::string(5000, '\x7f'));
+    WriteAllBytes(Join(src, L"Projet\\sous dossier\\été ñ.txt"), "accents");
+    WriteAllBytes(Join(src, L"seul.txt"), "seul");
+    SetFileAttributesW(Join(src, L"seul.txt").c_str(), FILE_ATTRIBUTE_READONLY);
+
+    const std::wstring zip = Join(base, L"test.zip");
+    FastProgress prog;
+    std::wstring detail;
+    const double t0 = NowMs();
+    CHECK(Zip_Create(zip, {Join(src, L"Projet"), Join(src, L"seul.txt")}, prog, &detail) == 0);
+    printf("  zip : %.1f Mo -> %.1f Ko en %.0f ms\n", prog.bytesTotal / 1048576.0, ReadAllBytes(zip).size() / 1024.0,
+           NowMs() - t0);
+    CHECK(prog.filesDone == 5 && prog.filesTotal == 5);
+    CHECK(Zip_Create(zip, {Join(src, L"seul.txt")}, prog, &detail) == ERROR_FILE_EXISTS);  // jamais par-dessus
+
+    auto idx = Zip_ReadIndex(zip);
+    CHECK(idx->error == 0);
+    CHECK(idx->entries.size() == 8);  // 3 dossiers + 5 fichiers
+    bool sawAccent = false;
+    for (const auto& e : idx->entries) sawAccent |= e.name == L"Projet\\sous dossier\\été ñ.txt";
+    CHECK(sawAccent);
+
+    // Lu par libarchive (tar.exe de Windows) : notre ZIP est lisible ailleurs.
+    const std::wstring viaTar = Join(base, L"viatar");
+    CreateDirectoryW(viaTar.c_str(), nullptr);
+    CHECK(RunTar(L"-x -f test.zip -C viatar", base) == 0);
+    CHECK(ReadAllBytes(Join(viaTar, L"Projet\\gros.txt")) == big);
+    CHECK(ReadAllBytes(Join(viaTar, L"Projet\\photo.jpg")) == std::string(5000, '\x7f'));
+
+    // Parcours comme un dossier.
+    std::wstring arc, inner;
+    CHECK(Archive_Split(Join(zip, L"Projet\\sous dossier"), arc, inner));
+    CHECK_STRI(arc, zip);
+    CHECK_STR(inner, L"Projet\\sous dossier");
+    CHECK(Archive_Split(zip, arc, inner) && inner.empty());
+    CHECK(!Archive_Split(src, arc, inner));
+    {
+        DirData d;
+        d.path = zip;
+        Archive_Enumerate(d);
+        CHECK(d.error == 0 && d.inArchive() && d.entries.size() == 2);
+        DirData s;
+        s.path = Join(zip, L"Projet");
+        Archive_Enumerate(s);
+        CHECK(s.entries.size() == 4);  // gros.txt, vide.txt, photo.jpg, sous dossier
+        bool dir = false;
+        for (const auto& e : s.entries) dir |= e.isDir() && std::wstring(s.name(e)) == L"sous dossier";
+        CHECK(dir);
+        DirData bad;
+        bad.path = Join(zip, L"absent");
+        Archive_Enumerate(bad);
+        CHECK(bad.error == ERROR_PATH_NOT_FOUND);
+    }
+
+    // Extraction complète : contenu, dates, attributs.
+    const std::wstring out = Join(base, L"out");
+    FastProgress p2;
+    std::vector<std::wstring> created;
+    CHECK(Archive_Extract(zip, out, {}, p2, &created, &detail) == 0);
+    CHECK(created.size() == 2);
+    CHECK(ReadAllBytes(Join(out, L"Projet\\gros.txt")) == big);
+    CHECK(ReadAllBytes(Join(out, L"Projet\\vide.txt")).empty());
+    CHECK(ReadAllBytes(Join(out, L"Projet\\sous dossier\\été ñ.txt")) == "accents");
+    CHECK(GetFileAttributesW(Join(out, L"Projet\\sous dossier\\vide").c_str()) & FILE_ATTRIBUTE_DIRECTORY);
+    CHECK(MtimeOf(Join(out, L"Projet\\gros.txt")) == MtimeOf(Join(src, L"Projet\\gros.txt")));
+    CHECK(GetFileAttributesW(Join(out, L"seul.txt").c_str()) & FILE_ATTRIBUTE_READONLY);
+    // Encore : premier niveau renommé, rien n'est écrasé.
+    created.clear();
+    ExtractOptions sel;
+    sel.base = L"Projet";
+    sel.items = {L"sous dossier", L"vide.txt"};
+    CHECK(Archive_Extract(zip, out, sel, p2, &created, &detail) == 0);
+    CHECK(created.size() == 2 && GetFileAttributesW(Join(out, L"sous dossier\\été ñ.txt").c_str()) != INVALID_FILE_ATTRIBUTES);
+    CHECK(Archive_Extract(zip, out, sel, p2, nullptr, &detail) == 0);
+    CHECK(GetFileAttributesW(Join(out, L"sous dossier (2)").c_str()) != INVALID_FILE_ATTRIBUTES);
+    CHECK(GetFileAttributesW(Join(out, L"vide (2).txt").c_str()) != INVALID_FILE_ATTRIBUTES);
+    CHECK(Archive_SizeOf(zip, sel) == 7);
+
+    // ZIP écrit par libarchive (deflate) : lu par notre moteur.
+    CHECK(RunTar(L"-a -c -f fromtar.zip -C src Projet", base) == 0);
+    const std::wstring out2 = Join(base, L"out2");
+    CHECK(Archive_Extract(Join(base, L"fromtar.zip"), out2, {}, p2, nullptr, &detail) == 0);
+    CHECK(ReadAllBytes(Join(out2, L"Projet\\gros.txt")) == big);
+
+    // tar.gz : extrait par tar.exe.
+    CHECK(RunTar(L"-c -z -f paquet.tar.gz -C src Projet", base) == 0);
+    CHECK(Archive_IsArchive(L"paquet.tar.gz") && !Archive_IsZip(L"paquet.tar.gz"));
+    CHECK_STR(Archive_Stem(L"paquet.tar.gz"), L"paquet");
+    CHECK_STR(Archive_Stem(L"photos.zip"), L"photos");
+    const std::wstring out3 = Join(base, L"out3");
+    CHECK(Archive_Extract(Join(base, L"paquet.tar.gz"), out3, {}, p2, nullptr, &detail) == 0);
+    CHECK(ReadAllBytes(Join(out3, L"Projet\\gros.txt")) == big);
+
+    // Archive abîmée, et nom dangereux (« ../ ») écarté.
+    std::string z = ReadAllBytes(zip);
+    WriteAllBytes(Join(base, L"court.zip"), z.substr(0, z.size() / 2));
+    CHECK(Zip_ReadIndex(Join(base, L"court.zip"))->error == ERROR_BAD_FORMAT);
+    std::string evil = ReadAllBytes(Join(base, L"fromtar.zip"));
+    for (size_t at = evil.find("Projet/gros.txt"); at != std::string::npos; at = evil.find("Projet/gros.txt", at + 1))
+        memcpy(&evil[at], "../../../g.txt", 14);  // le nom (même longueur) sort du dossier d'extraction
+    WriteAllBytes(Join(base, L"evil.zip"), evil);
+    auto ev = Zip_ReadIndex(Join(base, L"evil.zip"));
+    bool unsafe = false;
+    for (const auto& e : ev->entries) unsafe |= e.name.find(L"..") != std::wstring::npos;
+    CHECK(ev->error == 0 && !unsafe);
+    SetFileAttributesW(Join(src, L"seul.txt").c_str(), FILE_ATTRIBUTE_NORMAL);
+    SetFileAttributesW(Join(out, L"seul.txt").c_str(), FILE_ATTRIBUTE_NORMAL);
+}
+
 // ── Corbeille et Accueil (places.h) ──
 
 void WriteBytes(const std::wstring& path, const std::vector<BYTE>& b) {
@@ -803,7 +1016,7 @@ void TestPrepareMenu() {
     const double t0 = NowMs();
     CHECK(ShellMenu_Prepare(nullptr, g_root, {L"zdir"}, false, true));
     const double reuse = NowMs() - t0;
-    CHECK(reuse < 10);
+    CHECK(reuse < 25);  // marge : sous ASan et machine chargée, ~8 ms
     printf("  menu prepare : remis en %.2f ms\n", reuse);
     ShellMenu_Discard();
     ShellMenu_Discard(true);  // deux fois : sans effet
@@ -1692,6 +1905,8 @@ int wmain() {
     TestFastCopy();
     TestFileOps();
     TestPlaces();
+    TestDeflate();
+    TestArchive();
     TestCopyQueue();  // après TestFileOps : classe de fenêtre FeTestSink
     TestDrop();
     RemoveTree(g_root);

@@ -23,6 +23,7 @@ struct FastProgress {
     std::atomic<bool> cancel{false};
     std::atomic<bool> pause{false};  // en pause : les threads de copie attendent (entre deux blocs)
     bool move = false;
+    const wchar_t* label = nullptr;  // barre d'état : « Extraction », « Compression » (nullptr : copie / déplacement)
     ULONGLONG start = 0;  // GetTickCount64
 };
 

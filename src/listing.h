@@ -56,9 +56,12 @@ struct DirData {
     // Emplacements virtuels (Corbeille « ::bin », Accueil « ::home ») : les noms du pool sont
     // ceux affichés ; target = chemin réel de chaque entrée, origin = emplacement d'origine / dossier.
     std::vector<std::wstring> target, origin;
+    // Dossier d'une archive ZIP (archive.h) : le fichier .zip ("" sinon). path = archive + chemin intérieur.
+    std::wstring archive;
 
     bool isRoot() const { return path.empty() && query.empty(); }  // Ce PC (pas une recherche dans tout le PC)
     bool isVirtual() const { return path.size() > 2 && path[0] == L':' && path[1] == L':'; }
+    bool inArchive() const { return !archive.empty(); }
     const wchar_t* name(const Entry& e) const { return pool.data() + e.nameOff; }
 };
 
