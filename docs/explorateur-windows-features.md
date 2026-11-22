@@ -134,7 +134,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Volet de navigation | ✅ P0 |
 | Volet de détails (Alt+Maj+P) | ✅ P1 |
 | Volet d'aperçu (Alt+P) | ✅ P1 |
-| Cases à cocher des éléments | P2 |
+| Cases à cocher des éléments | ✅ P2 (bloc 27 : Afficher ▸ Cases à cocher des éléments ; case cochée = élément sélectionné, un clic sur la case ajoute ou retire sans toucher au reste ; réglage de l'Explorateur repris par défaut) |
 | **Extensions de noms de fichiers** | ✅ **P0** (réglage de Windows suivi en direct ; menu du fond du dossier ; types connus seulement, NeverShowExt / AlwaysShowExt respectés ; renommer garde l'extension masquée) |
 | **Éléments masqués** | ✅ **P0** (réglage de Windows suivi en direct ; Ctrl+H ou menu du fond du dossier ; affichés estompés ; « n masqués » dans la barre d'état ; même règle dans le volet) |
 | Mode compact | ✅ P1 |
@@ -149,9 +149,9 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Ajuster toutes les colonnes | Clic droit en-tête ▸ Ajuster toutes les colonnes / Ctrl+pavé num. « + » | ✅ P2 |
 | Réordonner | Glisser l'en-tête | ✅ |
 | Trier | Clic sur l'en-tête, flèche de tri | ✅ |
-| **Filtres de colonne** | Survol de l'en-tête ▸ flèche ▾ : filtre par valeurs (« A–H », « Aujourd'hui », « Grand (128 Mo–1 Go) »…), cases multiples | P2 |
+| **Filtres de colonne** | Survol de l'en-tête ▸ flèche ▾ : filtre par valeurs (« A–H », « Aujourd'hui », « Grand (128 Mo–1 Go) »…), cases multiples | ✅ P2 (bloc 27 : flèche ▾ des colonnes Nom, dates, Type, Taille ; tranches présentes avec leur nombre, plusieurs à la fois ; « ✓ » sur la colonne filtrée, nombre de masqués dans la barre d'état ; oubliés en changeant de dossier) |
 | Taille des dossiers | **Jamais affichée** (colonne vide pour les dossiers) | ✅ ⭐ (§20 : calculée en arrière-plan) |
-| Colonnes par type de dossier | Musique : Titre, Artiste, Album… ; Images : Date de prise de vue, Dimensions… | P2 |
+| Colonnes par type de dossier | Musique : Titre, Artiste, Album… ; Images : Date de prise de vue, Dimensions… | ✅ P2 (bloc 27 : Musique : N°, Titre, Interprètes, Album ; Images : Prise de vue, Dimensions ; Vidéos : Durée ; pour un dossier sans affichage mémorisé) |
 
 ### 4.4 Tri et regroupement
 
@@ -160,7 +160,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Trier par | Nom, Date, Type, Taille + toute colonne ; croissant/décroissant | ✅ (toute colonne ; propriété : valeurs lues puis tri, nombres et dates par valeur) |
 | Tri naturel | `fichier2` avant `fichier10` (désactivable par stratégie de groupe) | ✅ |
 | Dossiers en premier | Toujours (sauf en regroupement) | ✅ |
-| **Regrouper par** | Nom (A–H, I–P…), Date (Aujourd'hui, Hier, Plus tôt cette semaine, Semaine dernière, Le mois dernier, Plus tôt cette année, Il y a longtemps), Type, Taille (Vide, Minuscule, Petit, Moyen, Grand, Très grand, Énorme, Gigantesque), toute propriété ; groupes repliables (clic sur l'en-tête de groupe) | P2 |
+| **Regrouper par** | Nom (A–H, I–P…), Date (Aujourd'hui, Hier, Plus tôt cette semaine, Semaine dernière, Le mois dernier, Plus tôt cette année, Il y a longtemps), Type, Taille (Vide, Minuscule, Petit, Moyen, Grand, Très grand, Énorme, Gigantesque), toute propriété ; groupes repliables (clic sur l'en-tête de groupe) | ✅🟡 P2 (bloc 27 : Trier ▸ Regrouper par Nom, dates, Type, Taille ; en-têtes repliables au clic, ← / → / Entrée, Tout réduire / développer ; mémorisé par dossier ; en Détails et Contenu seulement ; pas par propriété) |
 | Téléchargements | Regroupé par date par défaut | P3 |
 
 ### 4.5 Mémoire des affichages par dossier
@@ -168,7 +168,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Fonction | Détail | Prio |
 |---|---|---|
 | Vue mémorisée par dossier | Mode, colonnes, tri et regroupement mémorisés pour chaque dossier | ✅ P1 (mode, colonnes, largeurs, ordre, tri ; dans `HKCU\Software\FastExplorer\Views`, 5000 dossiers au plus ; regroupement : avec le §4.4) |
-| **Type de dossier** | Éléments généraux, Documents, Images, Musique, Vidéos : détecté automatiquement selon le contenu, ou forcé (Propriétés ▸ Personnaliser) | P2 |
+| **Type de dossier** | Éléments généraux, Documents, Images, Musique, Vidéos : détecté automatiquement selon le contenu, ou forcé (Propriétés ▸ Personnaliser) | ✅ P2 (bloc 27 : détecté si plus de la moitié des fichiers sont des images, musiques, vidéos ou documents, ou lu dans desktop.ini ; Afficher ▸ Optimiser ce dossier pour, mémorisé) |
 | « Appliquer aux dossiers » | Options des dossiers ▸ Affichage : applique la vue courante à tous les dossiers du même type | ✅🟡 P2 (menu Affichage : à tous les dossiers ; pas encore par type de dossier) |
 | Réinitialiser les dossiers | Retour aux vues par défaut | ✅ P2 (menu Affichage : ce dossier ; « Appliquer à tous » efface les autres) |
 
@@ -182,7 +182,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Éléments masqués | Icône semi-transparente | P0 |
 | Couleur des fichiers compressés/chiffrés NTFS | Bleu / vert (option) | P3 |
 | Couper (Ctrl+X) | L'élément coupé devient semi-transparent jusqu'au collage | ✅ P1 |
-| **Info-bulles** | Survol : type, taille, date ; pour les dossiers, taille et premiers fichiers (option) | P2 |
+| **Info-bulles** | Survol : type, taille, date ; pour les dossiers, taille et premiers fichiers (option) | ✅ P2 (bloc 27 : type, taille, date ; dossiers : taille si calculée, premiers dossiers et fichiers sur un disque local ; en-tête de groupe : nombre d'éléments ; réglages de l'Explorateur respectés) |
 | Mise en évidence des nouveaux éléments | Un élément créé ou collé est sélectionné et rendu visible | ✅ (bloc 2) |
 
 ---
@@ -198,7 +198,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Inverser la sélection | Barre de commandes ▸ « … » | ✅ (bloc 24 : avec Tout sélectionner, Ne rien sélectionner) |
 | Aucun | Clic dans le vide, barre « … » ▸ Ne rien sélectionner | ✅ |
 | **Rectangle de sélection** (lasso) | Glisser depuis une zone vide | ✅ (natif) |
-| Cases à cocher | Option d'affichage | P2 |
+| Cases à cocher | Option d'affichage | ✅ P2 (bloc 27) |
 | Déplacer le focus sans sélectionner | Ctrl+flèches, puis Ctrl+Espace pour (dé)sélectionner | ✅ (natif) |
 | **Recherche par frappe** | Taper le début d'un nom ; option alternative : « Taper dans la zone de recherche » | ✅ |
 | Résumé de sélection | Barre d'état : « 3 éléments sélectionnés, 12,4 Mo » | ✅ P0 (taille seulement sans dossier sélectionné, comme l'Explorateur ; avec les dossiers dès que leur taille est connue ; un seul calcul par rafale de changements) |
@@ -520,7 +520,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Ctrl+molette | Zoom des icônes | ✅ P1 |
 | Alt+P / Alt+Maj+P | Volet d'aperçu / de détails | ✅ P1 |
 | Alt+1 … 9 / Alt+Maj+1 … 9 | Signets (FastExplorer) : y aller / y ranger le dossier affiché | ✅ P2 (bloc 26) |
-| Ctrl+pavé num. + | Ajuster toutes les colonnes | P2 |
+| Ctrl+pavé num. + | Ajuster toutes les colonnes | ✅ P2 |
 
 ---
 
@@ -649,7 +649,7 @@ P2, en blocs (dans cet ordre) :
     chemins tapés (F4), déposer sur un segment du fil d'Ariane, Ctrl+Maj+E, F11, Alt+double-clic.
 26. ✅ **Onglets et sessions** : détacher / fusionner un onglet, ouverture au survol pendant un glisser, onglets
     restaurés à la réouverture, sessions nommées ⭐, signets ⭐.
-27. **Affichage** : regrouper par, filtres de colonne, cases à cocher, info-bulles, type de dossier et ses
+27. ✅ **Affichage** : regrouper par, filtres de colonne, cases à cocher, info-bulles, type de dossier et ses
     colonnes, Ctrl+pavé num. +.
 28. **Opérations** : copier vers / déplacer vers, coller en tant que raccourci, renommage par lot avancé ⭐,
     « qui utilise ce fichier ? » ⭐, reprise après erreur et vérification des copies, perte de propriétés,

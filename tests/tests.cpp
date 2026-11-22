@@ -23,6 +23,7 @@
 #include "pins.h"
 #include "places.h"
 #include "sessions.h"
+#include "groups.h"
 #include "net.h"
 #include <lm.h>
 #include "nt.h"
@@ -1076,6 +1077,83 @@ void TestPlaces() {
     const auto crumbs = Crumbs_Split(kBinPath, {});
     CHECK(crumbs.size() == 1 && crumbs[0].text == L"Corbeille" && crumbs[0].path == kBinPath);
     CHECK(IsVirtualPath(kHomePath) && !IsVirtualPath(L"C:\\") && !IsVirtualPath(L""));
+}
+
+int64_t LocalFt(int y, int m, int d, int h = 12) {
+    SYSTEMTIME l{(WORD)y, (WORD)m, 0, (WORD)d, (WORD)h, 0, 0, 0}, u{};
+    TzSpecificLocalTimeToSystemTime(nullptr, &l, &u);
+    FILETIME f{};
+    SystemTimeToFileTime(&u, &f);
+    return (int64_t)(((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime);
+}
+
+void TestGroups() {
+    CHECK_STR(NameBucket(L"42.txt").label, L"0 – 9");
+    CHECK_STR(NameBucket(L"abc").label, L"A – H");
+    CHECK_STR(NameBucket(L"École").label, L"A – H");
+    CHECK_STR(NameBucket(L"Zèbre").label, L"Q – Z");
+    CHECK_STR(NameBucket(L"_x").label, L"Autres");
+    CHECK(NameBucket(L"I").rank == 2 && NameBucket(L"p").rank == 2);
+    CHECK_STR(SizeBucket(0, false).label, L"Vide (0 Ko)");
+    CHECK_STR(SizeBucket(10 * 1024, false).label, L"Minuscule (0 – 16 Ko)");
+    CHECK_STR(SizeBucket(16 * 1024, false).label, L"Petit (16 Ko – 1 Mo)");
+    CHECK_STR(SizeBucket(200ull << 20, false).label, L"Grand (128 Mo – 1 Go)");
+    CHECK_STR(SizeBucket(5ull << 30, false).label, L"Gigantesque (> 4 Go)");
+    CHECK_STR(SizeBucket(5ull << 30, true).label, L"Dossiers");
+    // Mercredi 18 novembre 2026, midi (semaine du lundi 16).
+    const int64_t now = LocalFt(2026, 11, 18);
+    CHECK_STR(DateBucket(LocalFt(2026, 11, 18, 8), now).label, L"Aujourd'hui");
+    CHECK_STR(DateBucket(LocalFt(2026, 11, 17, 23), now).label, L"Hier");
+    CHECK_STR(DateBucket(LocalFt(2026, 11, 16, 0), now).label, L"Plus tôt cette semaine");
+    CHECK_STR(DateBucket(LocalFt(2026, 11, 15, 22), now).label, L"La semaine dernière");
+    CHECK_STR(DateBucket(LocalFt(2026, 11, 9, 1), now).label, L"La semaine dernière");
+    CHECK_STR(DateBucket(LocalFt(2026, 11, 8), now).label, L"Plus tôt ce mois-ci");
+    CHECK_STR(DateBucket(LocalFt(2026, 10, 20), now).label, L"Le mois dernier");
+    CHECK_STR(DateBucket(LocalFt(2026, 3, 1), now).label, L"Plus tôt cette année");
+    CHECK_STR(DateBucket(LocalFt(2025, 12, 31), now).label, L"Il y a longtemps");
+    CHECK_STR(DateBucket(LocalFt(2026, 11, 19), now).label, L"Dans le futur");
+    CHECK_STR(DateBucket(0, now).label, L"Date inconnue");
+    CHECK_STR(DateBucket(LocalFt(2025, 12, 20), LocalFt(2026, 1, 5)).label, L"Le mois dernier");  // décembre → janvier
+
+    // Regroupement : éléments 0…5, groupes par parité (rang 0 : pairs), filtre sur « < 4 ».
+    const std::vector<uint32_t> sorted = {5, 4, 3, 2, 1, 0};
+    BucketFn parity = [](uint32_t i) { return Bucket{(int)(i % 2), i % 2 ? L"impairs" : L"pairs"}; };
+    BucketFn low = [](uint32_t i) { return Bucket{0, i < 4 ? L"petit" : L"grand"}; };
+    std::vector<GroupInfo> groups;
+    std::vector<uint32_t> kept;
+    auto o = ArrangeOrder(sorted, {}, parity, false, {}, groups, &kept);
+    CHECK((o == std::vector<uint32_t>{kGroupRow | 0, 4, 2, 0, kGroupRow | 1, 5, 3, 1}));
+    CHECK(groups.size() == 2 && groups[0].label == L"pairs" && groups[0].count == 3 && kept.size() == 6);
+    o = ArrangeOrder(sorted, {}, parity, true, {L"impairs"}, groups);
+    CHECK((o == std::vector<uint32_t>{kGroupRow | 0, kGroupRow | 1, 4, 2, 0}));  // inversé, impairs repliés
+    CHECK(groups[0].label == L"impairs" && groups[0].collapsed && groups[0].count == 3);
+    o = ArrangeOrder(sorted, {{low, {L"petit"}}}, {}, false, {}, groups, &kept);
+    CHECK((o == std::vector<uint32_t>{3, 2, 1, 0}) && groups.empty() && kept == o);
+    o = ArrangeOrder(sorted, {{low, {L"petit"}}, {parity, {L"impairs"}}}, parity, false, {}, groups);
+    CHECK((o == std::vector<uint32_t>{kGroupRow | 0, 3, 1}) && groups.size() == 1);
+    o = ArrangeOrder(sorted, {{low, {}}}, {}, false, {}, groups);  // filtre vide : rien d'écarté
+    CHECK(o == sorted);
+    const auto b = BucketsOf(sorted, parity);
+    CHECK(b.size() == 2 && b[0].first.label == L"pairs" && b[0].second == 3 && b[1].second == 3);
+
+    // Type de dossier
+    auto kind = [](std::initializer_list<const wchar_t*> names) {
+        DirData d;
+        d.path = L"C:\\x";
+        for (const wchar_t* n : names) DirData_Add(d, n, (uint32_t)wcslen(n), FILE_ATTRIBUTE_ARCHIVE, 1, 1);
+        DirData_Add(d, L"desktop.ini", 11, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, 1, 1);
+        DirData_Add(d, L"sous", 4, FILE_ATTRIBUTE_DIRECTORY, 0, 1);
+        DirData_BuildKeys(d);
+        return DetectFolderKind(d);
+    };
+    CHECK(kind({L"a.mp3", L"b.FLAC", L"c.jpg"}) == FK_MUSIC);
+    CHECK(kind({L"a.jpg", L"b.png", L"c.txt", L"d.heic"}) == FK_PICTURES);
+    CHECK(kind({L"a.mkv", L"b.txt"}) == FK_GENERAL);  // pas plus de la moitié
+    CHECK(kind({L"a.pdf", L"b.docx", L"c"}) == FK_DOCUMENTS);
+    CHECK(kind({}) == FK_GENERAL);
+    CHECK(FolderKindFromName(L"Music") == FK_MUSIC && FolderKindFromName(L"MusicAlbum") == FK_MUSIC);
+    CHECK(FolderKindFromName(L"Pictures") == FK_PICTURES && FolderKindFromName(L"Photos") == FK_PICTURES);
+    CHECK(FolderKindFromName(L"Generic") == FK_GENERAL && FolderKindFromName(L"") == -1 && FolderKindFromName(L"Contacts") == -1);
 }
 
 void TestSessions() {
@@ -2142,6 +2220,7 @@ int wmain() {
     TestFileOps();
     TestPlaces();
     TestSessions();
+    TestGroups();
     TestNet();
     TestDeflate();
     TestArchive();

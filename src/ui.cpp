@@ -11,6 +11,7 @@
 #include "dragdrop.h"
 #include "fileops.h"
 #include "foldersize.h"
+#include "groups.h"
 #include "icons.h"
 #include "index.h"
 #include "thumbs.h"
@@ -30,6 +31,7 @@
 
 #include <commctrl.h>
 #include <dbt.h>
+#include <propkey.h>
 #include <commoncontrols.h>
 #include <shellapi.h>
 #include <shlwapi.h>
@@ -38,9 +40,11 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -110,6 +114,7 @@ struct FolderView {
     std::vector<ColSpec> cols = Columns_Default();
     ColSpec sort = Columns_Builtin(COL_NAME);
     bool asc = true;
+    int group = -1;  // Regrouper par (COL_*), -1 : aucun
 };
 
 // Navigation demandée mais pas encore affichée.
@@ -142,6 +147,10 @@ struct View {
     std::shared_ptr<const DirData> data;
     std::vector<uint32_t> order;
     std::vector<int> rowOf;
+    std::vector<uint32_t> sorted;   // ordre du tri, avant regroupement et filtres de colonne
+    std::vector<uint32_t> shown;    // arranged : éléments gardés par les filtres (repliés compris)
+    std::vector<GroupInfo> groups;  // en-têtes de groupes (kGroupRow | numéro dans order)
+    bool arranged = false;          // order ≠ sorted (groupes ou filtres)
     std::vector<int32_t> icons;     // par index d'entrée
     std::vector<uint8_t> overlays;  // surimpression par index d'entrée
     std::vector<uint8_t> iconState;
@@ -149,7 +158,7 @@ struct View {
     std::vector<uint64_t> dirBytes; // taille calculée des dossiers (par index d'entrée)
     std::vector<uint8_t> dirState;  // SIZE_* (combinables)
     std::vector<int32_t> thumb;     // modes icônes : place de la miniature (THUMB_* si négatif)
-    std::vector<std::pair<PROPERTYKEY, PropValues>> props;  // colonnes de propriétés : valeurs lues
+    std::deque<std::pair<PROPERTYKEY, PropValues>> props;  // colonnes de propriétés : valeurs lues (deque : PropsOf garde ses pointeurs valides)
     uint64_t serial = 0;            // identifie la vue auprès du thread d'icônes
     double sortMs = 0;
 };
@@ -257,7 +266,11 @@ std::unordered_set<std::wstring> g_dragNames;  // éléments que l'on fait gliss
 int S(int v) { return MulDiv(v, (int)g_dpi, 96); }
 bool HasView() { return g_view.data != nullptr; }
 int RowCount() { return HasView() ? (int)g_view.order.size() : 0; }
-int EntryAt(int row) { return (row >= 0 && row < RowCount()) ? (int)g_view.order[row] : -1; }
+int EntryAt(int row) {
+    if (row < 0 || row >= RowCount()) return -1;
+    const uint32_t v = g_view.order[row];
+    return IsGroupRow(v) ? -1 : (int)v;  // en-tête de groupe : aucun élément
+}
 const Entry& E(int idx) { return g_view.data->entries[idx]; }
 const wchar_t* NameOf(int idx) { return g_view.data->name(E(idx)); }
 
@@ -298,14 +311,16 @@ void ShowSummary() {
     const DirData& d = *g_view.data;
     wchar_t s[512];
     size_t dirs = 0;
-    for (uint32_t e : g_view.order) dirs += d.entries[e].isDir();
-    const size_t shown = g_view.order.size();
+    const std::vector<uint32_t>& vis = g_view.arranged ? g_view.shown : g_view.order;
+    for (uint32_t e : vis) dirs += d.entries[e].isDir();
+    const size_t shown = vis.size();
+    const size_t colHidden = g_view.sorted.size() > shown ? g_view.sorted.size() - shown : 0;  // filtres de colonne
     size_t visible = d.entries.size();  // sans le filtre instantané (éléments cachés exclus)
     if (!g_filter.empty() && !d.isRoot()) {
         visible = 0;
         for (const Entry& e : d.entries) visible += IsShown(e.attr, g_prefs);
     }
-    const size_t hidden = g_filter.empty() ? d.entries.size() - shown : 0;
+    const size_t hidden = g_filter.empty() ? d.entries.size() - shown - colHidden : 0;
     wchar_t masked[64] = L"";
     if (hidden) swprintf_s(masked, L", %zu masqué%s", hidden, hidden > 1 ? L"s" : L"");
     if (!g_filter.empty()) {
@@ -325,6 +340,10 @@ void ShowSummary() {
     } else {
         swprintf_s(s, L"%zu élément%s  (%zu dossier%s, %zu fichier%s%s)", shown, shown > 1 ? L"s" : L"", dirs,
                    dirs > 1 ? L"s" : L"", shown - dirs, shown - dirs > 1 ? L"s" : L"", masked);
+    }
+    if (colHidden) {
+        const size_t k = wcslen(s);
+        swprintf_s(s + k, _countof(s) - k, L"   •   filtre de colonne : %zu masqué%s", colHidden, colHidden > 1 ? L"s" : L"");
     }
     SetStatus(WithNotes(s));
     wchar_t perf[160];
@@ -352,6 +371,15 @@ int ColIndex(const ColSpec& c) {
 }
 int ColIndex(int key) { return key == COL_PROP ? -1 : ColIndex(Columns_Builtin(key)); }
 
+int g_groupKey = -1;                                 // Regrouper par (COL_*), -1 : aucun
+std::map<int, std::set<std::wstring>> g_colFilter;  // par colonne : tranches gardées
+std::set<std::wstring> g_collapsed;                  // groupes repliés
+bool g_checkboxes = false;                           // cases à cocher des éléments
+
+bool Groupable(int key) {
+    return key == COL_NAME || key == COL_SIZE || key == COL_TYPE || key == COL_DATE || key == COL_CTIME || key == COL_ATIME;
+}
+
 void UpdateSortArrow() {
     HWND hdr = ListView_GetHeader(g_list);
     const int sorted = ColIndex(g_sort);
@@ -359,8 +387,15 @@ void UpdateSortArrow() {
         HDITEMW hi{};
         hi.mask = HDI_FORMAT;
         Header_GetItem(hdr, i, &hi);
-        hi.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        hi.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN | HDF_SPLITBUTTON);
         if (i == sorted) hi.fmt |= g_sortAsc ? HDF_SORTUP : HDF_SORTDOWN;
+        const int key = g_cols[(size_t)i].key;
+        if (HasView() && !g_view.data->isRoot() && Groupable(key)) hi.fmt |= HDF_SPLITBUTTON;  // ▾ : filtre de colonne
+        const auto f = g_colFilter.find(key);
+        std::wstring text = g_cols[(size_t)i].title;
+        if (f != g_colFilter.end() && !f->second.empty()) text += L"  ✓";  // colonne filtrée
+        hi.mask |= HDI_TEXT;
+        hi.pszText = text.data();
         Header_SetItem(hdr, i, &hi);
     }
 }
@@ -398,7 +433,8 @@ std::vector<int> FindEntriesByNames(const std::vector<std::wstring>& names) {
 void RebuildRowOf() {
     const int n = RowCount();
     g_view.rowOf.assign(HasView() ? g_view.data->entries.size() : 0, -1);
-    for (int r = 0; r < n; ++r) g_view.rowOf[g_view.order[r]] = r;
+    for (int r = 0; r < n; ++r)
+        if (!IsGroupRow(g_view.order[r])) g_view.rowOf[g_view.order[r]] = r;
 }
 
 // Applique une sélection exprimée en index d'entrées (indépendante du tri).
@@ -556,7 +592,7 @@ void RequestDirSizes() {
     std::vector<std::wstring> dirs;
     if (HasView() && SizesWanted(*g_view.data)) {
         const ULONGLONG now = GetTickCount64();
-        for (uint32_t i : g_view.order) {
+        for (uint32_t i : g_view.sorted) {
             if (!E((int)i).isDir()) break;  // dossiers d'abord
             std::wstring full = FullPath((int)i);
             auto it = g_sizeCache.find(SizeKey(full));
@@ -838,6 +874,113 @@ void LoadCompact() {
 }
 
 // px96 : taille des icônes (VM_ICONS), 0 = inchangée.
+// ───────────────────────────── Regrouper par, filtres de colonne ─────────────────────────────
+//
+// Groupes : lignes d'en-tête insérées dans l'ordre affiché (la liste est virtuelle),
+// dessinées par nous, repliables d'un clic. Seulement en Détails et Contenu (une
+// ligne par élément). Filtres : tranches de valeurs gardées, par colonne (flèche ▾
+// de l'en-tête), oubliés en changeant de dossier.
+
+
+std::wstring TypeLabel(const DirData& d, const Entry& e) {
+    if (e.isDir()) return d.server ? L"Partage réseau" : d.path == kNetPath ? L"Ordinateur" : L"Dossier de fichiers";
+    if (e.extOff + 1 >= e.nameLen) return L"Fichier";
+    std::wstring ext(d.name(e) + e.extOff + 1, e.nameLen - e.extOff - 1);
+    CharUpperBuffW(ext.data(), (DWORD)ext.size());
+    return L"Fichier " + ext;
+}
+
+BucketFn BucketFor(int key) {
+    std::shared_ptr<const DirData> data = g_view.data;
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    const int64_t now = (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+    switch (key) {
+        case COL_NAME:
+            return [data](uint32_t i) {
+                const wchar_t* n = data->name(data->entries[i]);
+                if (const wchar_t* s = wcsrchr(n, L'\\')) n = s + 1;  // résultats de recherche : chemin relatif
+                return NameBucket(n);
+            };
+        case COL_SIZE: return [data](uint32_t i) { const Entry& e = data->entries[i]; return SizeBucket(e.size, e.isDir()); };
+        case COL_TYPE:
+            return [data](uint32_t i) {
+                const Entry& e = data->entries[i];
+                return Bucket{e.isDir() ? 0 : 1, TypeLabel(*data, e)};
+            };
+        case COL_CTIME: return [data, now](uint32_t i) { return DateBucket(data->entries[i].ctime, now); };
+        case COL_ATIME: return [data, now](uint32_t i) { return DateBucket(data->entries[i].atime, now); };
+        default: return [data, now](uint32_t i) { return DateBucket(data->entries[i].mtime, now); };
+    }
+}
+
+bool GroupsShown() {
+    return HasView() && !g_view.data->isRoot() && Groupable(g_groupKey) && (g_viewMode == VM_DETAILS || g_viewMode == VM_CONTENT);
+}
+
+// order ← sorted, regroupé et filtré.
+void ArrangeView() {
+    g_view.groups.clear();
+    g_view.shown.clear();
+    g_view.arranged = false;
+    if (!HasView()) return;
+    std::vector<ColumnFilter> filters;
+    if (!g_view.data->isRoot())
+        for (const auto& [k, keep] : g_colFilter)
+            if (!keep.empty()) filters.push_back({BucketFor(k), keep});
+    const bool groups = GroupsShown();
+    if (filters.empty() && !groups) {
+        g_view.order = g_view.sorted;
+        return;
+    }
+    // Groupes dans leur ordre naturel (dates : les plus récentes d'abord), inversé si l'on trie
+    // la même colonne dans l'autre sens.
+    const bool natural = g_groupKey != COL_DATE && g_groupKey != COL_CTIME && g_groupKey != COL_ATIME;
+    const bool reverse = groups && g_sort.key == g_groupKey && g_sortAsc != natural;
+    g_view.order = ArrangeOrder(g_view.sorted, filters, groups ? BucketFor(g_groupKey) : BucketFn{}, reverse, g_collapsed,
+                                g_view.groups, &g_view.shown);
+    g_view.arranged = true;
+}
+
+void UpdateSortArrow();
+
+// Regroupement, repli ou filtre changé : la liste suit, sélection gardée.
+void ReArrange() {
+    if (!HasView()) return;
+    const auto sel = SelectedEntries();
+    const int focus = FocusedEntry();
+    ArrangeView();
+    RebuildRowOf();
+    ListView_SetItemCountEx(g_list, RowCount(), LVSICF_NOSCROLL);
+    ApplySelection(sel, focus, false);
+    InvalidateRect(g_list, nullptr, TRUE);
+    UpdateSortArrow();
+    ShowSummary();
+}
+
+// Ligne d'en-tête de groupe → son numéro (-1 : élément ordinaire).
+int GroupAt(int row) {
+    if (row < 0 || row >= RowCount() || !IsGroupRow(g_view.order[row])) return -1;
+    const int g = (int)(g_view.order[row] & ~kGroupRow);
+    return g < (int)g_view.groups.size() ? g : -1;
+}
+
+void ToggleGroup(int row) {
+    const int g = GroupAt(row);
+    if (g < 0) return;
+    const std::wstring label = g_view.groups[(size_t)g].label;
+    if (!g_collapsed.erase(label)) g_collapsed.insert(label);
+    ReArrange();
+    for (int r = 0; r < RowCount(); ++r)  // l'en-tête garde le focus
+        if (const int k = GroupAt(r); k >= 0 && g_view.groups[(size_t)k].label == label) {
+            ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED);
+            ListView_SetItemState(g_list, r, LVIS_FOCUSED, LVIS_FOCUSED);
+            ListView_SetSelectionMark(g_list, r);
+            ListView_EnsureVisible(g_list, r, FALSE);
+            break;
+        }
+}
+
 void ApplyViewMode(int mode, int px96, bool save = true) {
     g_viewMode = mode;
     if (px96) g_iconPx = std::clamp(px96, 32, 256);
@@ -856,7 +999,10 @@ void ApplyViewMode(int mode, int px96, bool save = true) {
     if (focus >= 0) ListView_EnsureVisible(g_list, focus, FALSE);
     ListRedraw(true);
     InvalidateRect(g_list, nullptr, TRUE);
-    if (save) SaveViewMode();
+    if (save) {
+        SaveViewMode();
+        if (HasView() && (g_view.arranged || GroupsShown())) ReArrange();
+    }
 }
 
 void SetCompact(bool on) {
@@ -1027,6 +1173,11 @@ void FillDispInfo(LVITEMW& it) {
         it.state = INDEXTOOVERLAYMASK(g_view.overlays[idx]) | (dim ? LVIS_CUT : 0) |
                    (it.iItem == g_dropRow ? LVIS_DROPHILITED : 0);
         it.stateMask = LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED;
+        if (g_checkboxes) {  // case cochée = élément sélectionné, comme l'Explorateur
+            const bool on = ListView_GetItemState(g_list, it.iItem, LVIS_SELECTED) != 0;
+            it.state |= INDEXTOSTATEIMAGEMASK(on ? 2 : 1);
+            it.stateMask |= LVIS_STATEIMAGEMASK;
+        }
     }
     if (it.mask & LVIF_COLUMNS) {  // mosaïques, contenu : colonnes affichées sous le nom
         static UINT buf[3];
@@ -1238,7 +1389,72 @@ void UpdateColumnsForView() {
 }
 
 // Ce PC : jauge d'occupation de chaque lecteur (rouge au-delà de 90 %, comme l'Explorateur).
+HFONT g_groupFont = nullptr, g_groupFontOf = nullptr;  // police des en-têtes de groupes (et celle dont elle dérive)
+
+void DrawGroupHeader(NMLVCUSTOMDRAW* cd, int g) {
+    const GroupInfo& gi = g_view.groups[(size_t)g];
+    const int row = (int)cd->nmcd.dwItemSpec;
+    HDC dc = cd->nmcd.hdc;
+    RECT r;
+    if (!ListView_GetItemRect(g_list, row, &r, LVIR_BOUNDS)) return;
+    RECT client;
+    GetClientRect(g_list, &client);
+    r.left = client.left;
+    r.right = std::max(r.right, client.right);
+    const COLORREF bk = ListView_GetBkColor(g_list);
+    HBRUSH b = CreateSolidBrush(bk == CLR_NONE ? GetSysColor(COLOR_WINDOW) : bk);
+    FillRect(dc, &r, b);
+    DeleteObject(b);
+    const bool focused = (ListView_GetItemState(g_list, row, LVIS_FOCUSED) & LVIS_FOCUSED) && GetFocus() == g_list;
+    if (focused) {
+        RECT f = r;
+        InflateRect(&f, -S(1), -S(1));
+        DrawFocusRect(dc, &f);
+    }
+    HFONT base = (HFONT)SendMessageW(g_list, WM_GETFONT, 0, 0);
+    if (g_groupFontOf != base || !g_groupFont) {
+        if (g_groupFont) DeleteObject(g_groupFont);
+        LOGFONTW lf{};
+        GetObjectW(base ? base : GetStockObject(DEFAULT_GUI_FONT), sizeof lf, &lf);
+        lf.lfWeight = FW_SEMIBOLD;
+        g_groupFont = CreateFontIndirectW(&lf);
+        g_groupFontOf = base;
+    }
+    HGDIOBJ old = SelectObject(dc, g_groupFont);
+    SetBkMode(dc, TRANSPARENT);
+    const COLORREF accent = RGB(0, 84, 153);
+    SetTextColor(dc, accent);
+    const std::wstring text = std::wstring(gi.collapsed ? L"›  " : L"⌄  ") + gi.label + L"  (" + std::to_wstring(gi.count) + L")";
+    RECT tr = r;
+    tr.left += S(8);
+    DrawTextW(dc, text.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_CALCRECT);
+    tr.top = r.top;
+    tr.bottom = r.bottom;
+    DrawTextW(dc, text.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    SelectObject(dc, old);
+    // Trait jusqu'au bord, comme l'Explorateur.
+    RECT line{tr.right + S(10), (r.top + r.bottom) / 2, r.right - S(8), 0};
+    line.bottom = line.top + std::max(1, S(1));
+    if (line.right > line.left) {
+        HBRUSH lb = CreateSolidBrush(RGB(204, 220, 236));
+        FillRect(dc, &line, lb);
+        DeleteObject(lb);
+    }
+}
+
 LRESULT OnListCustomDraw(NMLVCUSTOMDRAW* cd) {
+    if (HasView() && !g_view.groups.empty()) {
+        switch (cd->nmcd.dwDrawStage) {
+            case CDDS_PREPAINT: return CDRF_NOTIFYITEMDRAW;
+            case CDDS_ITEMPREPAINT:
+                if (const int g = GroupAt((int)cd->nmcd.dwItemSpec); g >= 0) {
+                    DrawGroupHeader(cd, g);
+                    return CDRF_SKIPDEFAULT;
+                }
+                return CDRF_DODEFAULT;
+        }
+        return CDRF_DODEFAULT;
+    }
     if (!HasView() || !g_view.data->isRoot() || g_viewMode != VM_DETAILS) return CDRF_DODEFAULT;
     switch (cd->nmcd.dwDrawStage) {
         case CDDS_PREPAINT: return CDRF_NOTIFYITEMDRAW;
@@ -1290,6 +1506,7 @@ std::wstring EncodeView(const FolderView& v) {
     std::wstring s = std::to_wstring(v.mode) + L"|" + std::to_wstring(v.px) + L"|" + Columns_Id(v.sort) + L"|" +
                      (v.asc ? L"1" : L"0") + L"|";
     for (size_t i = 0; i < v.cols.size(); ++i) s += (i ? L"," : L"") + Columns_Id(v.cols[i]) + L":" + std::to_wstring(v.cols[i].width96);
+    if (v.group >= 0) s += L"|" + std::to_wstring(v.group);
     return s;
 }
 
@@ -1303,7 +1520,7 @@ std::vector<std::wstring> Split(const std::wstring& s, wchar_t sep) {
 
 bool DecodeView(const std::wstring& s, FolderView& v) {
     const auto f = Split(s, L'|');
-    if (f.size() != 5) return false;
+    if (f.size() != 5 && f.size() != 6) return false;
     FolderView r;
     r.mode = _wtoi(f[0].c_str());
     r.px = std::clamp(_wtoi(f[1].c_str()), 32, 256);
@@ -1319,6 +1536,7 @@ bool DecodeView(const std::wstring& s, FolderView& v) {
         r.cols.push_back(std::move(spec));
     }
     if (r.cols.empty()) r.cols = Columns_Default();
+    if (f.size() == 6 && Groupable(_wtoi(f[5].c_str())) && !f[5].empty()) r.group = _wtoi(f[5].c_str());
     v = std::move(r);
     return true;
 }
@@ -1368,6 +1586,7 @@ FolderView CurrentView() {
     v.cols = FixedColumns() ? g_folderCols : CurrentColumns();  // Ce PC, Corbeille, Accueil : colonnes fixes
     v.sort = g_sort;
     v.asc = g_sortAsc;
+    v.group = g_groupKey;
     return v;
 }
 
@@ -1408,12 +1627,76 @@ void ApplyFolderView(const FolderView& v) {
     g_folderCols = v.cols;
     g_sort = v.sort;
     g_sortAsc = v.asc;
+    g_groupKey = v.group;
     ApplyViewMode(v.mode, v.px, false);
     UpdateColumnsForView();
     UpdateSortArrow();
 }
 
 void Flash(const std::wstring& msg);
+
+// ───────────────────────────── Type de dossier ─────────────────────────────
+
+FolderKind g_folderKind = FK_GENERAL;  // type du dossier affiché (détecté ou choisi)
+
+std::vector<ColSpec> KindColumns(FolderKind k) {
+    auto prop = [](const PROPERTYKEY& pk, int w, bool right = false) {
+        ColSpec c = Columns_Prop(pk);
+        c.width96 = w;
+        c.right = right;
+        return c;
+    };
+    ColSpec name = Columns_Builtin(COL_NAME);
+    switch (k) {
+        case FK_MUSIC:
+            name.width96 = 300;
+            return {name, prop(PKEY_Music_TrackNumber, 50, true), prop(PKEY_Title, 240), prop(PKEY_Music_Artist, 200),
+                    prop(PKEY_Music_AlbumTitle, 200)};
+        case FK_PICTURES:
+            return {name, prop(PKEY_Photo_DateTaken, 170), prop(PKEY_Image_Dimensions, 110), Columns_Builtin(COL_TYPE),
+                    Columns_Builtin(COL_SIZE)};
+        case FK_VIDEOS:
+            return {name, Columns_Builtin(COL_DATE), Columns_Builtin(COL_TYPE), Columns_Builtin(COL_SIZE),
+                    prop(PKEY_Media_Duration, 90, true)};
+        default: return Columns_Default();
+    }
+}
+
+// Type imposé par desktop.ini ([ViewState] FolderType), sinon d'après le contenu.
+FolderKind KindOf(const DirData& d) {
+    if (d.isRoot() || d.isVirtual() || d.listOnly() || !d.query.empty() || d.entries.size() > 20000) return FK_GENERAL;
+    for (const Entry& e : d.entries)
+        if (!e.isDir() && e.nameLen == 11 && _wcsicmp(d.name(e), L"desktop.ini") == 0) {
+            wchar_t type[64] = L"";
+            GetPrivateProfileStringW(L"ViewState", L"FolderType", L"", type, 64, Join(d.path, L"desktop.ini").c_str());
+            if (const int k = FolderKindFromName(type); k >= 0) return (FolderKind)k;
+            break;
+        }
+    return DetectFolderKind(d);
+}
+
+bool ReadView(const std::wstring& name, FolderView& v);
+
+// Nouveau dossier : sans affichage mémorisé, colonnes de son type (musique, images, vidéos).
+void AutoFolderKind(const DirData& d) {
+    g_folderKind = KindOf(d);
+    if (FixedColumns() || g_folderKind == FK_GENERAL || g_folderKind == FK_DOCUMENTS) return;
+    FolderView saved;
+    if (ReadView(ViewName(d.path), saved)) return;  // l'utilisateur a choisi ses colonnes
+    std::vector<ColSpec> cols = KindColumns(g_folderKind);
+    g_folderCols = cols;
+    if (ColumnsKey(cols) != ColumnsKey(CurrentColumns())) ApplyColumns(cols);
+}
+
+// « Optimiser ce dossier pour » : colonnes du type choisi, mémorisées pour ce dossier.
+void SetFolderKind(FolderKind k) {
+    if (!HasView() || FixedColumns()) return;
+    g_folderKind = k;
+    ApplyColumns(KindColumns(k));
+    SaveFolderView();
+    RequestSortProps();
+    if (g_viewMode == VM_TILES || g_viewMode == VM_CONTENT) InvalidateRect(g_list, nullptr, TRUE);
+}
 
 // L'affichage courant devient celui de tous les dossiers (les réglages propres à chacun sont oubliés).
 void ApplyViewToAll() {
@@ -1515,7 +1798,8 @@ int FindItem(const NMLVFINDITEMW* f) {
     const int start = (f->iStart >= 0 && f->iStart < n) ? f->iStart : 0;
     for (int k = 0; k < n; ++k) {
         const int r = (start + k) % n;
-        if (_wcsnicmp(NameOf(EntryAt(r)), f->lvfi.psz, len) == 0) return r;
+        const int e = EntryAt(r);  // en-tête de groupe : sauté
+        if (e >= 0 && _wcsnicmp(NameOf(e), f->lvfi.psz, len) == 0) return r;
     }
     return -1;
 }
@@ -1714,8 +1998,9 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
 void ApplyOrder(std::vector<uint32_t> order, double ms) {
     const auto sel = SelectedEntries();
     const int focus = FocusedEntry();
-    g_view.order = std::move(order);
+    g_view.sorted = std::move(order);
     g_view.sortMs = ms;
+    ArrangeView();
     RebuildRowOf();
     ListView_SetItemCountEx(g_list, RowCount(), LVSICF_NOSCROLL);  // change si des éléments sont masqués / affichés
     ApplySelection(sel, focus, true);
@@ -2022,7 +2307,7 @@ void OnResult(Result* raw) {
     std::vector<int32_t> icons(n, -1);
     std::vector<uint8_t> overlays(n, 0), states(n, ICON_NONE);
     std::vector<int32_t> thumbs(n, THUMB_UNKNOWN);
-    std::vector<std::pair<PROPERTYKEY, PropValues>> props;  // rafraîchissement : valeurs déjà lues reprises
+    std::deque<std::pair<PROPERTYKEY, PropValues>> props;  // rafraîchissement : valeurs déjà lues reprises
     for (size_t i = 0; i < n; ++i)
         if (d.entries[i].icon >= 0) { icons[i] = d.entries[i].icon; states[i] = ICON_OWN; }
     if (refresh && HasView() && g_view.data->path == d.path) {
@@ -2074,6 +2359,12 @@ void OnResult(Result* raw) {
         g_view.order = SortOrder(d, g_sort.key, g_sortAsc, g_prefs, g_filter, &g_view.dirBytes);
     if (g_sort.key == COL_PROP && d.entries.size() <= kSyncSortMax && SortProps())
         g_view.order = SortOrder(d, g_sort.key, g_sortAsc, g_prefs, g_filter, nullptr, SortProps());  // valeurs reprises
+    if (_wcsicmp(g_path.c_str(), d.path.c_str()) != 0 || g_query != d.query) {  // autre dossier : filtres oubliés
+        g_colFilter.clear();
+        g_collapsed.clear();
+    }
+    g_view.sorted = std::move(g_view.order);
+    ArrangeView();
     RebuildRowOf();
     g_path = d.path;
     g_query = d.query;
@@ -2087,6 +2378,10 @@ void OnResult(Result* raw) {
     RequestDirSizes();
     if (p.view) ApplyFolderView(*p.view);  // autre dossier : son affichage
     else UpdateColumnsForView();
+    if (!refresh) AutoFolderKind(d);
+    ArrangeView();  // regroupement de ce dossier (son affichage vient d'être appliqué)
+    RebuildRowOf();
+    UpdateSortArrow();
     RequestSortProps();
     if (Pane_Mode() != PaneMode::None) SetTimer(g_hwnd, TIMER_PANE, 30, nullptr);  // dossier changé, ou fichier modifié
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
@@ -2929,7 +3224,8 @@ void BinRestore(bool all) {
     if (!InBin()) return;
     std::vector<int> sel;
     if (all)
-        for (uint32_t i : g_view.order) sel.push_back((int)i);
+        for (uint32_t i : g_view.order)
+            if (!IsGroupRow(i)) sel.push_back((int)i);
     else
         sel = SelectedEntries();
     if (sel.empty()) return;
@@ -3779,6 +4075,14 @@ void SwitchSide() {
     Passive p;
     p.view = std::move(g_view);
     g_view = View{};
+    if (p.view.arranged) {  // le panneau inactif montre l'ordre du tri, sans groupes ni filtres
+        p.view.order = p.view.sorted;
+        p.view.groups.clear();
+        p.view.arranged = false;
+        p.view.rowOf.assign(p.view.data ? p.view.data->entries.size() : 0, -1);
+        for (size_t r = 0; r < p.view.order.size(); ++r) p.view.rowOf[p.view.order[r]] = (int)r;
+        ListView_SetItemCountEx(old, (int)p.view.order.size(), LVSICF_NOSCROLL);
+    }
     p.cols = g_cols;
     p.path = g_path;
     p.query = g_query;
@@ -4634,11 +4938,173 @@ MenuExtra SortMenu() {
     return m;
 }
 
+void SetGroupBy(int key) {
+    g_groupKey = key;
+    g_collapsed.clear();
+    SaveFolderView();
+    ReArrange();
+    if (key >= 0 && !GroupsShown() && HasView() && !g_view.data->isRoot())
+        Flash(L"Les groupes s'affichent en Détails et en Contenu");
+}
+
+MenuExtra GroupMenu() {
+    MenuExtra m;
+    m.text = L"Regrouper par";
+    m.sub.push_back({L"(Aucun)", [] { SetGroupBy(-1); }, false, g_groupKey < 0});
+    for (int k : {COL_NAME, COL_DATE, COL_TYPE, COL_SIZE, COL_CTIME, COL_ATIME})
+        m.sub.push_back({Columns_Builtin(k).title, [k] { SetGroupBy(k); }, false, g_groupKey == k});
+    if (!g_view.groups.empty()) {
+        m.sub.push_back({});
+        m.sub.push_back({L"Tout réduire", [] {
+                             for (const auto& g : g_view.groups) g_collapsed.insert(g.label);
+                             ReArrange();
+                         }});
+        m.sub.push_back({L"Tout développer", [] {
+                             g_collapsed.clear();
+                             ReArrange();
+                         }});
+    }
+    return m;
+}
+
+MenuExtra KindMenu() {
+    MenuExtra m;
+    m.text = L"Optimiser ce dossier pour";
+    const bool can = HasView() && !FixedColumns() && g_query.empty();
+    const std::pair<FolderKind, const wchar_t*> kinds[] = {{FK_GENERAL, L"Éléments généraux"}, {FK_DOCUMENTS, L"Documents"},
+                                                           {FK_PICTURES, L"Images"},           {FK_MUSIC, L"Musique"},
+                                                           {FK_VIDEOS, L"Vidéos"}};
+    for (const auto& [k, text] : kinds) {
+        const FolderKind kk = k;
+        m.sub.push_back({text, [kk] { SetFolderKind(kk); }, false, g_folderKind == kk, {}, !can});
+    }
+    return m;
+}
+
+void SetCheckboxes(bool on, bool save = true);
+
+void ToggleColumnFilter(int key, const std::wstring& label) {
+    auto& keep = g_colFilter[key];
+    if (!keep.erase(label)) keep.insert(label);
+    if (keep.empty()) g_colFilter.erase(key);
+    ReArrange();
+}
+
+// Flèche ▾ d'un en-tête : tranches de valeurs présentes, à cocher (plusieurs : l'une ou l'autre).
+void ShowColumnFilter(int sub, POINT pt) {
+    if (!HasView() || g_view.data->isRoot() || sub < 0 || sub >= (int)g_cols.size()) return;
+    const int key = g_cols[(size_t)sub].key;
+    if (!Groupable(key)) return;
+    const auto f = g_colFilter.find(key);
+    const std::set<std::wstring> keep = f != g_colFilter.end() ? f->second : std::set<std::wstring>{};
+    std::vector<MenuExtra> v;
+    for (const auto& [b, n] : BucketsOf(g_view.sorted, BucketFor(key))) {
+        const std::wstring label = b.label;
+        v.push_back({MenuText(label) + L"\t" + std::to_wstring(n), [key, label] { ToggleColumnFilter(key, label); }, false,
+                     keep.count(label) > 0});
+    }
+    if (v.empty()) v.push_back({L"Aucune valeur", nullptr, false, false, {}, true});
+    if (!keep.empty()) {
+        v.push_back({});
+        v.push_back({L"Effacer le filtre", [key] {
+                         g_colFilter.erase(key);
+                         ReArrange();
+                     }});
+    }
+    ShowOwnMenu(v, pt, TPM_LEFTALIGN | TPM_TOPALIGN);
+}
+
+// Contenu d'un dossier local pour son info-bulle : « Dossiers : a, b ; Fichiers : c, d… ».
+std::wstring FolderPeek(const std::wstring& path) {
+    if (path.size() < 3 || path[1] != L':' || GetDriveTypeW(path.substr(0, 3).c_str()) != DRIVE_FIXED) return L"";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW(ToNtPath(Join(path, L"*")).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+                                FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return L"";
+    std::vector<std::wstring> dirs, files;
+    bool more = false;
+    int seen = 0;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..") || !IsShown(fd.dwFileAttributes, g_prefs)) continue;
+        auto& v = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? dirs : files;
+        if (v.size() < 5) v.push_back(fd.cFileName);
+        else more = true;
+        if (++seen > 200) {
+            more = true;
+            break;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (dirs.empty() && files.empty()) return L"Dossier vide";
+    auto list = [&](const std::vector<std::wstring>& v) {
+        std::wstring s;
+        for (const auto& n : v) s += (s.empty() ? L"" : L", ") + n;
+        return s;
+    };
+    std::wstring s;
+    if (!dirs.empty()) s += L"Dossiers : " + list(dirs) + (more && files.empty() ? L"…" : L"");
+    if (!files.empty()) s += (s.empty() ? L"" : L"\n") + std::wstring(L"Fichiers : ") + list(files) + (more ? L"…" : L"");
+    return s;
+}
+
+bool ExplorerFlag(const wchar_t* name, DWORD def) {
+    return RegDword(L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", name, def) != 0;
+}
+
+// Info-bulle au survol : type, taille, date ; pour un dossier, sa taille si connue et son contenu.
+void OnInfoTip(NMLVGETINFOTIPW* t) {
+    if (!HasView() || !t->pszText || t->cchTextMax <= 0 || t->iItem < 0 || t->iItem >= RowCount()) return;
+    std::wstring s;
+    if (const int g = GroupAt(t->iItem); g >= 0) {
+        const GroupInfo& gi = g_view.groups[(size_t)g];
+        s = gi.label + L" : " + Plural(gi.count, L"élément", L"éléments") +
+            (gi.collapsed ? L"\nClic : développer" : L"\nClic : réduire");
+        wcsncpy_s(t->pszText, t->cchTextMax, s.c_str(), _TRUNCATE);
+        return;
+    }
+    const int idx = EntryAt(t->iItem);
+    const DirData& d = *g_view.data;
+    if (idx < 0 || d.isRoot()) return;
+    const Entry& e = E(idx);
+    wchar_t date[64] = L"";
+    FormatDate(e.mtime, date, 64);
+    s = L"Type : " + TypeLabel(d, e);
+    if (!e.isDir()) s += L"\nTaille : " + BytesText(e.size);
+    else if (idx < (int)g_view.dirState.size() && (g_view.dirState[idx] & SIZE_KNOWN))
+        s += L"\nTaille : " + BytesText(g_view.dirBytes[idx]);
+    if (*date) s += L"\nModifié le : " + std::wstring(date);
+    if (e.isDir() && !d.isVirtual() && !d.listOnly() && ExplorerFlag(L"FolderContentsInfoTip", 1))
+        if (std::wstring peek = FolderPeek(FullPath(idx)); !peek.empty()) s += L"\n" + peek;
+    // Nom tronqué : le ListView l'a mis en tête (dwFlags = 0).
+    std::wstring out = (t->dwFlags & LVGIT_UNFOLDED) ? L"" : std::wstring(t->pszText);
+    if (!out.empty()) out += L"\n";
+    out += s;
+    wcsncpy_s(t->pszText, t->cchTextMax, out.c_str(), _TRUNCATE);
+}
+
+// Cases à cocher des éléments (case cochée = élément sélectionné).
+void SetCheckboxes(bool on, bool save) {
+    g_checkboxes = on;
+    if (save) {
+        const DWORD v = on ? 1 : 0;
+        RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"Checkboxes", REG_DWORD, &v, sizeof v);
+    }
+    for (HWND lv : g_lists) {
+        if (!lv) continue;
+        ListView_SetExtendedListViewStyleEx(lv, LVS_EX_CHECKBOXES, on ? LVS_EX_CHECKBOXES : 0);
+        ListView_SetCallbackMask(lv, LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED | (on ? LVIS_STATEIMAGEMASK : 0));
+        InvalidateRect(lv, nullptr, TRUE);
+    }
+}
+
 std::vector<MenuExtra> DisplayItems() {
     std::vector<MenuExtra> v = ViewMenu().sub;
     v.push_back({});
     v.push_back({L"Éléments masqués\tCtrl+H", ToggleHidden, false, g_prefs.showHidden});
     v.push_back({L"Extensions de noms de fichiers", ToggleExtensions, false, g_prefs.showExtensions});
+    v.push_back({L"Cases à cocher des éléments", [] { SetCheckboxes(!g_checkboxes); }, false, g_checkboxes});
+    v.push_back({});
+    v.push_back(KindMenu());
     return v;
 }
 
@@ -4786,7 +5252,11 @@ void OnCommandDropdown(int id) {
     std::vector<MenuExtra> items;
     switch (id) {
         case CMD_NEW: items = NewMenu().sub; break;
-        case CMD_SORT: items = SortMenu().sub; break;
+        case CMD_SORT:
+            items = SortMenu().sub;
+            items.push_back({});
+            items.push_back(GroupMenu());
+            break;
         case CMD_VIEW: items = DisplayItems(); break;
         case CMD_MORE: items = MoreItems(); break;
         default: return;
@@ -4819,6 +5289,7 @@ void ShowQuickMenu(POINT pt, const std::vector<int>& sel) {
         view.text = L"Affichage";
         v.push_back(view);
         v.push_back(SortMenu());
+    v.push_back(GroupMenu());
         v.push_back({L"Actualiser\tF5", [] { g_forceSizes = true; Refresh(); }});
         v.push_back({});
         v.push_back({L"Coller\tCtrl+V", [] { Paste(g_path); }, false, false, {}, !mod || !clip});
@@ -5258,7 +5729,8 @@ void CreateChildren(HWND hwnd) {
                                   WS_CHILD | (k == 0 ? WS_VISIBLE : 0) | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA |
                                       LVS_SHAREIMAGELISTS | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
                                   0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(k == 0 ? ID_LIST : ID_LIST2), g_inst, nullptr);
-        ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
+        ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP |
+                                                  (ExplorerFlag(L"ShowInfoTip", 1) ? LVS_EX_INFOTIP : 0));
         ListView_SetCallbackMask(lv, LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED);  // fournis par LVN_GETDISPINFO
         SetWindowTheme(lv, L"Explorer", nullptr);
         g_lists[k] = lv;
@@ -5266,6 +5738,7 @@ void CreateChildren(HWND hwnd) {
                                        0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(ID_HDR0 + k), g_inst, nullptr);
     }
     g_list = g_lists[0];
+    SetCheckboxes(RegDword(L"Software\\FastExplorer", L"Checkboxes", ExplorerFlag(L"AutoCheckSelect", 0)) != 0, false);
 
     ApplyColumns(g_cols);
 
@@ -5582,6 +6055,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case LVN_ODSTATECHANGED: ScheduleSelectionSummary(); return 0;  // plage (Maj+clic, Ctrl+A)
                 case NM_CUSTOMDRAW: return OnListCustomDraw((NMLVCUSTOMDRAW*)lp);
+                case LVN_GETINFOTIPW: OnInfoTip((NMLVGETINFOTIPW*)lp); return 0;
+                case LVN_COLUMNDROPDOWN: {
+                    const int c = ((NMLISTVIEW*)lp)->iSubItem;
+                    HWND h = ListView_GetHeader(g_list);
+                    RECT r{};
+                    if (!Header_GetItemDropDownRect(h, c, &r)) Header_GetItemRect(h, c, &r);
+                    MapWindowPoints(h, nullptr, (POINT*)&r, 2);
+                    ShowColumnFilter(c, {r.left, r.bottom});
+                    return 0;
+                }
                 case LVN_ODFINDITEMW: return FindItem((NMLVFINDITEMW*)lp);
                 case LVN_COLUMNCLICK:
                     if (const int c = ((NMLISTVIEW*)lp)->iSubItem; c >= 0 && c < (int)g_cols.size()) Resort(g_cols[c]);
@@ -5660,6 +6143,26 @@ bool HandleGlobalKeys(const MSG& m) {
         while (g_wheelAcc <= -WHEEL_DELTA) { g_wheelAcc += WHEEL_DELTA; Zoom(-1); }
         return true;
     }
+    if (m.hwnd == g_list && (m.message == WM_LBUTTONDOWN || m.message == WM_LBUTTONDBLCLK) && HasView()) {
+        LVHITTESTINFO ht{};
+        ht.pt = {GET_X_LPARAM(m.lParam), GET_Y_LPARAM(m.lParam)};
+        const int row = ListView_SubItemHitTest(g_list, &ht);
+        if (GroupAt(row) >= 0) {  // en-tête de groupe : replier / déplier
+            SetFocus(g_list);
+            if (m.message == WM_LBUTTONDOWN) ToggleGroup(row);
+            return true;
+        }
+        if (g_checkboxes && row >= 0 && (ht.flags & LVHT_ONITEMSTATEICON) && EntryAt(row) >= 0) {
+            SetFocus(g_list);  // case : ajoute ou retire l'élément de la sélection, sans toucher aux autres
+            if (m.message == WM_LBUTTONDOWN) {
+                const bool on = ListView_GetItemState(g_list, row, LVIS_SELECTED) != 0;
+                ListView_SetItemState(g_list, row, (on ? 0 : LVIS_SELECTED) | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                ListView_SetSelectionMark(g_list, row);
+                ListView_RedrawItems(g_list, row, row);
+            }
+            return true;
+        }
+    }
     if (m.hwnd == g_list && m.message == WM_MOUSEMOVE) {
         if (!(m.wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))) SetTimer(g_hwnd, TIMER_HOVER, kMenuHoverMs, nullptr);
         return false;
@@ -5676,7 +6179,8 @@ bool HandleGlobalKeys(const MSG& m) {
             const int e = HasView() ? FindEntryByName(g_editName) : -1;
             const int row = e >= 0 ? g_view.rowOf[e] : -1;
             const int next = row + (GetKeyState(VK_SHIFT) < 0 ? -1 : 1);
-            g_tabNext = row >= 0 && next >= 0 && next < RowCount() ? NameOf(EntryAt(next)) : L"";
+            const int ne = row >= 0 ? EntryAt(next) : -1;  // en-tête de groupe : on s'arrête
+            g_tabNext = ne >= 0 ? NameOf(ne) : L"";
             SetFocus(g_list);  // la liste valide la saisie (LVN_ENDLABELEDIT)
             g_tabNext.clear();
             return true;
@@ -5770,6 +6274,17 @@ bool HandleGlobalKeys(const MSG& m) {
         return false;
     }
     if (m.message != WM_KEYDOWN) return false;
+    if (focus == g_list && HasView() && !g_view.groups.empty()) {
+        const int row = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED);
+        if (const int g = GroupAt(row); g >= 0) {
+            const bool collapsed = g_view.groups[(size_t)g].collapsed;
+            if ((m.wParam == VK_LEFT && !collapsed) || (m.wParam == VK_RIGHT && collapsed) || m.wParam == VK_RETURN ||
+                m.wParam == VK_SPACE) {
+                ToggleGroup(row);
+                return true;
+            }
+        }
+    }
     const bool ctrl = GetKeyState(VK_CONTROL) < 0;
     if (ctrl) {  // onglets et fenêtres
         const bool sh = GetKeyState(VK_SHIFT) < 0;
