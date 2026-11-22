@@ -110,7 +110,7 @@ struct Pending {
 enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
 enum SizeState : uint8_t { SIZE_KNOWN = 1, SIZE_PARTIAL = 2, SIZE_PENDING = 4 };
 enum ThumbState : int32_t { THUMB_UNKNOWN = -1, THUMB_PENDING = -2, THUMB_NONE = -3 };
-enum ViewMode { VM_DETAILS, VM_LIST, VM_SMALL, VM_ICONS };
+enum ViewMode { VM_DETAILS, VM_LIST, VM_SMALL, VM_ICONS, VM_TILES, VM_CONTENT };
 
 // Ce qui est affiché. `order` : ligne → index d'entrée ; `rowOf` : l'inverse.
 struct View {
@@ -522,11 +522,21 @@ uint32_t g_bigOverlays = 0;           // surimpressions déjà déclarées (bits
 int g_wheelAcc = 0;                   // Ctrl+molette : crans partiels (pavés tactiles)
 constexpr int kZoomPx[] = {32, 48, 64, 96, 128, 192, 256};
 
-bool BigMode() { return g_viewMode == VM_ICONS; }
+bool g_compact = true;                // mode compact : lignes serrées (sinon espacées, comme l'Explorateur)
+
+// Modes qui utilisent g_bigList : icônes, mosaïques, contenu.
+bool BigMode() { return g_viewMode >= VM_ICONS; }
+// Taille des images de g_bigList (à 96 ppp) : mosaïques et contenu en 48 px, comme l'Explorateur.
+int BigPx96() { return g_viewMode == VM_ICONS ? g_iconPx : 48; }
+
+DWORD RegDword(const wchar_t* key, const wchar_t* name, DWORD def) {
+    DWORD v = 0, cb = sizeof v;
+    return RegGetValueW(HKEY_CURRENT_USER, key, name, RRF_RT_REG_DWORD, nullptr, &v, &cb) == ERROR_SUCCESS ? v : def;
+}
 
 void ResetBigList() {
     if (g_bigList) ImageList_Destroy(g_bigList);
-    g_bigPx = S(g_iconPx);
+    g_bigPx = S(BigPx96());
     g_bigList = ImageList_Create(g_bigPx, g_bigPx, ILC_COLOR32, 64, 64);
     g_bigSys.clear();
     g_bigOverlays = 0;
@@ -566,42 +576,102 @@ void BigOverlay(int ov) {
         if (const int slot = SysSlot(img); slot >= 0) ImageList_SetOverlayImage(g_bigList, slot, ov);
 }
 
-// Miniature (au plus px × px) posée en bas et au centre d'un carré transparent.
-int AddThumb(HBITMAP bmp) {
-    BITMAP bm{};
-    if (!GetObjectW(bmp, sizeof bm, &bm) || bm.bmWidth <= 0 || bm.bmHeight == 0) return -1;
-    const int px = g_bigPx;
-    const int w = std::min<int>(bm.bmWidth, px), h = std::min<int>(std::abs(bm.bmHeight), px);
-    BITMAPINFO bi{};
-    bi.bmiHeader = {sizeof(BITMAPINFOHEADER), bm.bmWidth, -std::abs(bm.bmHeight), 1, 32, BI_RGB};
-    std::vector<uint32_t> src((size_t)bm.bmWidth * std::abs(bm.bmHeight));
-    HDC dc = GetDC(nullptr);
-    const int got = GetDIBits(dc, bmp, 0, std::abs(bm.bmHeight), src.data(), &bi, DIB_RGB_COLORS);
+// Copie une image 32 bits (sw × sh, alpha non prémultiplié) au centre d'une case
+// transparente cw × ch (en bas si `bottom`) et l'ajoute à `list`.
+int AddPadded(HIMAGELIST list, int cw, int ch, const std::vector<uint32_t>& src, int sw, int sh, bool bottom) {
     BITMAPINFO di{};
-    di.bmiHeader = {sizeof(BITMAPINFOHEADER), px, -px, 1, 32, BI_RGB};
+    di.bmiHeader = {sizeof(BITMAPINFOHEADER), cw, -ch, 1, 32, BI_RGB};
     void* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(dc, &di, DIB_RGB_COLORS, &bits, nullptr, 0);
-    ReleaseDC(nullptr, dc);
-    if (!got || !dib) {
-        if (dib) DeleteObject(dib);
-        return -1;
-    }
+    HBITMAP dib = CreateDIBSection(nullptr, &di, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib) return -1;
     bool alpha = false;  // image opaque livrée avec un canal alpha nul : on la rend opaque
     for (uint32_t p : src)
         if (p >> 24) { alpha = true; break; }
     auto* dst = (uint32_t*)bits;
-    memset(dst, 0, (size_t)px * px * 4);
-    const int x0 = (px - w) / 2, y0 = px - h;
+    memset(dst, 0, (size_t)cw * ch * 4);
+    const int w = std::min(sw, cw), h = std::min(sh, ch);
+    const int x0 = (cw - w) / 2, y0 = bottom ? ch - h : (ch - h) / 2;
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
-            const uint32_t p = src[(size_t)y * bm.bmWidth + x];
-            dst[(size_t)(y0 + y) * px + x0 + x] = alpha ? p : (p | 0xFF000000u);
+            const uint32_t p = src[(size_t)y * sw + x];
+            dst[(size_t)(y0 + y) * cw + x0 + x] = alpha ? p : (p | 0xFF000000u);
         }
-    const int slot = ImageList_Add(g_bigList, dib, nullptr);
+    const int slot = ImageList_Add(list, dib, nullptr);
     DeleteObject(dib);
     return slot;
 }
 
+// Pixels 32 bits d'un bitmap (haut en premier).
+bool BitmapPixels(HBITMAP bmp, std::vector<uint32_t>& px, int& w, int& h) {
+    BITMAP bm{};
+    if (!GetObjectW(bmp, sizeof bm, &bm) || bm.bmWidth <= 0 || bm.bmHeight == 0) return false;
+    w = bm.bmWidth;
+    h = std::abs(bm.bmHeight);
+    BITMAPINFO bi{};
+    bi.bmiHeader = {sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB};
+    px.assign((size_t)w * h, 0);
+    HDC dc = GetDC(nullptr);
+    const int got = GetDIBits(dc, bmp, 0, h, px.data(), &bi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    return got != 0;
+}
+
+// Miniature (au plus px × px) posée en bas et au centre d'un carré transparent.
+int AddThumb(HBITMAP bmp) {
+    std::vector<uint32_t> src;
+    int w, h;
+    if (!BitmapPixels(bmp, src, w, h)) return -1;
+    return AddPadded(g_bigList, g_bigPx, g_bigPx, src, w, h, true);
+}
+
+// ── Mode non compact : lignes espacées ──
+// Le ListView règle la hauteur des lignes sur celle de sa liste de petites
+// icônes. On lui donne donc une liste de cases plus hautes que les icônes, où
+// chaque icône système est recopiée au centre (une fois par icône différente).
+HIMAGELIST g_smallPick = nullptr;      // liste système des petites icônes (selon l'échelle)
+HIMAGELIST g_rowList = nullptr;        // cases espacées
+int g_rowW = 0, g_rowH = 0;
+HIMAGELIST g_rowSrc = nullptr;         // liste système d'où viennent ses icônes
+std::unordered_map<int, int> g_rowSys;  // icône système → case
+uint32_t g_rowOverlays = 0;
+
+bool RowMode() { return !g_compact && g_viewMode <= VM_SMALL && g_rowList; }
+
+int RowSlot(int sys) {
+    if (auto it = g_rowSys.find(sys); it != g_rowSys.end()) return it->second;
+    int slot = -1;
+    if (HICON ic = ImageList_GetIcon(g_smallPick, sys, ILD_TRANSPARENT)) {
+        ICONINFO ii{};
+        if (GetIconInfo(ic, &ii)) {
+            std::vector<uint32_t> px, mask;
+            int w = 0, h = 0, mw = 0, mh = 0;
+            if (ii.hbmColor && BitmapPixels(ii.hbmColor, px, w, h)) {
+                bool alpha = false;
+                for (uint32_t p : px)
+                    if (p >> 24) { alpha = true; break; }
+                // Ancienne icône sans canal alpha : la transparence vient du masque.
+                if (!alpha && ii.hbmMask && BitmapPixels(ii.hbmMask, mask, mw, mh) && mw == w && mh >= h)
+                    for (size_t i = 0; i < px.size(); ++i) px[i] = (mask[i] & 0xFFFFFF) ? 0 : (px[i] | 0xFF000000u);
+                if (!alpha && mask.empty())
+                    for (uint32_t& p : px) p |= 0xFF000000u;
+                slot = AddPadded(g_rowList, g_rowW, g_rowH, px, w, h, false);
+            }
+            if (ii.hbmColor) DeleteObject(ii.hbmColor);
+            if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        }
+        DestroyIcon(ic);
+    }
+    g_rowSys[sys] = slot;
+    return slot;
+}
+
+void RowOverlay(int ov) {
+    if (ov <= 0 || ov > 15 || (g_rowOverlays & (1u << ov))) return;
+    g_rowOverlays |= 1u << ov;
+    int img = -1;
+    if (SUCCEEDED(((IImageList*)g_smallPick)->GetOverlayImage(ov, &img)) && img >= 0)
+        if (const int slot = RowSlot(img); slot >= 0) ImageList_SetOverlayImage(g_rowList, slot, ov);
+}
 void OnThumb(ThumbResult* raw) {
     std::unique_ptr<ThumbResult> r(raw);
     struct Bmp { HBITMAP b; ~Bmp() { if (b) DeleteObject(b); } } bmp{r->bmp};
@@ -619,7 +689,8 @@ int BigImage(int idx, int sysIcon) {
     if (th == THUMB_UNKNOWN) {
         const Entry& e = E(idx);
         th = THUMB_NONE;
-        if (!g_view.data->isRoot() && Thumbs_Wanted(e.attr, e.size)) {
+        // Dossier : aperçu de ses premiers fichiers, lisible à partir de 48 px.
+        if (!g_view.data->isRoot() && Thumbs_Wanted(e.attr, e.size) && !(e.isDir() && g_bigPx < S(48))) {
             th = THUMB_PENDING;
             Thumbs_Request(g_view.serial, (uint32_t)idx, Join(g_path, NameOf(idx)), g_bigPx);
         }
@@ -633,50 +704,108 @@ void SaveViewMode() {
     RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"IconPx", REG_DWORD, &px, sizeof px);
 }
 
+// Mosaïques et contenu : taille des cases. Contenu = une case par ligne, sur toute la largeur.
+void ApplyTileInfo() {
+    if (g_viewMode != VM_TILES && g_viewMode != VM_CONTENT) return;
+    RECT rc;
+    GetWindowRect(g_list, &rc);
+    const bool content = g_viewMode == VM_CONTENT;
+    const int lines = content ? 3 : 2;  // sous le nom : type et taille (mosaïques) ; date, taille, type (contenu)
+    LVTILEVIEWINFO ti{sizeof ti};
+    ti.dwMask = LVTVIM_TILESIZE | LVTVIM_COLUMNS | LVTVIM_LABELMARGIN;
+    ti.dwFlags = LVTVIF_FIXEDSIZE;
+    const int w = content ? std::max(S(200), (int)(rc.right - rc.left) - GetSystemMetricsForDpi(SM_CXVSCROLL, g_dpi) - S(6))
+                          : S(280);
+    ti.sizeTile = {w, std::max(g_bigPx, g_fontH * (lines + 1)) + S(content ? 14 : 10)};
+    ti.cLines = lines;
+    ti.rcLabelMargin = {S(6), 0, S(4), 0};
+    ListView_SetTileViewInfo(g_list, &ti);
+}
+
+// Hauteur des lignes (détails, liste, petites icônes) : liste système en mode
+// compact, sinon g_rowList (cases plus hautes que les icônes).
+void ApplyRowSpacing() {
+    HIMAGELIST want = g_smallPick;
+    if (!g_compact && g_viewMode <= VM_SMALL && g_smallPick) {
+        int cx = 16, cy = 16;
+        ImageList_GetIconSize(g_smallPick, &cx, &cy);
+        const int h = std::max(cy, g_fontH) + S(14);
+        if (!g_rowList || g_rowW != cx || g_rowH != h || g_rowSrc != g_smallPick) {
+            if (g_rowList) {
+                ListView_SetImageList(g_list, g_smallPick, LVSIL_SMALL);
+                ImageList_Destroy(g_rowList);
+            }
+            g_rowW = cx;
+            g_rowH = h;
+            g_rowSrc = g_smallPick;
+            g_rowList = ImageList_Create(cx, h, ILC_COLOR32, 64, 64);
+            g_rowSys.clear();
+            g_rowOverlays = 0;
+        }
+        want = g_rowList;
+    }
+    if (want && (HIMAGELIST)SendMessageW(g_list, LVM_GETIMAGELIST, LVSIL_SMALL, 0) != want)
+        ListView_SetImageList(g_list, want, LVSIL_SMALL);
+}
+void LoadCompact() {
+    // Réglage propre à l'application s'il a été changé ; sinon celui de l'Explorateur.
+    const DWORD win = RegDword(L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", L"UseCompactMode", 0);
+    g_compact = RegDword(L"Software\\FastExplorer", L"Compact", win) != 0;
+}
+
 // px96 : taille des icônes (VM_ICONS), 0 = inchangée.
 void ApplyViewMode(int mode, int px96, bool save = true) {
     g_viewMode = mode;
     if (px96) g_iconPx = std::clamp(px96, 32, 256);
     const int focus = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED);
     SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
+    ApplyRowSpacing();
     if (BigMode()) {
-        if (!g_bigList || g_bigPx != S(g_iconPx)) ResetBigList();
+        if (!g_bigList || g_bigPx != S(BigPx96())) ResetBigList();
         ListView_SetImageList(g_list, g_bigList, LVSIL_NORMAL);
-        ListView_SetIconSpacing(g_list, g_bigPx + S(std::max(28, g_iconPx / 3)), g_bigPx + g_fontH * 2 + S(14));
+        if (mode == VM_ICONS)
+            ListView_SetIconSpacing(g_list, g_bigPx + S(std::max(28, g_iconPx / 3)), g_bigPx + g_fontH * 2 + S(14));
     }
-    static const DWORD kViews[] = {LV_VIEW_DETAILS, LV_VIEW_LIST, LV_VIEW_SMALLICON, LV_VIEW_ICON};
+    static const DWORD kViews[] = {LV_VIEW_DETAILS, LV_VIEW_LIST, LV_VIEW_SMALLICON, LV_VIEW_ICON, LV_VIEW_TILE, LV_VIEW_TILE};
     ListView_SetView(g_list, kViews[mode]);
+    ApplyTileInfo();
     if (focus >= 0) ListView_EnsureVisible(g_list, focus, FALSE);
     SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_list, nullptr, TRUE);
     if (save) SaveViewMode();
 }
 
+void SetCompact(bool on) {
+    g_compact = on;
+    const DWORD v = on ? 1 : 0;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"Compact", REG_DWORD, &v, sizeof v);
+    ApplyViewMode(g_viewMode, 0, false);
+}
+
 void LoadViewMode() {
-    DWORD mode = 0, px = 0, cb = sizeof mode;
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"ViewMode", RRF_RT_REG_DWORD, nullptr, &mode, &cb) !=
-        ERROR_SUCCESS)
-        return;
-    cb = sizeof px;
-    RegGetValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"IconPx", RRF_RT_REG_DWORD, nullptr, &px, &cb);
-    if (mode <= VM_ICONS && mode != VM_DETAILS) ApplyViewMode((int)mode, (int)px, false);
+    LoadCompact();
+    const DWORD mode = RegDword(L"Software\\FastExplorer", L"ViewMode", VM_DETAILS);
+    const DWORD px = RegDword(L"Software\\FastExplorer", L"IconPx", 96);
+    ApplyViewMode(mode <= VM_CONTENT ? (int)mode : VM_DETAILS, (int)px, false);
 }
 
 // Ctrl+molette : détails → liste → petites icônes → icônes de 32 à 256 px (et retour).
+// Depuis les mosaïques ou le contenu, on repart des icônes moyennes.
 void Zoom(int dir) {
     int level;  // 0 détails, 1 liste, 2 petites icônes, 3… tailles d'icônes
-    if (g_viewMode != VM_ICONS) level = g_viewMode == VM_DETAILS ? 0 : g_viewMode == VM_LIST ? 1 : 2;
+    if (g_viewMode < VM_ICONS) level = g_viewMode == VM_DETAILS ? 0 : g_viewMode == VM_LIST ? 1 : 2;
     else {
+        const int px = g_viewMode == VM_ICONS ? g_iconPx : 48;
         level = 3;
         for (int i = 0; i < (int)std::size(kZoomPx); ++i)
-            if (kZoomPx[i] <= g_iconPx) level = 3 + i;
+            if (kZoomPx[i] <= px) level = 3 + i;
     }
     level = std::clamp(level + dir, 0, 2 + (int)std::size(kZoomPx));
     if (level < 3) ApplyViewMode(level == 0 ? VM_DETAILS : level == 1 ? VM_LIST : VM_SMALL, 0);
     else ApplyViewMode(VM_ICONS, kZoomPx[level - 3]);
 }
 
-// Ctrl+Maj+1…6, comme l'Explorateur.
+// Ctrl+Maj+1…8, comme l'Explorateur.
 void ViewByKey(int k) {
     switch (k) {
         case 1: ApplyViewMode(VM_ICONS, 256); break;  // très grandes icônes
@@ -685,6 +814,8 @@ void ViewByKey(int k) {
         case 4: ApplyViewMode(VM_SMALL, 0); break;
         case 5: ApplyViewMode(VM_LIST, 0); break;
         case 6: ApplyViewMode(VM_DETAILS, 0); break;
+        case 7: ApplyViewMode(VM_TILES, 0); break;
+        case 8: ApplyViewMode(VM_CONTENT, 0); break;
     }
 }
 
@@ -697,10 +828,13 @@ MenuExtra ViewMenu() {
              {L"Icônes moyennes\tCtrl+Maj+3", [] { ViewByKey(3); }, false, icons && g_iconPx < 80},
              {L"Petites icônes\tCtrl+Maj+4", [] { ViewByKey(4); }, false, g_viewMode == VM_SMALL},
              {L"Liste\tCtrl+Maj+5", [] { ViewByKey(5); }, false, g_viewMode == VM_LIST},
-             {L"Détails\tCtrl+Maj+6", [] { ViewByKey(6); }, false, g_viewMode == VM_DETAILS}};
+             {L"Détails\tCtrl+Maj+6", [] { ViewByKey(6); }, false, g_viewMode == VM_DETAILS},
+             {L"Mosaïques\tCtrl+Maj+7", [] { ViewByKey(7); }, false, g_viewMode == VM_TILES},
+             {L"Contenu\tCtrl+Maj+8", [] { ViewByKey(8); }, false, g_viewMode == VM_CONTENT},
+             {},
+             {L"Mode compact", [] { SetCompact(!g_compact); }, false, g_compact}};
     return m;
 }
-
 void FillDispInfo(LVITEMW& it) {
     const int idx = EntryAt(it.iItem);
     if (idx < 0) return;
@@ -716,15 +850,31 @@ void FillDispInfo(LVITEMW& it) {
                 Icons_Request(g_view.serial, (uint32_t)idx, Join(g_path, NameOf(idx)));
             }
         }
-        it.iImage = BigMode() ? BigImage(idx, g_view.icons[idx]) : g_view.icons[idx];
+        const int sys = g_view.icons[idx];
+        it.iImage = BigMode() ? BigImage(idx, sys) : RowMode() ? RowSlot(sys) : sys;
     }
     if (it.mask & LVIF_STATE) {  // surimpression (flèche de raccourci, état cloud), élément coupé
         // Élément caché : estompé, comme dans l'Explorateur (même rendu qu'un élément coupé).
         const bool dim = g_view.cut[idx] || (!g_view.data->isRoot() && (e.attr & FILE_ATTRIBUTE_HIDDEN));
         if (BigMode()) BigOverlay(g_view.overlays[idx]);
+        else if (RowMode()) RowOverlay(g_view.overlays[idx]);
         it.state = INDEXTOOVERLAYMASK(g_view.overlays[idx]) | (dim ? LVIS_CUT : 0) |
                    (it.iItem == g_dropRow ? LVIS_DROPHILITED : 0);
         it.stateMask = LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED;
+    }
+    if (it.mask & LVIF_COLUMNS) {  // mosaïques, contenu : colonnes affichées sous le nom
+        static const UINT kTile[] = {COL_TYPE, COL_SIZE}, kContent[] = {COL_DATE, COL_SIZE, COL_TYPE};
+        const UINT* cols = g_viewMode == VM_CONTENT ? kContent : kTile;
+        const UINT n = g_viewMode == VM_CONTENT ? 3 : 2;
+        if (it.puColumns) {  // tampon fourni par le ListView (cColumns = sa capacité)
+            it.cColumns = std::min<UINT>(n, it.cColumns);
+            for (UINT i = 0; i < it.cColumns; ++i) it.puColumns[i] = cols[i];
+        } else {
+            it.cColumns = n;
+            it.puColumns = (PUINT)cols;
+        }
+        if ((it.mask & LVIF_COLFMT) && it.piColFmt)
+            for (UINT i = 0; i < it.cColumns; ++i) it.piColFmt[i] = 0;
     }
     if (!(it.mask & LVIF_TEXT) || !it.pszText || it.cchTextMax <= 0) return;
     wchar_t* out = it.pszText;
@@ -796,7 +946,7 @@ void UpdateColumnsForView() {
 
 // Ce PC : jauge d'occupation de chaque lecteur (rouge au-delà de 90 %, comme l'Explorateur).
 LRESULT OnListCustomDraw(NMLVCUSTOMDRAW* cd) {
-    if (!HasView() || !g_view.data->isRoot()) return CDRF_DODEFAULT;
+    if (!HasView() || !g_view.data->isRoot() || g_viewMode != VM_DETAILS) return CDRF_DODEFAULT;
     switch (cd->nmcd.dwDrawStage) {
         case CDDS_PREPAINT: return CDRF_NOTIFYITEMDRAW;
         case CDDS_ITEMPREPAINT: return CDRF_NOTIFYPOSTPAINT;
@@ -2772,6 +2922,7 @@ void ApplyImageList() {
     if (g_imgLarge) ImageList_GetIconSize(g_imgLarge, &cl, &cy);
     const int want = S(16);
     HIMAGELIST pick = (g_imgLarge && std::abs(cl - want) < std::abs(cs - want)) ? g_imgLarge : g_imgSmall;
+    g_smallPick = pick;
     if (pick) ListView_SetImageList(g_list, pick, LVSIL_SMALL);
     if (pick) NavPane_SetImageList(pick);
 }
@@ -2822,6 +2973,7 @@ void Layout() {
     g_split = {navW, top, navW + split, top + bodyH};
     place(g_list, navW + split, top, std::max(0, (int)rc.right - navW - split), bodyH);
     if (dwp) EndDeferWindowPos(dwp);
+    ApplyTileInfo();  // contenu : cases sur toute la largeur
 }
 
 // Initialise le Shell (listes d'icônes système) sur un thread à part, pendant
@@ -3044,7 +3196,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_dpi = nd;
             ApplyFont();
             ApplyImageList();
-            if (BigMode()) ApplyViewMode(g_viewMode, 0, false);  // icônes à la nouvelle échelle
+            ApplyViewMode(g_viewMode, 0, false);  // icônes et hauteur des lignes à la nouvelle échelle
             const RECT* r = (const RECT*)lp;
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                          SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
@@ -3291,7 +3443,7 @@ bool HandleGlobalKeys(const MSG& m) {
             case VK_PRIOR: SwitchTab((g_tab + n - 1) % n); return true;
             case VK_NEXT: SwitchTab((g_tab + 1) % n); return true;
         }
-        if (sh && m.wParam >= '1' && m.wParam <= '6') {  // Ctrl+Maj+1…6 : mode d'affichage
+        if (sh && m.wParam >= '1' && m.wParam <= '8') {  // Ctrl+Maj+1…8 : mode d'affichage
             ViewByKey((int)(m.wParam - '0'));
             return true;
         }

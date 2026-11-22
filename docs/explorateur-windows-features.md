@@ -122,10 +122,10 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Petites icônes | Ctrl+Maj+4 | ✅ P2 |
 | Liste | Ctrl+Maj+5 | ✅ P2 |
 | **Détails** | Ctrl+Maj+6 | ✅ P0 |
-| Mosaïques | Ctrl+Maj+7 | P2 |
-| Contenu | Ctrl+Maj+8 | P3 |
+| Mosaïques | Ctrl+Maj+7 | ✅ P2 (icône 48 px, type et taille sous le nom) |
+| Contenu | Ctrl+Maj+8 | ✅ P3 (une ligne par élément sur toute la largeur : date, taille, type) |
 | Zoom continu | Ctrl+molette : passe d'un mode à l'autre et ajuste la taille des icônes | ✅ P1 (Détails ↔ Liste ↔ petites ↔ 32…256 px ; mode mémorisé ; menu Affichage du fond de liste) |
-| **Mode compact** | Afficher ▸ Mode compact : réduit l'espacement entre les lignes | P1 |
+| **Mode compact** | Afficher ▸ Mode compact : réduit l'espacement entre les lignes | ✅ P1 (menu Affichage ; suit le réglage de l'Explorateur tant qu'on ne l'a pas changé ici) |
 
 ### 4.2 Options d'affichage (menu Afficher ▸ Afficher)
 
@@ -137,7 +137,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Cases à cocher des éléments | P2 |
 | **Extensions de noms de fichiers** | ✅ **P0** (réglage de Windows suivi en direct ; menu du fond du dossier ; types connus seulement, NeverShowExt / AlwaysShowExt respectés ; renommer garde l'extension masquée) |
 | **Éléments masqués** | ✅ **P0** (réglage de Windows suivi en direct ; Ctrl+H ou menu du fond du dossier ; affichés estompés ; « n masqués » dans la barre d'état ; même règle dans le volet) |
-| Mode compact | P1 |
+| Mode compact | ✅ P1 |
 
 ### 4.3 Colonnes (vue Détails)
 
@@ -177,7 +177,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Fonction | Détail | Prio |
 |---|---|---|
 | Icônes de type | Selon l'extension ; icônes propres aux `.exe`, `.ico`, `.lnk`, `.url` | ✅ P0 (thread dédié, icône du type affichée en attendant) ⚙️ `SHGetFileInfo` sans `USEFILEATTRIBUTES` pour ces types, en tâche de fond |
-| **Miniatures** | Images, vidéos, PDF, documents Office, polices ; dossier = aperçu des premiers fichiers | ✅🟡 P1 ⚙️ `IShellItemImageFactory`, cache `thumbcache_*.db` (fichiers : oui, sur 2 threads, lignes visibles d'abord, jamais pour un fichier cloud absent ; aperçu des dossiers : à venir) |
+| **Miniatures** | Images, vidéos, PDF, documents Office, polices ; dossier = aperçu des premiers fichiers | ✅ P1 ⚙️ `IShellItemImageFactory`, cache `thumbcache_*.db` (sur 2 threads, lignes visibles d'abord, jamais pour un fichier cloud absent ; dossiers : aperçu de leur contenu à partir de 48 px) |
 | Surimpressions (overlays) | Flèche des raccourcis, cadenas, états de synchro cloud (nuage, coche verte), double flèche bleue (fichier compressé NTFS) | ✅ P1 (via `SHGFI_OVERLAYINDEX`) ⚙️ `IShellIconOverlayIdentifier` (15 emplacements max) |
 | Éléments masqués | Icône semi-transparente | P0 |
 | Couleur des fichiers compressés/chiffrés NTFS | Bleu / vert (option) | P3 |
@@ -516,7 +516,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 ### Affichage
 | Raccourci | Action | État |
 |---|---|---|
-| Ctrl+Maj+1 … 8 | Mode d'affichage (voir §4.1) | ✅🟡 P1 (1 à 6 ; mosaïques et contenu : à venir) |
+| Ctrl+Maj+1 … 8 | Mode d'affichage (voir §4.1) | ✅ P1 |
 | Ctrl+molette | Zoom des icônes | ✅ P1 |
 | Alt+P / Alt+Maj+P | Volet d'aperçu / de détails | P1 |
 | Ctrl+pavé num. + | Ajuster toutes les colonnes | P2 |
@@ -628,9 +628,8 @@ dossiers avant l'index…) :
 14. ✅ **Taille des dossiers** ⭐ : calculée en arrière-plan (colonne Taille), sans ralentir la navigation.
 15. ✅ **Recherche instantanée sur tout le disque** ⭐ : index MFT + journal USN (à la *Everything*), puis
     filtres de recherche (date, type, taille).
-16. 🟡 **Modes d'affichage** : grandes / moyennes icônes, zoom continu (Ctrl+molette), Ctrl+Maj+1…8,
-    mode compact, **miniatures** (cache système partagé avec l'Explorateur). Fait : modes 1 à 6, zoom,
-    miniatures des fichiers ; reste : mosaïques, contenu, mode compact, aperçu des dossiers.
+16. ✅ **Modes d'affichage** : grandes / moyennes icônes, zoom continu (Ctrl+molette), Ctrl+Maj+1…8,
+    mode compact, **miniatures** (cache système partagé avec l'Explorateur).
 17. **Colonnes** : choix des colonnes (Property System), vue mémorisée par dossier.
 18. **Volets d'aperçu et de détails** (Alt+P, Alt+Maj+P) : preview handlers hors processus, propriétés
     modifiables, sélection multiple, largeur réglable.

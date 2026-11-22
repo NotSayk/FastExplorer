@@ -96,5 +96,6 @@ void Thumbs_Request(uint64_t serial, uint32_t idx, std::wstring path, int px) {
 bool Thumbs_Wanted(uint32_t attr, uint64_t size) {
     constexpr uint32_t kNotLocal =
         FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE;
-    return !(attr & (FILE_ATTRIBUTE_DIRECTORY | kNotLocal)) && size > 0;
+    if (attr & kNotLocal) return false;
+    return (attr & FILE_ATTRIBUTE_DIRECTORY) || size > 0;  // dossier : aperçu de son contenu
 }

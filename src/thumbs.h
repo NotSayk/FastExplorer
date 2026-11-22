@@ -24,4 +24,5 @@ void Thumbs_SetSerial(uint64_t serial);
 void Thumbs_Request(uint64_t serial, uint32_t idx, std::wstring path, int px);
 
 // Le type de ce fichier peut-il avoir une miniature ? (Jamais pour un fichier cloud absent du disque.)
+// Dossiers : oui (aperçu de leurs premiers fichiers, composé par le Shell).
 bool Thumbs_Wanted(uint32_t attr, uint64_t size);
