@@ -3,6 +3,7 @@
 #include "win.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -18,7 +19,8 @@
 // Restore : remet des éléments de la Corbeille à leur place d'origine (annuler une suppression).
 // RestoreBin : idem depuis la vue Corbeille (paths = éléments $R…). EmptyBin : vider la Corbeille.
 // Extract : paths[0] = archive, folder = destination. Compress : paths → folder\newName (.zip).
-enum class FileOpKind { Copy, Move, Delete, Rename, NewFolder, Restore, RestoreBin, EmptyBin, Extract, Compress };
+// Link : un raccourci dans folder vers chaque élément (paths ou items), « nom - Raccourci.lnk ».
+enum class FileOpKind { Copy, Move, Delete, Rename, NewFolder, Restore, RestoreBin, EmptyBin, Extract, Compress, Link };
 
 // Suite donnée par l'interface à une extraction (renvoyée telle quelle).
 enum class ThenDo { Nothing, Open, Clipboard, Show };
@@ -68,7 +70,24 @@ struct FileOpResult {
     ThenDo then = ThenDo::Nothing;      // = FileOp::then
     std::vector<std::wstring> renamedFrom;  // Rename multiple : chemins d'origine, parallèles à created
     bool newFile = false;                   // = FileOp::newFile
+    // Copie par notre moteur :
+    bool verified = false;                  // chaque copie relue et comparée à l'original
+    uint32_t retried = 0;                   // fichiers réussis après reprise (erreur passagère)
+    uint32_t verifyFailed = 0;              // copies différentes de l'original, refaites par le Shell
 };
+
+// Vérification des copies (relire et comparer chaque fichier copié par notre moteur) : réglage global.
+void FileOps_SetVerify(bool on);
+bool FileOps_Verify();
+
+// Fichiers de `sources` (parcourus jusqu'à ~5000 éléments) qui perdront des propriétés sur un volume aux
+// capacités `destFlags` (GetVolumeInformation) : flux NTFS nommés (hors Zone.Identifier) sans
+// FILE_NAMED_STREAMS, chiffrement EFS sans FILE_SUPPORTS_ENCRYPTION (*encrypted : il y en a). Au plus 50 noms.
+std::vector<std::wstring> FileOps_PropertyLoss(const std::vector<std::wstring>& sources, DWORD destFlags,
+                                               bool* encrypted = nullptr);
+
+// Nom libre d'un raccourci : « base - Raccourci.lnk », puis « base - Raccourci (2).lnk »…
+std::wstring ShortcutName(const std::wstring& base, const std::function<bool(const std::wstring&)>& taken);
 
 // Remet `original` (chemin complet d'avant la suppression) depuis la Corbeille
 // de son volume : l'élément supprimé le plus récemment, et pas avant `since`.
@@ -87,6 +106,18 @@ DWORD Recycle_RestoreItem(const std::wstring& rPath, std::wstring* restoredTo = 
 
 // Applications qui gardent ces fichiers ouverts (Restart Manager), ex. « Word, Excel » ; "" si aucune connue.
 std::wstring FileOps_Lockers(const std::vector<std::wstring>& paths);
+
+// « Qui utilise ce fichier ? » : chaque processus qui garde ouverts ces fichiers (ou des fichiers de ces
+// dossiers, jusqu'à 256), sans doublon.
+struct Locker {
+    std::wstring app;      // nom de l'application (« Microsoft Word »), sinon de l'exécutable
+    std::wstring exe;      // chemin de l'exécutable, si lisible
+    DWORD pid = 0;
+    FILETIME started{};    // pour reconnaître le processus (le pid peut être réutilisé)
+    bool service = false;  // service Windows (ne se ferme pas comme une fenêtre)
+    bool explorer = false; // l'Explorateur de Windows
+};
+std::vector<Locker> FileOps_LockerList(const std::vector<std::wstring>& paths);
 
 // Lance l'opération ; `target` reçoit `msg` (lParam = FileOpResult*, à libérer)
 // à la fin. `owner` possède les fenêtres de progression et de conflit.

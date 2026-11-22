@@ -30,6 +30,7 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 std::atomic<int> g_running{0};
+std::atomic<bool> g_verify{false};
 
 // ───────────────────────────── File d'attente des copies ─────────────────────────────
 
@@ -89,7 +90,8 @@ struct FastReg {
 
 // Copie / déplacement par notre moteur (voir fastcopy.h). true : terminé ;
 // sinon `left` reçoit ce qui reste à confier au Shell (tout, s'il a refusé).
-bool TryFast(const FileOp& op, FileOpResult& r, HRESULT& hr, std::vector<std::wstring>& left, FastProgress& prog) {
+bool TryFast(const FileOp& op, FileOpResult& r, HRESULT& hr, std::vector<std::pair<std::wstring, std::wstring>>& left,
+             FastProgress& prog) {
     if ((op.kind != FileOpKind::Copy && op.kind != FileOpKind::Move) || op.folder.empty()) return false;
     std::vector<std::wstring> src = op.paths;
     for (const auto& p : op.items) {
@@ -118,6 +120,9 @@ bool TryFast(const FileOp& op, FileOpResult& r, HRESULT& hr, std::vector<std::ws
     }
     r.created = std::move(out.created);
     r.aborted = out.cancelled;
+    r.retried = out.retried;
+    r.verifyFailed = out.verifyFailed;
+    r.verified = prog.verify;
     SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, op.folder.c_str(), nullptr);
     hr = out.error ? HRESULT_FROM_WIN32(out.error) : S_OK;
     if (out.cancelled || out.shellLeft.empty()) return true;
@@ -384,6 +389,97 @@ std::wstring FreeName(const std::wstring& dir, const std::wstring& name, bool is
     return name;
 }
 
+// Raccourcis vers les éléments (« Coller en tant que raccourci »).
+HRESULT LinkOp(const FileOp& op, FileOpResult& r) {
+    std::vector<Pidl> items;
+    for (const auto& p : op.paths)
+        if (PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(p.c_str())) items.emplace_back((ITEMIDLIST*)pidl);
+    for (const auto& p : op.items)
+        if (PIDLIST_ABSOLUTE c = ILCloneFull(p.get())) items.emplace_back((ITEMIDLIST*)c);
+    if (items.empty()) return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    HRESULT last = S_OK;
+    for (const auto& item : items) {
+        std::wstring path(32768, L'\0'), base;
+        if (SHGetPathFromIDListEx(item.get(), path.data(), (DWORD)path.size(), GPFIDL_DEFAULT)) path.resize(wcslen(path.c_str()));
+        else path.clear();
+        std::wstring parent, leaf;
+        if (!path.empty() && ParentOf(path, parent, leaf) && !leaf.empty()) base = leaf;
+        else {
+            PWSTR n = nullptr;
+            if (SUCCEEDED(SHGetNameFromIDList(item.get(), SIGDN_NORMALDISPLAY, &n)) && n) base = n;
+            CoTaskMemFree(n);
+        }
+        for (auto& c : base)
+            if (wcschr(L"\\/:*?\"<>|", c)) c = L'_';
+        if (base.empty()) base = L"Raccourci";
+        ComPtr<IShellLinkW> sl;
+        ComPtr<IPersistFile> pf;
+        HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl));
+        if (SUCCEEDED(hr)) hr = sl->SetIDList(item.get());
+        if (SUCCEEDED(hr) && !parent.empty()) sl->SetWorkingDirectory(parent.c_str());
+        if (SUCCEEDED(hr)) hr = sl.As(&pf);
+        if (FAILED(hr)) {
+            last = hr;
+            continue;
+        }
+        const std::wstring name = ShortcutName(base, [&](const std::wstring& n) {
+            return GetFileAttributesW(ToNtPath(Join(op.folder, n.c_str())).c_str()) != INVALID_FILE_ATTRIBUTES;
+        });
+        const std::wstring full = Join(op.folder, name.c_str());
+        hr = pf->Save(full.c_str(), TRUE);
+        if (FAILED(hr)) {
+            last = hr;
+            continue;
+        }
+        r.created.push_back(name);
+        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, full.c_str(), nullptr);
+    }
+    return r.created.empty() ? (FAILED(last) ? last : E_FAIL) : S_OK;
+}
+
+// Copie vers un volume qui ne garde pas tout (FAT, exFAT, certains NAS) : on prévient, comme l'Explorateur.
+bool ConfirmPropertyLoss(const FileOp& op, HWND owner, const std::vector<std::wstring>& sources, FastProgress& prog) {
+    wchar_t root[MAX_PATH] = {}, fs[MAX_PATH] = {};
+    DWORD flags = 0;
+    if (op.folder.empty() || !GetVolumePathNameW(op.folder.c_str(), root, MAX_PATH) ||
+        !GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, &flags, fs, MAX_PATH))
+        return true;
+    if ((flags & FILE_NAMED_STREAMS) && (flags & FILE_SUPPORTS_ENCRYPTION)) return true;
+    bool encrypted = false;
+    const std::vector<std::wstring> lost = FileOps_PropertyLoss(sources, flags, &encrypted);
+    if (lost.empty()) return true;
+    prog.allowDecrypted = encrypted;
+    if (op.silent) return true;
+    std::wstring parent, leaf;
+    std::wstring what = ParentOf(lost[0], parent, leaf) ? leaf : lost[0];
+    what = L"« " + what + L" »";
+    if (lost.size() > 1)
+        what += L" et " + std::to_wstring(lost.size() - 1) + (lost.size() >= 50 ? L" autres éléments ou plus" : L" autre(s) élément(s)");
+    std::wstring content = what + (lost.size() == 1 ? L" a" : L" ont") + L" des propriétés que le lecteur de destination (" +
+                           fs + L") ne peut pas conserver :";
+    if (!(flags & FILE_NAMED_STREAMS))
+        content += L"\n• propriétés enregistrées dans des flux NTFS (résumé, étiquettes, miniatures…)";
+    if (encrypted) content += L"\n• chiffrement : ces fichiers seront copiés en clair";
+    TASKDIALOG_BUTTON buttons[] = {{IDYES, L"Copier sans ces propriétés"}, {IDCANCEL, L"Annuler"}};
+    TASKDIALOGCONFIG c{sizeof c};
+    c.hwndParent = owner;
+    c.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW | TDF_ALLOW_DIALOG_CANCELLATION;
+    c.pszWindowTitle = op.kind == FileOpKind::Move ? L"Déplacer" : L"Copier";
+    c.pszMainIcon = TD_WARNING_ICON;
+    c.pszMainInstruction = L"Copier sans les propriétés ?";
+    c.pszContent = content.c_str();
+    c.cButtons = 2;
+    c.pButtons = buttons;
+    c.nDefaultButton = IDYES;
+    int pressed = IDCANCEL;
+    // Résolu à l'exécution : TaskDialogIndirect n'existe que dans comctl32 v6 (chargé par l'application).
+    using Fn = HRESULT(WINAPI*)(const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+    HMODULE cc = GetModuleHandleW(L"comctl32.dll");
+    auto fn = cc ? (Fn)(void*)GetProcAddress(cc, "TaskDialogIndirect") : nullptr;
+    if (!fn) return true;
+    return SUCCEEDED(fn(&c, &pressed, nullptr, nullptr)) && pressed == IDYES;
+}
+
 HRESULT ExtractOp(const FileOp& op, FileOpResult& r, Job* job) {
     if (op.paths.empty()) return E_INVALIDARG;
     FastProgress local;
@@ -437,6 +533,7 @@ HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r, Job* job) {
     if (op.kind == FileOpKind::Extract) return ExtractOp(op, r, job);
     if (op.kind == FileOpKind::Compress) return CompressOp(op, r, job);
     if (op.kind == FileOpKind::NewFolder) return NewFolder(op, owner, r);
+    if (op.kind == FileOpKind::Link) return LinkOp(op, r);
     if (op.kind == FileOpKind::Restore) return Restore(op, r);
     if (op.kind == FileOpKind::RestoreBin) return RestoreBin(op, r);
     if (op.kind == FileOpKind::EmptyBin) {
@@ -448,7 +545,14 @@ HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r, Job* job) {
     if (op.kind == FileOpKind::Rename && TryFastRename(op, r)) return S_OK;
 
     HRESULT hr = S_OK;
-    std::vector<std::wstring> left;  // éléments que notre moteur rend au Shell
+    if ((op.kind == FileOpKind::Copy || op.kind == FileOpKind::Move) && job) {
+        job->prog.verify = g_verify;
+        if (!ConfirmPropertyLoss(op, owner, r.sources, job->prog)) {
+            r.aborted = true;
+            return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        }
+    }
+    std::vector<std::pair<std::wstring, std::wstring>> left;  // (source, dossier) que notre moteur rend au Shell
     if (job && TryFast(op, r, hr, left, job->prog)) return hr;
     const bool rest = !left.empty();
 
@@ -475,11 +579,20 @@ HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r, Job* job) {
     sink->Release();
 
     std::vector<ComPtr<IShellItem>> sources;
-    for (const auto& p : rest ? left : op.paths)
-        if (auto it = ItemFromPath(p)) sources.push_back(it);
-    for (const auto& p : op.items) {
-        ComPtr<IShellItem> it;
-        if (!rest && SUCCEEDED(SHCreateItemFromIDList(p.get(), IID_PPV_ARGS(&it)))) sources.push_back(it);
+    std::vector<ComPtr<IShellItem>> targets;  // reprise : dossier de destination propre à chaque source
+    if (rest) {
+        for (const auto& [src, to] : left)
+            if (auto it = ItemFromPath(src)) {
+                sources.push_back(it);
+                targets.push_back(_wcsicmp(to.c_str(), op.folder.c_str()) == 0 ? nullptr : ItemFromPath(to));
+            }
+    } else {
+        for (const auto& p : op.paths)
+            if (auto it = ItemFromPath(p)) sources.push_back(it);
+        for (const auto& p : op.items) {
+            ComPtr<IShellItem> it;
+            if (SUCCEEDED(SHCreateItemFromIDList(p.get(), IID_PPV_ARGS(&it)))) sources.push_back(it);
+        }
     }
 
     // Coller dans le dossier d'origine : un double « - Copie », comme l'Explorateur
@@ -494,17 +607,19 @@ HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r, Job* job) {
     }
 
     int queued = 0;
-    for (auto& s : sources) {
+    for (size_t k = 0; k < sources.size(); ++k) {
+        auto& s = sources[k];
+        IShellItem* to = k < targets.size() && targets[k] ? targets[k].Get() : folder.Get();
         switch (op.kind) {
             case FileOpKind::Copy:
-                if (!folder) return E_INVALIDARG;
-                hr = fo->CopyItem(s.Get(), folder.Get(), nullptr, nullptr);
+                if (!to) return E_INVALIDARG;
+                hr = fo->CopyItem(s.Get(), to, nullptr, nullptr);
                 break;
             case FileOpKind::Move: {
-                if (!folder) return E_INVALIDARG;
+                if (!to) return E_INVALIDARG;
                 ComPtr<IShellItem> parent;
-                if (SUCCEEDED(s->GetParent(&parent)) && SameItem(parent.Get(), folder.Get())) continue;  // déjà là
-                hr = fo->MoveItem(s.Get(), folder.Get(), nullptr, nullptr);
+                if (SUCCEEDED(s->GetParent(&parent)) && SameItem(parent.Get(), to)) continue;  // déjà là
+                hr = fo->MoveItem(s.Get(), to, nullptr, nullptr);
                 break;
             }
             case FileOpKind::Delete: hr = fo->DeleteItem(s.Get(), nullptr); break;
@@ -1034,19 +1149,41 @@ DWORD Recycle_Restore(const std::wstring& original, int64_t since) {
     return 0;
 }
 
-std::wstring FileOps_Lockers(const std::vector<std::wstring>& paths) {
+std::vector<Locker> FileOps_LockerList(const std::vector<std::wstring>& paths) {
+    // Fichiers à interroger : ceux donnés, et ceux des dossiers donnés (Restart Manager ne voit que des fichiers).
+    std::vector<std::wstring> files;
+    std::vector<std::wstring> dirs;
+    for (const auto& p : paths) {
+        const DWORD a = GetFileAttributesW(ToNtPath(p).c_str());
+        if (a == INVALID_FILE_ATTRIBUTES) continue;
+        if (a & FILE_ATTRIBUTE_DIRECTORY) dirs.push_back(p);
+        else files.push_back(p);
+    }
+    for (size_t k = 0; k < dirs.size() && files.size() < 256; ++k) {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW(ToNtPath(Join(dirs[k], L"*")).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch,
+                                    nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            const wchar_t* n = fd.cFileName;
+            if (n[0] == L'.' && (!n[1] || (n[1] == L'.' && !n[2]))) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (dirs.size() < 2000) dirs.push_back(Join(dirs[k], n));
+            } else {
+                files.push_back(Join(dirs[k], n));
+            }
+        } while (files.size() < 256 && FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::vector<Locker> out;
+    if (files.empty()) return out;
     DWORD session = 0;
     WCHAR key[CCH_RM_SESSION_KEY + 1] = {};
-    if (RmStartSession(&session, 0, key) != ERROR_SUCCESS) return L"";
-    std::vector<LPCWSTR> files;
-    for (const auto& p : paths) {
-        const DWORD a = GetFileAttributesW(p.c_str());
-        if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(p.c_str());
-        if (files.size() >= 64) break;
-    }
-    std::wstring out;
-    if (!files.empty() &&
-        RmRegisterResources(session, (UINT)files.size(), files.data(), 0, nullptr, 0, nullptr) == ERROR_SUCCESS) {
+    if (RmStartSession(&session, 0, key) != ERROR_SUCCESS) return out;
+    std::vector<LPCWSTR> names;
+    for (const auto& f : files) names.push_back(f.c_str());
+    if (RmRegisterResources(session, (UINT)names.size(), names.data(), 0, nullptr, 0, nullptr) == ERROR_SUCCESS) {
         UINT need = 0, have = 0;
         DWORD reasons = 0;
         std::vector<RM_PROCESS_INFO> info;
@@ -1058,10 +1195,114 @@ std::wstring FileOps_Lockers(const std::vector<std::wstring>& paths) {
         }
         if (e == ERROR_SUCCESS)
             for (UINT i = 0; i < have; ++i) {
-                const std::wstring n = info[i].strAppName;
-                if (!n.empty() && out.find(n) == std::wstring::npos) out += (out.empty() ? L"" : L", ") + n;
+                const RM_PROCESS_INFO& pi = info[i];
+                if (std::any_of(out.begin(), out.end(), [&](const Locker& l) { return l.pid == pi.Process.dwProcessId; }))
+                    continue;
+                Locker l;
+                l.pid = pi.Process.dwProcessId;
+                l.started = pi.Process.ProcessStartTime;
+                l.app = pi.strAppName;
+                l.service = pi.ApplicationType == RmService;
+                l.explorer = pi.ApplicationType == RmExplorer;
+                if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, l.pid)) {
+                    wchar_t exe[MAX_PATH * 2] = {};
+                    DWORD n = _countof(exe);
+                    if (QueryFullProcessImageNameW(h, 0, exe, &n)) l.exe.assign(exe, n);
+                    CloseHandle(h);
+                }
+                if (l.app.empty()) {
+                    std::wstring parent, leaf;
+                    l.app = !l.exe.empty() && ParentOf(l.exe, parent, leaf) ? leaf : L"Processus " + std::to_wstring(l.pid);
+                }
+                out.push_back(std::move(l));
             }
     }
     RmEndSession(session);
+    return out;
+}
+
+std::wstring FileOps_Lockers(const std::vector<std::wstring>& paths) {
+    std::vector<std::wstring> files;
+    for (const auto& p : paths) {
+        const DWORD a = GetFileAttributesW(p.c_str());
+        if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(p);
+        if (files.size() >= 64) break;
+    }
+    std::wstring out;
+    if (files.empty()) return out;
+    for (const auto& l : FileOps_LockerList(files))
+        if (out.find(l.app) == std::wstring::npos) out += (out.empty() ? L"" : L", ") + l.app;
+    return out;
+}
+
+void FileOps_SetVerify(bool on) { g_verify = on; }
+bool FileOps_Verify() { return g_verify; }
+
+std::wstring ShortcutName(const std::wstring& base, const std::function<bool(const std::wstring&)>& taken) {
+    for (int i = 1; i < 10000; ++i) {
+        std::wstring n = base + L" - Raccourci" + (i == 1 ? L"" : L" (" + std::to_wstring(i) + L")") + L".lnk";
+        if (!taken(n)) return n;
+    }
+    return base + L" - Raccourci.lnk";
+}
+
+std::vector<std::wstring> FileOps_PropertyLoss(const std::vector<std::wstring>& sources, DWORD destFlags, bool* encrypted) {
+    std::vector<std::wstring> out;
+    if (encrypted) *encrypted = false;
+    const bool streams = !(destFlags & FILE_NAMED_STREAMS), efs = !(destFlags & FILE_SUPPORTS_ENCRYPTION);
+    if (!streams && !efs) return out;
+    // Flux qui ne sont pas des propriétés : l'Explorateur les laisse partir sans rien dire.
+    auto ignorable = [](const wchar_t* s) {
+        return _wcsicmp(s, L"::$DATA") == 0 || _wcsicmp(s, L":Zone.Identifier:$DATA") == 0 ||
+               _wcsicmp(s, L":SmartScreen:$DATA") == 0;
+    };
+    auto check = [&](const std::wstring& path, DWORD attr) {
+        bool lose = false;
+        if (efs && (attr & FILE_ATTRIBUTE_ENCRYPTED)) {
+            lose = true;
+            if (encrypted) *encrypted = true;
+        }
+        if (streams && !lose) {
+            WIN32_FIND_STREAM_DATA sd;
+            HANDLE h = FindFirstStreamW(ToNtPath(path).c_str(), FindStreamInfoStandard, &sd, 0);
+            if (h != INVALID_HANDLE_VALUE) {
+                do
+                    if (!ignorable(sd.cStreamName)) lose = true;
+                while (!lose && FindNextStreamW(h, &sd));
+                FindClose(h);
+            }
+        }
+        if (lose && out.size() < 50) out.push_back(path);
+    };
+    size_t visited = 0;
+    std::vector<std::wstring> dirs;
+    for (const auto& s : sources) {
+        const DWORD a = GetFileAttributesW(ToNtPath(s).c_str());
+        if (a == INVALID_FILE_ATTRIBUTES) continue;
+        ++visited;
+        if (a & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!(a & FILE_ATTRIBUTE_REPARSE_POINT)) dirs.push_back(s);
+        } else {
+            check(s, a);
+        }
+    }
+    for (size_t k = 0; k < dirs.size() && visited < 5000 && out.size() < 50; ++k) {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW(ToNtPath(Join(dirs[k], L"*")).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch,
+                                    nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            const wchar_t* n = fd.cFileName;
+            if (n[0] == L'.' && (!n[1] || (n[1] == L'.' && !n[2]))) continue;
+            ++visited;
+            const std::wstring full = Join(dirs[k], n);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) dirs.push_back(full);
+            } else {
+                check(full, fd.dwFileAttributes);
+            }
+        } while (visited < 5000 && out.size() < 50 && FindNextFileW(h, &fd));
+        FindClose(h);
+    }
     return out;
 }

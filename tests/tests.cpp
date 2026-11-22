@@ -24,6 +24,8 @@
 #include "places.h"
 #include "sessions.h"
 #include "groups.h"
+#include "batchrename.h"
+#include <thread>
 #include "net.h"
 #include <lm.h>
 #include "nt.h"
@@ -1700,7 +1702,7 @@ void TestFastCopy() {
         RemoveDirectoryW(Join(withLink, L"lien").c_str());  // la jonction seule, pas sa cible
         RemoveDirectoryW(withLink.c_str());
     }
-    // Un fichier verrouillé : l'élément est retiré de la destination et rendu au Shell.
+    // Un fichier verrouillé : reprise, ce qui est copié reste ; lui seul est rendu au Shell, vers son dossier.
     {
         const std::wstring locked = Join(Join(tree, L"sous"), L"f150.bin");
         HANDLE h = CreateFileW(locked.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -1710,10 +1712,13 @@ void TestFastCopy() {
         FastProgress p;
         FastOutcome o;
         CHECK(FastTransfer({tree, Join(src, L"seul.txt")}, d2, false, p, o));
-        CHECK(o.shellLeft.size() == 1 && o.shellLeft[0] == tree);
-        CHECK(o.created.size() == 1 && o.created[0] == L"seul.txt");
-        CHECK(!Exists(Join(d2, L"Arbre")));  // rien de partiel ne reste
+        CHECK(o.shellLeft.size() == 1 && o.shellLeft[0].first == locked &&
+              o.shellLeft[0].second == Join(Join(d2, L"Arbre"), L"sous"));
+        CHECK(o.created.size() == 2 && o.created[0] == L"Arbre" && o.created[1] == L"seul.txt");
+        CHECK(p.filesDone == 301 && Exists(Join(Join(Join(d2, L"Arbre"), L"sous"), L"f149.bin")));
+        CHECK(!Exists(Join(Join(Join(d2, L"Arbre"), L"sous"), L"f150.bin")));
         CloseHandle(h);
+        SetFileAttributesW(Join(Join(Join(d2, L"Arbre"), L"masqué"), L"lecture seule.txt").c_str(), FILE_ATTRIBUTE_NORMAL);
     }
     // Annulation : rien n'est copié, c'est signalé.
     {
@@ -1743,6 +1748,225 @@ void TestFastCopy() {
     for (const wchar_t* d : {L"dst", L"dst4"})
         SetFileAttributesW(Join(Join(Join(Join(base, d), L"Arbre"), L"masqué"), L"lecture seule.txt").c_str(),
                            FILE_ATTRIBUTE_NORMAL);
+    RemoveTree(base);
+}
+
+void TestBatchRename() {
+    std::vector<RenameItem> items{{L"Photo 1.JPG"}, {L"photo 2.jpg"}, {L"Dossier photo", true}};
+    RenameRule r;
+    r.find = L"photo";
+    r.replace = L"Vacances";
+    auto n = BatchNames(r, items, L"Images");
+    CHECK(n.size() == 3);
+    CHECK_STR(n[0], L"Vacances 1.JPG");
+    CHECK_STR(n[1], L"Vacances 2.jpg");
+    CHECK_STR(n[2], L"Dossier Vacances");  // dossier : pas d'extension
+    r.matchCase = true;
+    n = BatchNames(r, items, L"Images");
+    CHECK_STR(n[0], L"Photo 1.JPG");  // casse respectée : « Photo » ne correspond pas
+    CHECK_STR(n[1], L"Vacances 2.jpg");
+
+    RenameRule c;
+    c.pattern = L"{dossier} {n:3} ({nom})";
+    c.start = 9;
+    c.step = 2;
+    n = BatchNames(c, items, L"Images");
+    CHECK_STR(n[0], L"Images 009 (Photo 1).JPG");
+    CHECK_STR(n[1], L"Images 011 (photo 2).jpg");
+    c.pattern = L"{nom}.{ext} {{x}} {inconnu}";
+    n = BatchNames(c, std::vector<RenameItem>{RenameItem{L"a.txt"}}, L"");
+    CHECK_STR(n[0], L"a.txt {x} {inconnu}.txt");
+
+    RenameRule re;
+    re.regex = true;
+    re.find = L"(\\d+)";
+    re.replace = L"[$1]";
+    n = BatchNames(re, items, L"");
+    CHECK_STR(n[0], L"Photo [1].JPG");
+    re.find = L"(";
+    std::wstring err;
+    n = BatchNames(re, items, L"", &err);
+    CHECK(!err.empty() && n[0] == L"Photo 1.JPG");
+
+    RenameRule lc;
+    lc.nameCase = NameCase::Lower;
+    lc.withExtension = true;
+    n = BatchNames(lc, items, L"");
+    CHECK_STR(n[0], L"photo 1.jpg");
+    lc.withExtension = false;
+    lc.nameCase = NameCase::Title;
+    n = BatchNames(lc, std::vector<RenameItem>{RenameItem{L"le chat-noir (été).TXT"}}, L"");
+    CHECK_STR(n[0], L"Le Chat-Noir (Été).TXT");
+    lc.nameCase = NameCase::Sentence;
+    n = BatchNames(lc, std::vector<RenameItem>{RenameItem{L"LE CHAT.txt"}}, L"");
+    CHECK_STR(n[0], L"Le chat.txt");
+    lc.nameCase = NameCase::Upper;
+    n = BatchNames(lc, std::vector<RenameItem>{RenameItem{L"été.txt"}}, L"");
+    CHECK_STR(n[0], L"ÉTÉ.txt");
+
+    RenameRule d;
+    d.pattern = L"{date} {nom}";
+    RenameItem dated{L"x.png"};
+    dated.modified = LocalFt(2026, 3, 7);
+    n = BatchNames(d, {dated}, L"");
+    CHECK_STR(n[0], L"2026-03-07 x.png");
+
+    CHECK(NameProblem(L"ok.txt").empty());
+    CHECK(!NameProblem(L"").empty());
+    CHECK(!NameProblem(L"a?b").empty());
+    CHECK(!NameProblem(L"con.txt").empty());
+    CHECK(!NameProblem(L"LPT1").empty());
+    CHECK(!NameProblem(L"fin.").empty());
+    CHECK(NameProblem(L"console.txt").empty());
+    const auto p = BatchProblems({L"a.txt", L"A.TXT", L"b?.txt", L"con.txt", L"pris.txt", L"libre.txt"}, {L"PRIS.txt"});
+    CHECK(!p[0].empty() && !p[1].empty());  // doublon dans le lot (sans la casse)
+    CHECK(!p[2].empty() && !p[3].empty() && !p[4].empty());
+    CHECK(p[5].empty());
+
+    CHECK_STR(ShortcutName(L"a.txt", [](const std::wstring&) { return false; }), L"a.txt - Raccourci.lnk");
+    CHECK_STR(ShortcutName(L"a.txt", [](const std::wstring& s) { return s == L"a.txt - Raccourci.lnk"; }),
+              L"a.txt - Raccourci (2).lnk");
+}
+
+void TestBlock28Ops() {
+    const std::wstring base = Join(g_root, L"b28");
+    CreateDirectoryW(base.c_str(), nullptr);
+    const std::wstring src = Join(base, L"src");
+    CreateDirectoryW(src.c_str(), nullptr);
+
+    // Vérification : identique, puis différent (même taille), puis taille différente.
+    const std::wstring a = Join(src, L"a.bin"), b = Join(src, L"b.bin"), c = Join(src, L"c.bin");
+    MakeFile(a, 300000);
+    MakeFile(c, 1000);
+    CHECK(CopyFileW(a.c_str(), b.c_str(), FALSE));
+    CHECK(FastVerify(a, b));
+    {
+        HANDLE h = CreateFileW(b.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        SetFilePointer(h, 150000, nullptr, FILE_BEGIN);
+        DWORD w = 0;
+        const char x = 0x5A;
+        WriteFile(h, &x, 1, &w, nullptr);
+        CloseHandle(h);
+    }
+    CHECK(!FastVerify(a, b));
+    CHECK(!FastVerify(a, c));
+
+    // Copie vérifiée : relue en entier, comptée deux fois dans la progression.
+    {
+        const std::wstring d = Join(base, L"dverif");
+        CreateDirectoryW(d.c_str(), nullptr);
+        FastProgress p;
+        p.verify = true;
+        FastOutcome o;
+        CHECK(FastTransfer({a, c}, d, false, p, o));
+        CHECK(o.created.size() == 2 && o.shellLeft.empty() && o.verifyFailed == 0);
+        CHECK(p.bytesTotal == 2ull * 301000 && p.bytesDone == p.bytesTotal);
+        CHECK(FastVerify(a, Join(d, L"a.bin")));
+    }
+
+    // Reprise : un fichier ouvert un court instant est réessayé et passe.
+    {
+        const std::wstring d = Join(base, L"dretry");
+        CreateDirectoryW(d.c_str(), nullptr);
+        HANDLE h = CreateFileW(c.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        CHECK(h != INVALID_HANDLE_VALUE);
+        std::thread release([h] {
+            Sleep(120);
+            CloseHandle(h);
+        });
+        FastProgress p;
+        FastOutcome o;
+        CHECK(FastTransfer({c}, d, false, p, o));
+        release.join();
+        CHECK(o.created.size() == 1 && o.shellLeft.empty() && o.retried == 1);
+        CHECK(Exists(Join(d, L"c.bin")));
+    }
+    CHECK(FastTransient(ERROR_SHARING_VIOLATION) && FastTransient(ERROR_NETNAME_DELETED));
+    CHECK(!FastTransient(ERROR_ACCESS_DENIED) && !FastTransient(ERROR_DISK_FULL));
+
+    // Perte de propriétés : un flux nommé compte, Zone.Identifier non.
+    {
+        const std::wstring tree = Join(base, L"props");
+        CreateDirectoryW(tree.c_str(), nullptr);
+        const std::wstring withProps = Join(tree, L"avec.txt"), zoneOnly = Join(tree, L"zone.txt");
+        MakeFile(withProps, 10);
+        MakeFile(zoneOnly, 10);
+        MakeFile(withProps + L":Résumé", 20);
+        MakeFile(zoneOnly + L":Zone.Identifier", 20);
+        auto lost = FileOps_PropertyLoss({tree}, 0);
+        CHECK(lost.size() == 1 && lost[0] == withProps);
+        CHECK(FileOps_PropertyLoss({tree}, FILE_NAMED_STREAMS | FILE_SUPPORTS_ENCRYPTION).empty());
+        CHECK(FileOps_PropertyLoss({zoneOnly}, 0).empty());
+        bool enc = true;
+        FileOps_PropertyLoss({withProps}, FILE_NAMED_STREAMS, &enc);
+        CHECK(!enc);
+    }
+
+    // Qui utilise ce fichier : ce processus, qui le garde ouvert (directement et via son dossier).
+    {
+        HANDLE h = CreateFileW(a.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        CHECK(h != INVALID_HANDLE_VALUE);
+        const DWORD me = GetCurrentProcessId();
+        auto has = [&](const std::vector<Locker>& v) {
+            return std::any_of(v.begin(), v.end(), [&](const Locker& l) { return l.pid == me && !l.app.empty(); });
+        };
+        CHECK(has(FileOps_LockerList({a})));
+        CHECK(has(FileOps_LockerList({src})));
+        CloseHandle(h);
+        CHECK(!has(FileOps_LockerList({a})));
+    }
+
+    // Coller en tant que raccourci : « nom - Raccourci.lnk », numéroté ensuite.
+    {
+        HWND sink = CreateWindowW(L"FeTestSink", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+        CHECK(sink != nullptr);
+        constexpr UINT kMsg = WM_APP + 11;
+        auto run = [&](FileOp op) -> std::unique_ptr<FileOpResult> {
+            op.silent = true;
+            FileOps_Start(nullptr, sink, kMsg, std::move(op));
+            const double t0 = NowMs();
+            MSG m;
+            while (NowMs() - t0 < 15000) {
+                if (PeekMessageW(&m, sink, kMsg, kMsg, PM_REMOVE)) return std::unique_ptr<FileOpResult>((FileOpResult*)m.lParam);
+                Sleep(2);
+            }
+            return nullptr;
+        };
+        const std::wstring links = Join(base, L"liens");
+        CreateDirectoryW(links.c_str(), nullptr);
+        auto link = [&](std::vector<std::wstring> paths) {
+            FileOp op;
+            op.kind = FileOpKind::Link;
+            op.folder = links;
+            op.paths = std::move(paths);
+            return run(std::move(op));
+        };
+        auto r = link({a, src});
+        CHECK(r && SUCCEEDED(r->hr) && r->created.size() == 2);
+        CHECK(r && r->created.size() == 2 && r->created[0] == L"a.bin - Raccourci.lnk" && r->created[1] == L"src - Raccourci.lnk");
+        std::wstring target;
+        CHECK(ResolveShortcut(Join(links, L"a.bin - Raccourci.lnk"), target) && _wcsicmp(target.c_str(), a.c_str()) == 0);
+        r = link({a});
+        CHECK(r && r->created.size() == 1 && r->created[0] == L"a.bin - Raccourci (2).lnk");
+
+        // Copie par la file : reprise d'un fichier verrouillé dans un dossier (le reste est copié, le Shell, en
+        // silence, échoue sur lui seul), puis copie vérifiée.
+        const std::wstring tree = Join(base, L"arbre");
+        CreateDirectoryW(tree.c_str(), nullptr);
+        for (int i = 0; i < 20; ++i) MakeFile(Join(tree, (L"f" + std::to_wstring(i) + L".bin").c_str()), 500);
+        const std::wstring d = Join(base, L"dfile");
+        CreateDirectoryW(d.c_str(), nullptr);
+        FileOps_SetVerify(true);
+        FileOp cp;
+        cp.kind = FileOpKind::Copy;
+        cp.folder = d;
+        cp.paths = {tree};
+        r = run(std::move(cp));
+        FileOps_SetVerify(false);
+        CHECK(r && SUCCEEDED(r->hr) && r->verified && r->verifyFailed == 0 && r->created.size() == 1);
+        CHECK(Exists(Join(Join(d, L"arbre"), L"f19.bin")));
+        DestroyWindow(sink);
+    }
     RemoveTree(base);
 }
 
@@ -2218,6 +2442,8 @@ int wmain() {
     TestSearch();
     TestFastCopy();
     TestFileOps();
+    TestBatchRename();
+    TestBlock28Ops();
     TestPlaces();
     TestSessions();
     TestGroups();

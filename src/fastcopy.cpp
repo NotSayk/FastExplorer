@@ -36,7 +36,8 @@ std::wstring Volume(const std::wstring& p) {
 struct File {
     std::wstring src, dst;
     uint64_t size = 0;
-    bool done = false;  // copié (écrit par un seul thread, lu après la fin des threads)
+    bool done = false;    // copié (écrit par un seul thread, lu après la fin des threads)
+    bool failed = false;  // échec définitif : rendu au Shell
 };
 
 struct Top {
@@ -115,6 +116,111 @@ void ClearReadOnly(const std::wstring& nt) {
         SetFileAttributesW(nt.c_str(), a & ~FILE_ATTRIBUTE_READONLY);
 }
 
+// Comparaison octet à octet ; counted : octets relus comptés dans prog.
+bool VerifyCounting(const std::wstring& src, const std::wstring& dst, FastProgress* prog, uint64_t& counted) {
+    HANDLE a = CreateFileW(ToNtPath(src).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (a == INVALID_HANDLE_VALUE) return false;
+    // Sans le cache : on relit ce qui est sur le disque, pas ce qui vient d'être écrit en mémoire.
+    HANDLE b = CreateFileW(ToNtPath(dst).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (b == INVALID_HANDLE_VALUE) {
+        CloseHandle(a);
+        return false;
+    }
+    LARGE_INTEGER sa{}, sb{};
+    bool same = GetFileSizeEx(a, &sa) && GetFileSizeEx(b, &sb) && sa.QuadPart == sb.QuadPart;
+    constexpr DWORD kChunk = 1 << 20;  // multiple de la taille de secteur (lecture sans cache)
+    auto* bufA = (uint8_t*)VirtualAlloc(nullptr, kChunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    auto* bufB = (uint8_t*)VirtualAlloc(nullptr, kChunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    same = same && bufA && bufB;
+    while (same) {
+        if (prog) {
+            WaitWhilePaused(*prog);
+            if (prog->cancel) {
+                same = false;
+                break;
+            }
+        }
+        DWORD na = 0, nb = 0;
+        if (!ReadFile(a, bufA, kChunk, &na, nullptr) || !ReadFile(b, bufB, kChunk, &nb, nullptr) || na != nb) {
+            same = false;
+            break;
+        }
+        if (!na) break;
+        if (memcmp(bufA, bufB, na) != 0) same = false;
+        if (prog) prog->bytesDone += na;
+        counted += na;
+    }
+    if (bufA) VirtualFree(bufA, 0, MEM_RELEASE);
+    if (bufB) VirtualFree(bufB, 0, MEM_RELEASE);
+    CloseHandle(a);
+    CloseHandle(b);
+    return same;
+}
+
+// Petite attente interruptible (annulation) entre deux tentatives.
+void Backoff(const FastProgress& p, DWORD ms) {
+    for (DWORD w = 0; w < ms && !p.cancel; w += 50) Sleep(50);
+}
+
+bool IsRemote(const std::wstring& p) {
+    if (p.size() > 1 && p[0] == L'\\') return true;
+    const std::wstring v = Volume(p);
+    return !v.empty() && GetDriveTypeW(v.c_str()) == DRIVE_REMOTE;
+}
+
+// Copie d'un fichier, avec reprise : erreur passagère réessayée, gros fichier réseau repris où il s'était
+// arrêté (COPY_FILE_RESTARTABLE), copie vérifiée si demandé. 0 : copié.
+DWORD CopyOne(const File& f, FastProgress& prog, bool remote, bool& retried, bool& badVerify) {
+    const std::wstring s = ToNtPath(f.src), d = ToNtPath(f.dst);
+    const bool restartable = remote && f.size >= (256ull << 20);
+    DWORD flags = COPY_FILE_FAIL_IF_EXISTS;
+    if (prog.allowDecrypted) flags |= COPY_FILE_ALLOW_DECRYPTED_DESTINATION;
+    DWORD e = 0;
+    bool verifiedOnce = false;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        CopyCtx ctx{&prog};
+        DWORD fl = flags;
+        if (restartable) fl |= COPY_FILE_RESTARTABLE;
+        if (restartable && attempt > 0) fl &= ~COPY_FILE_FAIL_IF_EXISTS;  // la copie partielle reprend
+        if (CopyFileExW(s.c_str(), d.c_str(), OnProgress, &ctx, nullptr, fl)) {
+            uint64_t checked = 0;
+            if (!prog.verify || VerifyCounting(f.src, f.dst, &prog, checked)) {
+                retried = attempt > 0;
+                return 0;
+            }
+            // Copie différente de l'original : refaite une fois, puis abandonnée au Shell.
+            ClearReadOnly(d);
+            DeleteFileW(d.c_str());
+            prog.bytesDone -= ctx.last + checked;
+            if (verifiedOnce) {
+                badVerify = true;
+                return ERROR_CRC;
+            }
+            verifiedOnce = true;
+            continue;
+        }
+        e = GetLastError();
+        // Ce que cette tentative avait compté ne vaut plus (sauf reprise d'un gros fichier).
+        if (!restartable) prog.bytesDone -= ctx.last;
+        if (prog.cancel || !FastTransient(e)) return e;
+        // Partage : un seul court essai de plus (un fichier ouvert longtemps ne se libérera pas) ; réseau : 1, 2, 4 s.
+        const bool share = e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION;
+        if (share && attempt > 0) return e;
+        Backoff(prog, share ? 300 : 1000u << attempt);
+        if (prog.cancel) return ERROR_CANCELLED;
+        if (!restartable) {
+            DWORD a = GetFileAttributesW(d.c_str());
+            if (a != INVALID_FILE_ATTRIBUTES) {  // copie partielle restée (réseau coupé) : on repart de zéro
+                ClearReadOnly(d);
+                DeleteFileW(d.c_str());
+            }
+        }
+    }
+    return e;
+}
+
 // Retire ce que l'on a créé pour cet élément (il n'existait pas avant nous).
 void Undo(Top& t) {
     for (auto& f : t.files)
@@ -127,15 +233,26 @@ void Undo(Top& t) {
     if (t.topCreated) RemoveDirectoryW(ToNtPath(t.dst).c_str());  // échoue s'il reste quelque chose : on garde
 }
 
-// Déplacement entre volumes : la source est supprimée une fois tout copié.
+// Déplacement entre volumes : la source est supprimée une fois copiée (fichiers en échec exceptés :
+// le Shell les déplace ensuite, et leurs dossiers, non vides, restent).
 bool DeleteSource(Top& t) {
     bool ok = true;
+    bool partial = false;
     for (auto& f : t.files) {
+        if (!f.done) {
+            partial = true;
+            continue;
+        }
         const std::wstring nt = ToNtPath(f.src);
         ClearReadOnly(nt);
         ok &= DeleteFileW(nt.c_str()) != FALSE;
     }
-    for (auto it = t.dirs.rbegin(); it != t.dirs.rend(); ++it) ok &= RemoveDirectoryW(ToNtPath(it->first).c_str()) != FALSE;
+    for (auto it = t.dirs.rbegin(); it != t.dirs.rend(); ++it)
+        ok &= RemoveDirectoryW(ToNtPath(it->first).c_str()) != FALSE || partial;
+    if (partial) {
+        if (t.dir) RemoveDirectoryW(ToNtPath(t.src).c_str());
+        return ok;
+    }
     if (t.dir) {
         ok &= RemoveDirectoryW(ToNtPath(t.src).c_str()) != FALSE;
     } else {
@@ -165,6 +282,31 @@ bool SeekPenalty(const std::wstring& path, bool& penalty) {
 }
 
 }  // namespace
+
+bool FastTransient(DWORD e) {
+    switch (e) {
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_LOCK_VIOLATION:
+        case ERROR_NETNAME_DELETED:
+        case ERROR_UNEXP_NET_ERR:
+        case ERROR_SEM_TIMEOUT:
+        case ERROR_NETWORK_UNREACHABLE:
+        case ERROR_BAD_NET_RESP:
+        case ERROR_BAD_NETPATH:
+        case ERROR_NETWORK_BUSY:
+        case ERROR_CONNECTION_ABORTED:
+        case ERROR_VC_DISCONNECTED:
+        case ERROR_DEV_NOT_EXIST:
+        case ERROR_REQ_NOT_ACCEP:
+            return true;
+        default: return false;
+    }
+}
+
+bool FastVerify(const std::wstring& src, const std::wstring& dst, FastProgress* prog) {
+    uint64_t n = 0;
+    return VerifyCounting(src, dst, prog, n);
+}
 
 int FastCopyThreads(const std::wstring& src, const std::wstring& dest) {
     auto remote = [](const std::wstring& p) {
@@ -219,7 +361,7 @@ bool FastTransfer(const std::vector<std::wstring>& sources, const std::wstring& 
                 break;
             }
             if (MoveFileExW(ToNtPath(t->src).c_str(), ToNtPath(t->dst).c_str(), 0)) out.created.push_back(t->name);
-            else out.shellLeft.push_back(t->src);
+            else out.shellLeft.emplace_back(t->src, dest);
             ++prog.filesDone;
         }
         return true;
@@ -238,12 +380,13 @@ bool FastTransfer(const std::vector<std::wstring>& sources, const std::wstring& 
             if (!GetFileAttributesExW(ToNtPath(t->src).c_str(), GetFileExInfoStandard, &fa)) return false;
             t->files.push_back({t->src, t->dst, ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow});
         }
-        for (auto& f : t->files) prog.bytesTotal += f.size;
+        for (auto& f : t->files) prog.bytesTotal += prog.verify ? 2 * f.size : f.size;
         prog.filesTotal += (uint32_t)t->files.size();
     }
     // Pas assez de place : on n'écrit rien, le Shell le dit avant de commencer (comme l'Explorateur).
     ULARGE_INTEGER avail{};
-    if (GetDiskFreeSpaceExW(dest.c_str(), &avail, nullptr, nullptr) && avail.QuadPart < prog.bytesTotal + (1ull << 20))
+    if (GetDiskFreeSpaceExW(dest.c_str(), &avail, nullptr, nullptr) &&
+        avail.QuadPart < (prog.verify ? prog.bytesTotal / 2 : (uint64_t)prog.bytesTotal) + (1ull << 20))
         return false;
 
     // Dossiers (parents d'abord), avec les attributs de la source (masqué, compressé…).
@@ -269,21 +412,24 @@ bool FastTransfer(const std::vector<std::wstring>& sources, const std::wstring& 
     for (auto& t : tops)
         for (auto& f : t->files) jobs.push_back({t.get(), &f});
 
+    const bool remote = IsRemote(sources[0]) || IsRemote(dest);
+    std::atomic<uint32_t> retried{0}, badVerify{0};
     std::atomic<size_t> next{0};
     auto worker = [&] {
         for (size_t i; (i = next++) < jobs.size();) {
             Job& j = jobs[i];
             WaitWhilePaused(prog);
             if (prog.cancel) return;
-            if (j.top->failed) continue;
-            CopyCtx ctx{&prog};
-            // Échec : le fichier partiel est supprimé par CopyFileExW.
-            if (CopyFileExW(ToNtPath(j.file->src).c_str(), ToNtPath(j.file->dst).c_str(), OnProgress, &ctx, nullptr,
-                            COPY_FILE_FAIL_IF_EXISTS)) {
+            if (j.top->failed) continue;  // dossiers non créés : tout l'élément revient au Shell
+            bool again = false, bad = false;
+            const DWORD e = CopyOne(*j.file, prog, remote, again, bad);
+            if (!e) {
                 j.file->done = true;
                 ++prog.filesDone;
+                if (again) ++retried;
             } else if (!prog.cancel) {
-                j.top->failed = true;
+                j.file->failed = true;  // seul ce fichier revient au Shell
+                if (bad) ++badVerify;
             }
         }
     };
@@ -294,17 +440,28 @@ bool FastTransfer(const std::vector<std::wstring>& sources, const std::wstring& 
     for (auto& th : pool) th.join();
 
     out.cancelled = prog.cancel;
+    out.retried = retried;
+    out.verifyFailed = badVerify;
     for (auto& t : tops) {
         const bool complete = !t->failed && std::all_of(t->files.begin(), t->files.end(), [](const File& f) { return f.done; });
+        const bool someDone = std::any_of(t->files.begin(), t->files.end(), [](const File& f) { return f.done; });
         if (complete) {
             out.created.push_back(t->name);
             if (move && !DeleteSource(*t)) out.error = ERROR_SHARING_VIOLATION;
         } else if (out.cancelled) {
-            if (t->topCreated || std::any_of(t->files.begin(), t->files.end(), [](const File& f) { return f.done; }))
-                out.created.push_back(t->name);  // annulé : ce qui est copié reste, comme dans l'Explorateur
+            if (t->topCreated || someDone) out.created.push_back(t->name);  // annulé : ce qui est copié reste
+        } else if (!t->failed && t->dir && someDone) {
+            // Reprise : ce qui est copié reste ; seuls les fichiers en échec vont au Shell, vers leur dossier.
+            out.created.push_back(t->name);
+            for (const auto& f : t->files)
+                if (!f.done) {
+                    std::wstring parent, leaf;
+                    if (ParentOf(f.dst, parent, leaf)) out.shellLeft.emplace_back(f.src, parent);
+                }
+            if (move && !DeleteSource(*t)) out.error = ERROR_SHARING_VIOLATION;
         } else {
             Undo(*t);
-            out.shellLeft.push_back(t->src);
+            out.shellLeft.emplace_back(t->src, dest);
         }
     }
     return true;

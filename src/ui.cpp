@@ -24,6 +24,7 @@
 #include "places.h"
 #include "sessions.h"
 #include "archive.h"
+#include "batchrename.h"
 #include "net.h"
 #include "shellmenu.h"
 #include "util.h"
@@ -2778,6 +2779,8 @@ void CompressEntries(const std::vector<int>& entries) {
     Flash(L"Compression dans « " + stem + L".zip »…");
 }
 
+bool BrokenShortcut(const std::wstring& lnk, const std::wstring& target);
+
 void ActivateEntry(int idx) {
     if (idx < 0) return;
     if (InArchive() && !E(idx).isDir()) {  // extrait (dossier temporaire) puis ouvert
@@ -2802,6 +2805,7 @@ void ActivateEntry(int idx) {
     }
     std::wstring target;
     if (IsLnk(idx) && ResolveShortcut(full, target)) {
+        if (BrokenShortcut(full, target)) return;  // cible disparue : retrouver, chercher ou supprimer
         Navigate(NormalizePath(target, L""), Nav::Normal, {}, {}, full, true);
         return;
     }
@@ -2957,6 +2961,9 @@ std::wstring StepText(const UndoStep& s) {
         case FileOpKind::Rename:
             return s.from.size() > 1 ? count(L"renommage") : L"renommage de « " + LeafOf(s.from[0]) + L" »";
         case FileOpKind::NewFolder: return L"création de « " + LeafOf(s.to[0]) + L" »";
+        case FileOpKind::Link:
+            return s.to.size() == 1 ? L"création de « " + LeafOf(s.to[0]) + L" »"
+                                    : L"création de " + std::to_wstring(s.to.size()) + L" raccourcis";
         case FileOpKind::Copy: return count(L"copie");
         case FileOpKind::Move: return count(L"déplacement");
         case FileOpKind::Delete: return n == 1 ? L"suppression de « " + LeafOf(s.from[0]) + L" »"
@@ -2987,6 +2994,7 @@ bool StepFromResult(const FileOpResult& r, UndoStep& s) {
             s.to = {Join(r.folder, r.created[0].c_str())};
             s.file = r.newFile;
             return true;
+        case FileOpKind::Link:
         case FileOpKind::Copy:
             if (r.created.empty()) return false;
             s.from = r.sources;
@@ -3044,8 +3052,9 @@ std::vector<FileOp> OpsFor(const UndoStep& s, bool undo) {
             }
             break;
         case FileOpKind::Copy:
+        case FileOpKind::Link:
             if (undo) add(FileOpKind::Delete, ParentPath(s.to[0]), s.to);
-            else add(FileOpKind::Copy, ParentPath(s.to[0]), s.from);
+            else add(s.kind, ParentPath(s.to[0]), s.from);
             break;
         case FileOpKind::Move:
             if (undo) {  // chaque élément retourne dans son dossier d'origine
@@ -3116,6 +3125,8 @@ void RecordUndo(const FileOpResult& r) {
     if (g_undo.size() > kUndoMax) g_undo.erase(g_undo.begin());
 }
 
+std::wstring Plural(size_t n, const wchar_t* one, const wchar_t* many);
+
 void OnFileOp(FileOpResult* raw) {
     std::unique_ptr<FileOpResult> r(raw);
     RecordUndo(*r);
@@ -3134,6 +3145,17 @@ void OnFileOp(FileOpResult* raw) {
     if (HasView() && !g_pending.active) RequestDirSizes();
     if (FileOps_IsFailure(*r))
         SetStatus(L"Opération impossible : " + ErrorText((DWORD)r->hr) + (r->detail.empty() ? L"" : L" (" + r->detail + L")"));
+    else if ((r->kind == FileOpKind::Copy || r->kind == FileOpKind::Move) && !r->aborted) {
+        std::wstring note;
+        if (r->verifyFailed)
+            note = Plural(r->verifyFailed, L"copie différente", L"copies différentes") + L" de l'original, refaite(s) par Windows";
+        else if (r->verified && !r->created.empty())
+            note = L"Copie vérifiée : identique à l'original";
+        if (r->retried)
+            note += (note.empty() ? L"" : L" ; ") + Plural(r->retried, L"fichier repris", L"fichiers repris") +
+                    L" après une erreur passagère";
+        if (!note.empty()) Flash(note);
+    }
     if (r->clipboardCut && SUCCEEDED(r->hr) && !r->aborted) Clipboard_ClearAfterMove(r->clipSeq);
     if (g_quitWhenIdle) {
         if (FileOps_Running() == 0) DestroyWindow(g_hwnd);
@@ -3167,6 +3189,7 @@ void OnFileOp(FileOpResult* raw) {
         case FileOpKind::Restore:
         case FileOpKind::Copy:
         case FileOpKind::Move:
+        case FileOpKind::Link:
             if (!c.empty()) AfterOpSelect(r->folder, c, c[0]);  // sinon la surveillance suffit
             break;
         case FileOpKind::Compress:
@@ -4901,6 +4924,8 @@ void InvertSelection() {
     ScheduleSelectionSummary();
 }
 
+void SetVerifyCopies(bool on);
+
 void SetFullMenu(bool on) {
     g_fullMenu = on;
     const DWORD v = on ? 1 : 0;
@@ -5132,6 +5157,8 @@ std::vector<MenuExtra> MoreItems() {
     v.push_back({L"Sessions", nullptr, false, false, SessionItems()});
     v.push_back({});
     v.push_back({L"Menu contextuel complet par défaut", [] { SetFullMenu(!g_fullMenu); }, false, g_fullMenu});
+    v.push_back({L"Vérifier les copies (relire et comparer)", [] { SetVerifyCopies(!FileOps_Verify()); }, false,
+                 FileOps_Verify()});
     return v;
 }
 
@@ -5274,6 +5301,442 @@ const wchar_t* CommandTip(int id) {
 }
 
 // Le menu rapide s'applique-t-il ? (dossier ordinaire, sans Maj, réglage par défaut)
+// ───────────────────────────── Bloc 28 : opérations ─────────────────────────────
+
+// « Copier vers… » / « Déplacer vers… » : choix d'un dossier (le dernier choisi est proposé).
+void CopyMoveTo(const std::vector<int>& entries, bool move) {
+    if (entries.empty() || !HasView() || (move && !CanModify() && g_query.empty())) return;
+    std::vector<std::wstring> paths;
+    for (int e : entries)
+        if (std::wstring p = FullPath(e); !p.empty() && !IsVirtualPath(p)) paths.push_back(std::move(p));
+    if (paths.empty()) return;
+    wchar_t last[1024] = {};
+    DWORD cb = sizeof last;
+    std::wstring initial = g_path;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"LastCopyTo", RRF_RT_REG_SZ, nullptr, last, &cb) ==
+            ERROR_SUCCESS &&
+        GetFileAttributesW(last) != INVALID_FILE_ATTRIBUTES)
+        initial = last;
+    const std::wstring to = PickFolder(initial, move ? L"Déplacer vers" : L"Copier vers");
+    if (to.empty()) return;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"LastCopyTo", REG_SZ, to.c_str(),
+                    (DWORD)((to.size() + 1) * sizeof(wchar_t)));
+    FileOp op;
+    op.kind = move ? FileOpKind::Move : FileOpKind::Copy;
+    op.folder = to;
+    op.paths = std::move(paths);
+    const size_t n = op.paths.size();
+    StartOp(std::move(op));
+    Flash((move ? L"Déplacement de " : L"Copie de ") + Plural(n, L"élément", L"éléments") + L" vers " + to);
+}
+
+// « Coller en tant que raccourci » : un raccourci vers chaque élément du presse-papiers.
+void PasteShortcut(const std::wstring& dest) {
+    if (!CanModify() || dest.empty()) return;
+    FileOp op;
+    bool cut = false;
+    DWORD seq = 0;
+    if (!Clipboard_Get(op.items, cut, seq)) {
+        SetStatus(L"Rien à coller : le presse-papiers ne contient pas de fichiers.");
+        return;
+    }
+    op.kind = FileOpKind::Link;
+    op.folder = dest;
+    StartOp(std::move(op));
+}
+
+// ── Qui utilise ce fichier ? ──
+
+// Fenêtre principale visible d'un processus (pour y basculer ou lui demander de se fermer).
+std::vector<HWND> WindowsOf(DWORD pid) {
+    struct Ctx {
+        DWORD pid;
+        std::vector<HWND> out;
+    } c{pid, {}};
+    EnumWindows(
+        [](HWND h, LPARAM lp) -> BOOL {
+            auto* c = (Ctx*)lp;
+            DWORD p = 0;
+            GetWindowThreadProcessId(h, &p);
+            if (p == c->pid && IsWindowVisible(h) && !GetWindow(h, GW_OWNER)) c->out.push_back(h);
+            return TRUE;
+        },
+        (LPARAM)&c);
+    return c.out;
+}
+
+void WhoUses(const std::vector<int>& entries) {
+    std::vector<std::wstring> paths;
+    for (int e : entries)
+        if (std::wstring p = FullPath(e); !p.empty() && !IsVirtualPath(p)) paths.push_back(std::move(p));
+    if (paths.empty()) return;
+    SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    const std::vector<Locker> lockers = FileOps_LockerList(paths);
+    const std::wstring what = paths.size() == 1 ? L"« " + LeafOf(paths[0]) + L" »" : Plural(paths.size(), L"élément", L"éléments");
+    if (lockers.empty()) {
+        Flash(L"Aucune application n'utilise " + what + L" (selon le Gestionnaire de redémarrage de Windows)");
+        return;
+    }
+    std::vector<std::wstring> labels;
+    std::vector<TASKDIALOG_BUTTON> radios;
+    for (size_t i = 0; i < lockers.size(); ++i) {
+        const Locker& l = lockers[i];
+        std::wstring s = l.app + L"  (processus " + std::to_wstring(l.pid) + L")";
+        if (l.service) s += L" — service";
+        if (l.explorer) s += L" — Explorateur Windows";
+        labels.push_back(std::move(s));
+    }
+    for (size_t i = 0; i < labels.size(); ++i) radios.push_back({(int)(1000 + i), labels[i].c_str()});
+    enum { ID_SWITCH = 100, ID_CLOSE = 101 };
+    TASKDIALOG_BUTTON buttons[] = {{ID_SWITCH, L"Basculer vers l'application"},
+                                   {ID_CLOSE, L"Demander la fermeture"},
+                                   {IDCANCEL, L"Fermer"}};
+    const std::wstring main = what + (paths.size() == 1 ? L" est utilisé par " : L" sont utilisés par ") +
+                              Plural(lockers.size(), L"application", L"applications");
+    const std::wstring content =
+        L"Ces applications gardent le fichier ouvert : il ne peut pas être supprimé, déplacé ou renommé tant "
+        L"qu'elles ne l'ont pas fermé. « Demander la fermeture » fait comme la croix de la fenêtre : "
+        L"l'application peut proposer d'enregistrer.";
+    TASKDIALOGCONFIG c{sizeof c};
+    c.hwndParent = g_hwnd;
+    c.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW | TDF_ALLOW_DIALOG_CANCELLATION;
+    c.pszWindowTitle = L"Qui utilise ce fichier ?";
+    c.pszMainIcon = TD_INFORMATION_ICON;
+    c.pszMainInstruction = main.c_str();
+    c.pszContent = content.c_str();
+    c.cButtons = _countof(buttons);
+    c.pButtons = buttons;
+    c.nDefaultButton = ID_SWITCH;
+    c.cRadioButtons = (UINT)radios.size();
+    c.pRadioButtons = radios.data();
+    c.nDefaultRadioButton = 1000;
+    int pressed = IDCANCEL, radio = 1000;
+    if (FAILED(TaskDialogIndirect(&c, &pressed, &radio, nullptr)) || pressed == IDCANCEL) return;
+    const size_t k = (size_t)(radio - 1000);
+    if (k >= lockers.size()) return;
+    const Locker& l = lockers[k];
+    const std::vector<HWND> wins = WindowsOf(l.pid);
+    if (pressed == ID_SWITCH) {
+        if (wins.empty()) {
+            Flash(l.app + L" n'a pas de fenêtre visible");
+            return;
+        }
+        if (IsIconic(wins[0])) ShowWindow(wins[0], SW_RESTORE);
+        SetForegroundWindow(wins[0]);
+    } else if (pressed == ID_CLOSE) {
+        if (l.service || l.explorer || wins.empty()) {
+            Flash(l.app + L" ne se ferme pas depuis ici (pas de fenêtre, service ou Explorateur)");
+            return;
+        }
+        for (HWND w : wins) PostMessageW(w, WM_CLOSE, 0, 0);
+        Flash(L"Fermeture demandée à " + l.app);
+    }
+}
+
+// ── Raccourci dont la cible a disparu ──
+
+// true : traité (cible retrouvée et ouverte, recherche lancée, raccourci supprimé ou abandon).
+bool BrokenShortcut(const std::wstring& lnk, const std::wstring& target) {
+    const DWORD a = GetFileAttributesW(target.c_str());
+    if (a != INVALID_FILE_ATTRIBUTES) return false;
+    const DWORD err = GetLastError();
+    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND && err != ERROR_INVALID_DRIVE &&
+        err != ERROR_NOT_READY && err != ERROR_BAD_NETPATH && err != ERROR_BAD_NET_NAME)
+        return false;  // accès refusé… : le Shell saura le dire
+    std::wstring root = target.size() >= 3 && target[1] == L':' ? target.substr(0, 3) : std::wstring();
+    const bool driveGone = !root.empty() && GetFileAttributesW(root.c_str()) == INVALID_FILE_ATTRIBUTES;
+    const std::wstring leaf = LeafOf(target);
+    enum { ID_RESOLVE = 100, ID_SEARCH = 101, ID_DELETE = 102 };
+    const std::wstring searchText = L"Chercher « " + leaf + L" » dans tout le PC";
+    TASKDIALOG_BUTTON buttons[] = {{ID_RESOLVE, L"Retrouver la cible\nComme Windows : suivi des fichiers déplacés"},
+                                   {ID_SEARCH, searchText.c_str()},
+                                   {ID_DELETE, L"Supprimer le raccourci"},
+                                   {IDCANCEL, L"Annuler"}};
+    const std::wstring content = (driveGone ? L"Le lecteur " + root + L" n'est pas disponible.\n\n" : L"") +
+                                 L"Cible : " + target;
+    const std::wstring main = L"La cible du raccourci « " + Archive_Stem(LeafOf(lnk)) + L" » a disparu";
+    TASKDIALOGCONFIG c{sizeof c};
+    c.hwndParent = g_hwnd;
+    c.dwFlags = TDF_POSITION_RELATIVE_TO_WINDOW | TDF_ALLOW_DIALOG_CANCELLATION | TDF_USE_COMMAND_LINKS;
+    c.pszWindowTitle = L"Raccourci";
+    c.pszMainIcon = TD_WARNING_ICON;
+    c.pszMainInstruction = main.c_str();
+    c.pszContent = content.c_str();
+    c.cButtons = _countof(buttons);
+    c.pButtons = buttons;
+    c.nDefaultButton = ID_RESOLVE;
+    int pressed = IDCANCEL;
+    if (FAILED(TaskDialogIndirect(&c, &pressed, nullptr, nullptr))) return false;
+    if (pressed == ID_RESOLVE) {
+        IShellLinkW* sl = nullptr;
+        IPersistFile* pf = nullptr;
+        bool found = false;
+        std::wstring now;
+        if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl))) &&
+            SUCCEEDED(sl->QueryInterface(IID_PPV_ARGS(&pf))) && SUCCEEDED(pf->Load(lnk.c_str(), STGM_READWRITE))) {
+            SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+            // Sans fenêtre du Shell, 5 s au plus ; le raccourci est mis à jour s'il a retrouvé la cible.
+            if (sl->Resolve(g_hwnd, SLR_NO_UI | SLR_UPDATE | SLR_ANY_MATCH | (5000u << 16)) == S_OK) {
+                wchar_t buf[2048] = {};
+                if (sl->GetPath(buf, _countof(buf), nullptr, 0) == S_OK && buf[0] &&
+                    GetFileAttributesW(buf) != INVALID_FILE_ATTRIBUTES) {
+                    now = buf;
+                    found = true;
+                }
+            }
+        }
+        if (pf) pf->Release();
+        if (sl) sl->Release();
+        if (!found) {
+            Flash(L"Cible introuvable : essayez « Chercher dans tout le PC »");
+            return true;
+        }
+        Flash(L"Cible retrouvée : " + now);
+        const DWORD na = GetFileAttributesW(now.c_str());
+        if (na & FILE_ATTRIBUTE_DIRECTORY) Navigate(now, Nav::Normal);
+        else OpenWithShell(now);
+    } else if (pressed == ID_SEARCH) {
+        SetWindowTextW(g_searchBox, leaf.c_str());
+        g_filter.clear();
+        Navigate(L"", Nav::Normal, {}, {}, {}, false, &leaf);  // Ce PC : tout le PC (index si disponible)
+    } else if (pressed == ID_DELETE) {
+        std::wstring parent, name;
+        if (ParentOf(lnk, parent, name) && _wcsicmp(parent.c_str(), g_path.c_str()) == 0) DeleteNames({name}, false);
+    }
+    return true;
+}
+
+// ── Renommage par lot ──
+
+struct BatchState {
+    std::vector<RenameItem> items;
+    std::vector<std::wstring> others;  // noms du dossier non renommés
+    std::wstring folderName;
+    RenameRule rule;
+    std::vector<std::wstring> names, problems;
+    std::wstring error;
+    std::wstring dispBuf;
+};
+
+enum {
+    ID_BR_FIND = 200, ID_BR_REPL, ID_BR_REGEX, ID_BR_MATCHCASE, ID_BR_WITHEXT, ID_BR_PATTERN, ID_BR_CASE, ID_BR_START,
+    ID_BR_STEP, ID_BR_LIST, ID_BR_INFO, ID_BR_HELP
+};
+
+std::wstring DlgText(HWND dlg, int id) {
+    HWND c = GetDlgItem(dlg, id);
+    std::wstring t(GetWindowTextLengthW(c) + 1, L'\0');
+    t.resize(GetWindowTextW(c, t.data(), (int)t.size()));
+    return t;
+}
+
+void BatchUpdate(HWND dlg, BatchState& st) {
+    RenameRule& r = st.rule;
+    r.find = DlgText(dlg, ID_BR_FIND);
+    r.replace = DlgText(dlg, ID_BR_REPL);
+    r.regex = IsDlgButtonChecked(dlg, ID_BR_REGEX) == BST_CHECKED;
+    r.matchCase = IsDlgButtonChecked(dlg, ID_BR_MATCHCASE) == BST_CHECKED;
+    r.withExtension = IsDlgButtonChecked(dlg, ID_BR_WITHEXT) == BST_CHECKED;
+    r.pattern = DlgText(dlg, ID_BR_PATTERN);
+    r.nameCase = (NameCase)std::max(0, (int)SendDlgItemMessageW(dlg, ID_BR_CASE, CB_GETCURSEL, 0, 0));
+    r.start = _wtoi(DlgText(dlg, ID_BR_START).c_str());
+    const std::wstring step = DlgText(dlg, ID_BR_STEP);
+    r.step = step.empty() ? 1 : _wtoi(step.c_str());
+    st.names = BatchNames(r, st.items, st.folderName, &st.error);
+    st.problems = BatchProblems(st.names, st.others);
+    size_t changed = 0, bad = 0;
+    for (size_t i = 0; i < st.names.size(); ++i) {
+        if (st.names[i] == st.items[i].name) {
+            st.problems[i].clear();  // inchangé : rien à vérifier
+            continue;
+        }
+        if (!st.problems[i].empty()) ++bad;
+        else ++changed;
+    }
+    std::wstring info;
+    if (!st.error.empty()) info = st.error;
+    else {
+        info = Plural(changed, L"élément renommé", L"éléments renommés");
+        if (st.names.size() - changed - bad) info += L", " + Plural(st.names.size() - changed - bad, L"inchangé", L"inchangés");
+        if (bad) info += L", " + Plural(bad, L"nom refusé", L"noms refusés") + L" (voir « État »)";
+    }
+    SetDlgItemTextW(dlg, ID_BR_INFO, info.c_str());
+    EnableWindow(GetDlgItem(dlg, IDOK), st.error.empty() && changed > 0 && bad == 0);
+    HWND list = GetDlgItem(dlg, ID_BR_LIST);
+    ListView_SetItemCountEx(list, (int)st.items.size(), LVSICF_NOSCROLL);
+    InvalidateRect(list, nullptr, FALSE);
+}
+
+INT_PTR CALLBACK BatchProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* st = (BatchState*)GetWindowLongPtrW(dlg, DWLP_USER);
+    switch (msg) {
+        case WM_INITDIALOG: {
+            st = (BatchState*)lp;
+            SetWindowLongPtrW(dlg, DWLP_USER, lp);
+            const HFONT font = (HFONT)SendMessageW(dlg, WM_GETFONT, 0, 0);
+            auto make = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int w, int h,
+                            DWORD ex = 0) {
+                RECT r{x, y, x + w, y + h};
+                MapDialogRect(dlg, &r);
+                HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, r.left, r.top, r.right - r.left,
+                                         r.bottom - r.top, dlg, (HMENU)(INT_PTR)id, nullptr, nullptr);
+                SendMessageW(c, WM_SETFONT, (WPARAM)font, FALSE);
+                return c;
+            };
+            const DWORD edit = WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL;
+            make(L"STATIC", L"Rechercher :", SS_LEFT, -1, 7, 9, 58, 10);
+            HWND find = make(L"EDIT", L"", edit, ID_BR_FIND, 66, 7, 140, 13);
+            make(L"STATIC", L"Remplacer par :", SS_LEFT, -1, 214, 9, 58, 10);
+            make(L"EDIT", L"", edit, ID_BR_REPL, 273, 7, 140, 13);
+            make(L"BUTTON", L"Expression régulière", WS_TABSTOP | BS_AUTOCHECKBOX, ID_BR_REGEX, 66, 24, 100, 12);
+            make(L"BUTTON", L"Respecter la casse", WS_TABSTOP | BS_AUTOCHECKBOX, ID_BR_MATCHCASE, 170, 24, 90, 12);
+            make(L"BUTTON", L"Inclure l'extension", WS_TABSTOP | BS_AUTOCHECKBOX, ID_BR_WITHEXT, 264, 24, 100, 12);
+            make(L"STATIC", L"Nouveau nom :", SS_LEFT, -1, 7, 43, 58, 10);
+            make(L"EDIT", L"{nom}", edit, ID_BR_PATTERN, 66, 41, 140, 13);
+            make(L"STATIC", L"Casse :", SS_LEFT, -1, 214, 43, 58, 10);
+            HWND cs = make(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, ID_BR_CASE, 273, 41, 140, 90);
+            for (const wchar_t* s : {L"Inchangée", L"minuscules", L"MAJUSCULES", L"Majuscule À Chaque Mot",
+                                     L"Majuscule au début"})
+                SendMessageW(cs, CB_ADDSTRING, 0, (LPARAM)s);
+            SendMessageW(cs, CB_SETCURSEL, 0, 0);
+            make(L"STATIC", L"{nom}  {n}  {n:3}  {ext}  {date}  {dossier}", SS_LEFT | SS_NOPREFIX, ID_BR_HELP, 66, 57,
+                 200, 10);
+            make(L"STATIC", L"Compteur :", SS_LEFT, -1, 214, 59, 58, 10);
+            make(L"EDIT", L"1", edit | ES_NUMBER, ID_BR_START, 273, 57, 40, 13);
+            make(L"STATIC", L"pas", SS_RIGHT, -1, 318, 59, 20, 10);
+            make(L"EDIT", L"1", edit, ID_BR_STEP, 342, 57, 30, 13);
+            HWND list = make(WC_LISTVIEWW, L"", WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS,
+                             ID_BR_LIST, 7, 76, 406, 124);
+            ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+            SetWindowTheme(list, L"Explorer", nullptr);
+            RECT lr;
+            GetClientRect(list, &lr);
+            const int w = lr.right - lr.left - GetSystemMetrics(SM_CXVSCROLL);
+            LVCOLUMNW col{LVCF_TEXT | LVCF_WIDTH};
+            col.cx = w * 38 / 100;
+            col.pszText = (LPWSTR)L"Nom actuel";
+            ListView_InsertColumn(list, 0, &col);
+            col.pszText = (LPWSTR)L"Nouveau nom";
+            ListView_InsertColumn(list, 1, &col);
+            col.cx = w - 2 * (w * 38 / 100);
+            col.pszText = (LPWSTR)L"État";
+            ListView_InsertColumn(list, 2, &col);
+            make(L"STATIC", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, ID_BR_INFO, 7, 211, 290, 10);
+            make(L"BUTTON", L"Renommer", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, 309, 208, 50, 14);
+            make(L"BUTTON", L"Annuler", WS_TABSTOP | BS_PUSHBUTTON, IDCANCEL, 363, 208, 50, 14);
+            BatchUpdate(dlg, *st);
+            // Centré sur la fenêtre, mais jamais hors de l'écran où elle se trouve.
+            RECT dr, ow;
+            MONITORINFO mi{sizeof mi};
+            if (GetWindowRect(dlg, &dr) && GetWindowRect(g_hwnd, &ow) &&
+                GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+                const int dw = dr.right - dr.left, dh = dr.bottom - dr.top;
+                int x = (ow.left + ow.right - dw) / 2, y = (ow.top + ow.bottom - dh) / 2;
+                x = std::clamp(x, (int)mi.rcWork.left, std::max((int)mi.rcWork.left, (int)mi.rcWork.right - dw));
+                y = std::clamp(y, (int)mi.rcWork.top, std::max((int)mi.rcWork.top, (int)mi.rcWork.bottom - dh));
+                SetWindowPos(dlg, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            SetFocus(find);
+            return FALSE;
+        }
+        case WM_COMMAND: {
+            const int id = LOWORD(wp), code = HIWORD(wp);
+            if (id == IDOK) {
+                BatchUpdate(dlg, *st);
+                if (IsWindowEnabled(GetDlgItem(dlg, IDOK))) EndDialog(dlg, IDOK);
+                return TRUE;
+            }
+            if (id == IDCANCEL) {
+                EndDialog(dlg, IDCANCEL);
+                return TRUE;
+            }
+            if ((code == EN_CHANGE && id != ID_BR_INFO) || code == BN_CLICKED || code == CBN_SELCHANGE)
+                BatchUpdate(dlg, *st);
+            break;
+        }
+        case WM_NOTIFY: {
+            auto* nm = (NMHDR*)lp;
+            if (nm->idFrom == ID_BR_LIST && nm->code == LVN_GETDISPINFOW) {
+                auto* di = (NMLVDISPINFOW*)lp;
+                const size_t i = (size_t)di->item.iItem;
+                if (!(di->item.mask & LVIF_TEXT) || i >= st->items.size()) break;
+                const bool same = i < st->names.size() && st->names[i] == st->items[i].name;
+                switch (di->item.iSubItem) {
+                    case 0: st->dispBuf = st->items[i].name; break;
+                    case 1: st->dispBuf = i < st->names.size() ? st->names[i] : L""; break;
+                    default:
+                        st->dispBuf = same ? L"inchangé" : (i < st->problems.size() && !st->problems[i].empty() ? st->problems[i] : L"✓");
+                        break;
+                }
+                di->item.pszText = st->dispBuf.data();
+                return TRUE;
+            }
+            break;
+        }
+    }
+    return FALSE;
+}
+
+// Renommage par lot : éléments sélectionnés (sinon tout le dossier), dans l'ordre affiché.
+void BatchRename() {
+    if (!CanModify()) return;
+    std::vector<int> sel = SelectedEntries();
+    if (sel.size() < 2) {
+        sel.clear();
+        for (uint32_t i : g_view.order)
+            if (!IsGroupRow(i)) sel.push_back((int)i);
+    } else {
+        std::vector<int> ordered;
+        std::unordered_set<int> picked(sel.begin(), sel.end());
+        for (uint32_t i : g_view.order)
+            if (!IsGroupRow(i) && picked.count((int)i)) ordered.push_back((int)i);
+        sel = std::move(ordered);
+    }
+    if (sel.empty()) return;
+    BatchState st;
+    std::unordered_set<int> picked(sel.begin(), sel.end());
+    for (int e : sel) st.items.push_back({NameOf(e), E(e).isDir(), E(e).mtime});
+    for (int k = 0; k < (int)g_view.data->entries.size(); ++k)
+        if (!picked.count(k)) st.others.emplace_back(NameOf(k));
+    st.folderName = LeafOf(g_path);
+    std::vector<WORD> t(sizeof(DLGTEMPLATE) / sizeof(WORD), 0);
+    auto* d = (DLGTEMPLATE*)t.data();
+    d->style = DS_MODALFRAME | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    d->cx = 420;
+    d->cy = 229;
+    t.push_back(0);
+    t.push_back(0);
+    for (const wchar_t* s = L"Renommer par lot";; ++s) {
+        t.push_back(*s);
+        if (!*s) break;
+    }
+    t.push_back(9);
+    for (const wchar_t* s = L"Segoe UI";; ++s) {
+        t.push_back(*s);
+        if (!*s) break;
+    }
+    if (DialogBoxIndirectParamW(g_inst, (DLGTEMPLATE*)t.data(), g_hwnd, BatchProc, (LPARAM)&st) != IDOK) return;
+    FileOp op;
+    op.kind = FileOpKind::Rename;
+    op.folder = g_path;
+    for (size_t i = 0; i < st.items.size() && i < st.names.size(); ++i)
+        if (st.names[i] != st.items[i].name) {
+            op.paths.push_back(Join(g_path, st.items[i].name.c_str()));
+            op.newNames.push_back(st.names[i]);
+        }
+    if (op.paths.empty()) return;
+    const size_t n = op.paths.size();
+    StartOp(std::move(op));
+    Flash(L"Renommage de " + Plural(n, L"élément", L"éléments") + L" (Ctrl+Z pour annuler)");
+}
+
+void SetVerifyCopies(bool on) {
+    FileOps_SetVerify(on);
+    const DWORD v = on ? 1 : 0;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"VerifyCopies", REG_DWORD, &v, sizeof v);
+    Flash(on ? L"Les copies seront relues et comparées à l'original" : L"Copies non vérifiées (plus rapide)");
+}
+
 bool QuickMenuApplies(bool shift) {
     return !shift && !g_fullMenu && HasView() && !g_path.empty() && !g_view.data->isRoot() && !InVirtual() &&
            !g_view.data->listOnly() && g_query.empty();
@@ -5293,6 +5756,7 @@ void ShowQuickMenu(POINT pt, const std::vector<int>& sel) {
         v.push_back({L"Actualiser\tF5", [] { g_forceSizes = true; Refresh(); }});
         v.push_back({});
         v.push_back({L"Coller\tCtrl+V", [] { Paste(g_path); }, false, false, {}, !mod || !clip});
+        v.push_back({L"Coller en tant que raccourci", [] { PasteShortcut(g_path); }, false, false, {}, !mod || !clip});
         if (!g_undo.empty()) v.push_back({L"Annuler " + StepText(g_undo.back()) + L"\tCtrl+Z", Undo});
         if (!g_redo.empty()) v.push_back({L"Rétablir " + StepText(g_redo.back()) + L"\tCtrl+Y", Redo});
         v.push_back(NewMenu());
@@ -5325,16 +5789,21 @@ void ShowQuickMenu(POINT pt, const std::vector<int>& sel) {
         v.push_back({});
         v.push_back({L"Couper\tCtrl+X", [names] { CopyNames(names, true); }, false, false, {}, !mod});
         v.push_back({L"Copier\tCtrl+C", [names] { CopyNames(names, false); }});
+        v.push_back({L"Copier vers…", [names] { CopyMoveTo(FindEntriesByNames(names), false); }});
+        v.push_back({L"Déplacer vers…", [names] { CopyMoveTo(FindEntriesByNames(names), true); }, false, false, {}, !mod});
         if (dir) {
             const std::wstring path = FullPath(single);
             v.push_back({L"Coller dans ce dossier", [path] { Paste(path); }, false, false, {}, !mod || !clip});
         }
         v.push_back({names.size() > 1 ? L"Renommer tout\tF2" : L"Renommer\tF2", [] { BeginRename(); }, false, false, {},
                      !mod});
+        v.push_back({L"Renommer par lot…\tCtrl+Maj+F2", BatchRename, false, false, {}, !mod});
         v.push_back({L"Supprimer\tSuppr", [names] { DeleteNames(names, GetKeyState(VK_SHIFT) < 0); }, false, false, {},
                      !mod});
         v.push_back({});
         v.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C", [names] { CopyPaths(names); }});
+        v.push_back({names.size() == 1 && !dir ? L"Qui utilise ce fichier ?" : L"Qui utilise ces éléments ?",
+                     [names] { WhoUses(FindEntriesByNames(names)); }});
         if (single >= 0 && !dir && Archive_IsArchive(names[0])) {
             const std::wstring arc = FullPath(single), here = g_path;
             v.push_back({L"Extraire tout", [arc, here] { ExtractArchive(arc, here, true, ThenDo::Nothing); }});
@@ -5687,6 +6156,7 @@ void CreateChildren(HWND hwnd) {
     g_btnRefresh = btn(L"↻", ID_REFRESH);
     CreateCommandBar(hwnd);
     g_fullMenu = RegDword(L"Software\\FastExplorer", L"FullMenu", 0) != 0;
+    FileOps_SetVerify(RegDword(L"Software\\FastExplorer", L"VerifyCopies", 0) != 0);
 
     // Zone de saisie cachée : le fil d'Ariane occupe sa place, sauf pendant la saisie.
     g_addr = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
@@ -6398,7 +6868,10 @@ bool HandleGlobalKeys(const MSG& m) {
     }
     if (focus != g_list) return false;
     switch (m.wParam) {
-        case VK_F2: BeginRename(); return true;
+        case VK_F2:
+            if (ctrl && shift) BatchRename();
+            else BeginRename();
+            return true;
         case VK_DELETE: DeleteNames(NamesOf(SelectedEntries()), shift); return true;
         case 'C':
             if (!ctrl) return false;

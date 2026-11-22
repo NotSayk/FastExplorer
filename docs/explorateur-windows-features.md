@@ -226,9 +226,9 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Fonction | Détail | Prio |
 |---|---|---|
 | Copier / Couper / Coller | Ctrl+C / Ctrl+X / Ctrl+V ; interopérable avec les autres applications via le presse-papiers | ✅ P0 (dans les deux sens, CF_HDROP seul compris) ⚙️ formats `CF_HDROP`, `Shell IDList Array`, `Preferred DropEffect` |
-| Coller en tant que raccourci | Menu contextuel classique | P2 |
+| Coller en tant que raccourci | Menu contextuel classique | ✅ P2 (bloc 28 : menu du fond du dossier ; « nom - Raccourci.lnk », numéroté si pris ; aussi pour les éléments sans chemin ; annulable) |
 | Copier en tant que chemin d'accès | Ctrl+Maj+C : chemin(s) entre guillemets | ✅ (bloc 10 : aussi dans le menu contextuel, sans Maj) |
-| Copier vers / Déplacer vers | Choix d'un dossier de destination | P2 |
+| Copier vers / Déplacer vers | Choix d'un dossier de destination | ✅ P2 (bloc 28 : menu de la sélection ; sélecteur de dossier ouvert sur le dernier choisi ; passe par la file des copies) |
 | **Glisser-déposer** | Même volume = déplacer ; autre volume = copier ; Ctrl = forcer la copie ; Maj = forcer le déplacement ; Alt ou Ctrl+Maj = créer un raccourci ; **clic droit + glisser** = menu au dépôt (Copier ici, Déplacer ici, Créer un raccourci ici). Interopérable avec les autres applications | ✅ P0 (dépôt confié à la cible du Shell : dossier affiché ou élément survolé — dossier, .zip, raccourci ; testé hors écran, pas encore à la souris) ⚙️ OLE `IDropTarget` / `IDropSource` / `IDataObject` |
 | Ouverture au survol pendant le glisser | Survoler un dossier ou un onglet ouvre celui-ci après un délai | ✅ P2 (bloc 26 : 0,7 s ; on entre dans le dossier et l'on continue de glisser) |
 | Dupliquer sur place | Ctrl+C, Ctrl+V dans le même dossier : « fichier - Copie.txt » | P0 |
@@ -236,7 +236,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | **Conflits** | Remplacer, Ignorer, **Comparer** (choix fichier par fichier, avec dates et tailles), « Faire ceci pour les N conflits suivants » ; fusion des dossiers de même nom (option *Masquer les conflits de fusion de dossiers*) | ✅ P0 (dialogue du Shell) |
 | Fichier en cours d'utilisation | « Le fichier est ouvert dans <Application> » : Réessayer / Ignorer | ✅ (bloc 12 : fenêtre du Shell, qui nomme l'application ; nos propres échecs : « ouvert dans Word » par Restart Manager) ⚙️ Restart Manager (`RmGetList`) |
 | Droits insuffisants | « Vous devez disposer d'une autorisation » ▸ Continuer (élévation UAC pour cette opération) | ✅ (tout échec de notre moteur repasse par le Shell, qui propose l'élévation) ⚙️ élévation via COM (`IFileOperation` dans un processus élevé) |
-| Perte de propriétés | Copie vers FAT/exFAT ou réseau : avertissement quand les propriétés (flux NTFS…) ne peuvent pas être conservées | P2 |
+| Perte de propriétés | Copie vers FAT/exFAT ou réseau : avertissement quand les propriétés (flux NTFS…) ne peuvent pas être conservées | ✅ P2 (bloc 28 : avant la copie, si le volume de destination n'a pas de flux nommés ou de chiffrement ; flux NTFS hors Zone.Identifier, fichiers chiffrés EFS copiés en clair après accord ; jusqu'à 5 000 éléments examinés ; pas testé sur un vrai lecteur FAT) |
 | Espace insuffisant, chemin trop long | Messages dédiés | ✅ (bloc 12 : place vérifiée avant toute copie par notre moteur, sinon le Shell avertit avant de commencer ; chemins longs gérés par notre moteur, message du Shell au-delà) |
 | Moteur | ⚙️ `IFileOperation` (moteur de copie de l'Explorateur : annuler, conflits, progression, élévation) ou moteur maison (`CopyFileEx` / `MoveFileWithProgress`, E/S non tamponnées pour les gros fichiers) | — |
 
@@ -427,7 +427,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | Jonction | Idem pour les dossiers ; jonctions système masquées (« Documents and Settings ») | ✅ (masquées comme fichiers protégés) |
 | Lien physique (hard link) | Invisible dans l'Explorateur | P3 |
 | Créer un raccourci | Glisser avec Alt ou Ctrl+Maj, clic droit ▸ Créer un raccourci, Nouveau ▸ Raccourci | ✅ P1 (Shell) |
-| Cible absente | « Le raccourci a été modifié ou déplacé » + recherche de la cible | P2 |
+| Cible absente | « Le raccourci a été modifié ou déplacé » + recherche de la cible | ✅ P2 (bloc 28 : « Retrouver la cible » par le suivi de Windows, raccourci mis à jour ; « Chercher dans tout le PC » par notre index ; « Supprimer le raccourci ») |
 
 ---
 
@@ -552,8 +552,9 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | **Taille des dossiers** | Calcul en tâche de fond, colonne Taille remplie pour les dossiers, cache | ✅ P1 ⭐ (3 threads en priorité d'E/S basse, jonctions non suivies, « ≥ » si un sous-dossier est illisible, tri par taille, cache de 30 s périmé par les opérations de fichiers ; F5 recalcule ; pas sur les lecteurs réseau et optiques) |
 | **Recherche instantanée** sur tout le disque | Index MFT + journal USN (à la *Everything*) | ✅ P1 ⭐ (service `FastExplorerIndex` installé une fois, en un clic : table des fichiers NTFS lue en < 1 s, suivie par le journal USN ; canal nommé réservé à l'utilisateur, serveur vérifié ; ~140 ms dans tout le PC, 79 000 résultats en 0,7 s ; sans service : parcours des dossiers, Ce PC = tous les disques locaux) |
 | **Double panneau** (à la Total Commander) | Deux listes côte à côte, F5/F6 copier/déplacer vers l'autre panneau | ✅ P1 ⭐ (F9 ; chaque panneau est un onglet ; Tab ou clic pour changer de panneau, chemin du panneau actif en surbrillance ; glisser-déposer vers l'autre panneau ; l'autre panneau est relu après une copie vers lui ; mémorisé) |
-| **File d'attente de copies** | Copies mises en file (pas en parallèle sur le même disque), pause/reprise, reprise après erreur, vérification | ✅ P1 ⭐ (file par disque physique ou serveur, en parallèle sur des disques différents ; fenêtre « File d'attente des copies » : suspendre / reprendre, démarrer maintenant, annuler ; s'ouvre seule quand une copie attend son tour) ; reprise après erreur et vérification : P2 |
-| **Renommage par lot avancé** | Motifs, expressions régulières, compteur, casse, aperçu avant/après | P2 ⭐ |
+| **File d'attente de copies** | Copies mises en file (pas en parallèle sur le même disque), pause/reprise, reprise après erreur, vérification | ✅ P1 ⭐ (file par disque physique ou serveur, en parallèle sur des disques différents ; fenêtre « File d'attente des copies » : suspendre / reprendre, démarrer maintenant, annuler ; s'ouvre seule quand une copie attend son tour) ; ✅ P2 (bloc 28) : reprise après erreur (erreur réseau réessayée à 1, 2 et 4 s, fichier ouvert un instant réessayé, gros fichiers réseau repris là où ils s'étaient arrêtés ; ce qui est copié reste, seuls les fichiers en échec passent au Shell) et vérification (« ··· » ▸ Vérifier les copies : chaque copie relue sans le cache et comparée octet par octet, refaite une fois si elle diffère) |
+| **Renommage par lot avancé** | Motifs, expressions régulières, compteur, casse, aperçu avant/après | ✅ P2 ⭐ (bloc 28 : Ctrl+Maj+F2 ou menu ; rechercher / remplacer, texte ou expression régulière, avec ou sans la casse et l'extension ; modèle {nom} {n} {n:3} {ext} {date} {dossier} ; 4 casses ; aperçu en direct avec noms refusés et doublons ; une seule étape d'annulation) |
+| **Qui utilise ce fichier ?** | Applications qui gardent un fichier (ou les fichiers d'un dossier) ouvert | ✅ P2 ⭐ (bloc 28 : menu de la sélection ; Gestionnaire de redémarrage de Windows ; basculer vers l'application ou lui demander de se fermer) |
 | **Filtre instantané** du dossier courant | Taper pour filtrer la liste (sans lancer de recherche) | ✅ ⭐ (bloc 11 : zone de recherche, à chaque frappe, sans lire le disque ; filtre aussi des résultats de recherche ; mêmes règles que la recherche) |
 | **Raccourcis personnalisables** | Table de raccourcis éditable | P2 ⭐ |
 | **Palette de commandes** | Ctrl+Maj+P : toutes les actions accessibles au clavier | P2 ⭐ |
@@ -651,7 +652,7 @@ P2, en blocs (dans cet ordre) :
     restaurés à la réouverture, sessions nommées ⭐, signets ⭐.
 27. ✅ **Affichage** : regrouper par, filtres de colonne, cases à cocher, info-bulles, type de dossier et ses
     colonnes, Ctrl+pavé num. +.
-28. **Opérations** : copier vers / déplacer vers, coller en tant que raccourci, renommage par lot avancé ⭐,
+28. ✅ **Opérations** : copier vers / déplacer vers, coller en tant que raccourci, renommage par lot avancé ⭐,
     « qui utilise ce fichier ? » ⭐, reprise après erreur et vérification des copies, perte de propriétés,
     raccourci dont la cible a disparu.
 29. **Recherche** : syntaxe AQS, recherches récentes, contenu des fichiers (index Windows Search).
