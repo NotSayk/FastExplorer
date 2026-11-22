@@ -1614,6 +1614,75 @@ void TestFileOps() {    HWND sink = CreateWindowW(L"FeTestSink", L"", 0, 0, 0, 0
     // Données d'annulation : source complète et nouveau nom.
     CHECK(r && r->sources.size() == 1 && r->sources[0] == Join(ops, L"Nouveau dossier (2)") && r->newName == L"renommé");
 
+    {  // Nouveau document texte : un fichier vide, numéro avant l'extension
+        const std::wstring nd = Join(ops, L"nouveau");
+        CreateDirectoryW(nd.c_str(), nullptr);
+        auto mk = [&] {
+            FileOp f;
+            f.kind = FileOpKind::NewFolder;
+            f.folder = nd;
+            f.newName = L"Nouveau document texte.txt";
+            f.newFile = true;
+            return f;
+        };
+        r = run(mk());
+        CHECK_STR(created(r), L"Nouveau document texte.txt");
+        CHECK(r && r->newFile);
+        r = run(mk());
+        CHECK_STR(created(r), L"Nouveau document texte (2).txt");
+        const DWORD a = GetFileAttributesW(Join(nd, L"Nouveau document texte (2).txt").c_str());
+        CHECK(a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY));
+        RemoveTree(nd);
+    }
+
+    {  // Renommage multiple : échange de noms, casse seule, nom pris hors sélection
+        const std::wstring md = Join(ops, L"multi");
+        CreateDirectoryW(md.c_str(), nullptr);
+        MakeFile(Join(md, L"a.txt"), 1);
+        MakeFile(Join(md, L"b.txt"), 2);
+        MakeFile(Join(md, L"c.txt"), 3);
+        MakeFile(Join(md, L"pris.txt"), 4);
+        FileOp m;
+        m.kind = FileOpKind::Rename;
+        m.folder = md;
+        m.paths = {Join(md, L"a.txt"), Join(md, L"b.txt"), Join(md, L"c.txt")};
+        m.newNames = {L"b.txt", L"a.txt", L"C.TXT"};  // a ↔ b, c → C
+        r = run(std::move(m));
+        CHECK(r && SUCCEEDED(r->hr));
+        CHECK(r && r->created.size() == 3 && r->renamedFrom.size() == 3);
+        auto sizeOf = [](const std::wstring& p) {
+            WIN32_FILE_ATTRIBUTE_DATA d{};
+            return GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &d) ? (int)d.nFileSizeLow : -1;
+        };
+        CHECK(sizeOf(Join(md, L"b.txt")) == 1 && sizeOf(Join(md, L"a.txt")) == 2);
+        {
+            WIN32_FIND_DATAW fd;
+            HANDLE h = FindFirstFileW(Join(md, L"c.txt").c_str(), &fd);
+            CHECK(h != INVALID_HANDLE_VALUE && wcscmp(fd.cFileName, L"C.TXT") == 0);
+            if (h != INVALID_HANDLE_VALUE) FindClose(h);
+        }
+        // « pris.txt » n'est pas renommé : la cible n'est pas dans la sélection.
+        FileOp m2;
+        m2.kind = FileOpKind::Rename;
+        m2.folder = md;
+        m2.paths = {Join(md, L"a.txt"), Join(md, L"b.txt")};
+        m2.newNames = {L"pris.txt", L"x.txt"};
+        r = run(std::move(m2));
+        CHECK(r && r->created.size() == 1 && r->created[0] == L"x.txt");
+        CHECK(sizeOf(Join(md, L"pris.txt")) == 4 && sizeOf(Join(md, L"a.txt")) == 2 && sizeOf(Join(md, L"x.txt")) == 1);
+        // Aucun nom temporaire ne traîne.
+        int temps = 0;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(Join(md, L"*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do temps += wcsstr(fd.cFileName, L".fe-ren-") != nullptr;
+            while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        CHECK(temps == 0);
+        RemoveTree(md);
+    }
+
     MakeFile(Join(ops, L"f.txt"), 10);
     FileOp cp;
     cp.kind = FileOpKind::Copy;

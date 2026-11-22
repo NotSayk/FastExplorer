@@ -44,6 +44,9 @@ struct FileOp {
     bool newFolder = false;              // dans un nouveau dossier au nom de l'archive (« Extraire tout »)
     bool overwrite = false;              // remplacer ce qui existe (dossier temporaire)
     ThenDo then = ThenDo::Nothing;
+    // Rename de plusieurs éléments : nouveau nom (sans dossier) de chaque élément de paths.
+    std::vector<std::wstring> newNames;
+    bool newFile = false;  // NewFolder : un fichier vide (newName avec son extension) au lieu d'un dossier
 };
 
 struct FileOpResult {
@@ -63,6 +66,8 @@ struct FileOpResult {
     int tag = 0;                        // = FileOp::tag
     std::wstring detail;                // explication d'un échec (« ouvert dans Word »…), sinon vide
     ThenDo then = ThenDo::Nothing;      // = FileOp::then
+    std::vector<std::wstring> renamedFrom;  // Rename multiple : chemins d'origine, parallèles à created
+    bool newFile = false;                   // = FileOp::newFile
 };
 
 // Remet `original` (chemin complet d'avant la suppression) depuis la Corbeille

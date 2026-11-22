@@ -27,7 +27,7 @@ De haut en bas :
 |---|---|---|
 | **Barre d'onglets** (barre de titre) | Onglets, bouton « + », boutons fenêtre | ✅ P1 (barre sous la barre de titre) |
 | **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅ (bouton Actualiser : bloc 10) |
-| **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | P1 |
+| **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | ✅ P1 (bloc 24 : Nouveau ▾ dossier / document texte / autres, Couper, Copier, Coller, Renommer, Supprimer, Trier ▾, Afficher ▾, « ··· » ; boutons grisés selon la sélection, le presse-papiers et l'emplacement) |
 | **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accueil, Accès rapide épinglé, arborescence de Ce PC, Réseau, Corbeille ; Galerie, Linux à venir) |
 | **Zone de contenu** | La liste des éléments | ✅ P0 |
 | **Volet d'aperçu / de détails** (droite) | Aperçu du fichier, ou métadonnées | ✅ P1 |
@@ -195,7 +195,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Ajouter / retirer | Ctrl+clic | ✅ |
 | Plage | Maj+clic, Maj+flèches | ✅ |
 | Tout sélectionner | Ctrl+A | ✅ (natif ListView) |
-| Inverser la sélection | Barre de commandes ▸ « … » | P2 |
+| Inverser la sélection | Barre de commandes ▸ « … » | ✅ (bloc 24 : avec Tout sélectionner, Ne rien sélectionner) |
 | Aucun | Clic dans le vide, barre « … » ▸ Ne rien sélectionner | ✅ |
 | **Rectangle de sélection** (lasso) | Glisser depuis une zone vide | ✅ (natif) |
 | Cases à cocher | Option d'affichage | P2 |
@@ -216,7 +216,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | **Renommer** | F2, clic lent sur un élément sélectionné, bouton | ✅ P0 (F2, clic lent, menu ; un seul élément ; renommage direct `MoveFileEx`, le Shell en cas d'échec : nom pris, fichier ouvert, droits) |
 | Sélection intelligente | À l'édition, seul le nom **sans l'extension** est sélectionné | ✅ P0 |
 | Tab / Maj+Tab pendant le renommage | Valide et passe au fichier suivant / précédent | ✅ (bloc 10 ; touches tapées pendant le changement de saisie gardées) |
-| Renommage multiple | Sélection de N fichiers + F2 : « Vacances (1).jpg », « Vacances (2).jpg »… | P1 |
+| Renommage multiple | Sélection de N fichiers + F2 : « Vacances (1).jpg », « Vacances (2).jpg »… | ✅ P1 (bloc 24 : chacun garde son extension, dossiers sans ; échange de noms possible ; nom déjà pris hors sélection : élément laissé tel quel ; une seule étape d'annulation) |
 | Validation | Caractères interdits `\ / : * ? " < > |` (info-bulle d'erreur), noms réservés (`CON`, `PRN`, `AUX`, `NUL`, `COM1`…`LPT9`), point ou espace final retirés | ✅ P0 (bulle d'erreur, la saisie reste ouverte) |
 | Changement d'extension | Avertissement « Si vous modifiez l'extension… » | ✅ P0 |
 | Renommage par la voix | Saisie vocale dans le champ de renommage (26H2) | P3 |
@@ -282,7 +282,7 @@ comme arrière-plan, Pivoter (images), Monter (ISO/VHD), Graver…
 | Menu sur plusieurs éléments | Commandes communes | ✅ P0 |
 | Menu sur un lecteur | Formater, Éjecter, BitLocker, Propriétés | ✅ (menu du Shell) |
 | Touche Menu / Maj+F10 au clavier | P0 |
-| Notre propre menu rapide (commandes internes) + accès au menu Shell | P1 |
+| Notre propre menu rapide (commandes internes) + accès au menu Shell | ✅ P1 (bloc 24 : affiché en ~20 ms sans gestionnaires du Shell ; « Afficher plus d'options », Maj+clic droit ou Maj+F10 : menu complet, préparé pendant l'ouverture du menu rapide ; « Menu contextuel complet par défaut » dans « ··· ») |
 
 ---
 
@@ -639,7 +639,7 @@ dossiers avant l'index…) :
 21. ✅ **Corbeille et Accueil** : parcourir, restaurer, vider ; page d'Accueil (Accès rapide, récents).
 22. ✅ **Archives** : parcourir un ZIP comme un dossier, extraire tout, compresser.
 23. ✅ **Réseau** : lister les partages d'un serveur (`\\serveur`).
-24. **Barre de commandes et menu rapide** : nos commandes courantes en un clic, accès au menu du Shell,
+24. ✅ **Barre de commandes et menu rapide** : nos commandes courantes en un clic, accès au menu du Shell,
     renommage multiple.
 
 Plus tard, une fois l'interface aboutie : intégration Git (changer de branche) ⭐, onglet WSL ⭐,

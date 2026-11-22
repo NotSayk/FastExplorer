@@ -60,6 +60,7 @@ constexpr UINT WM_APP_RECLAIM = WM_APP + 7;     // reprendre le premier plan au 
 constexpr UINT WM_APP_SHELLNOTIFY = WM_APP + 8; // lecteur ou média ajouté / retiré (SHChangeNotifyRegister)
 constexpr UINT WM_APP_NAV = WM_APP + 9;         // résultat d'une lecture du volet de navigation
 constexpr UINT WM_APP_PASSIVE = WM_APP + 19;    // double panneau : contenu relu du panneau inactif (lParam = DirData*)
+constexpr UINT WM_APP_CMDMENU = WM_APP + 60;  // menu d'un bouton de la barre de commandes
 constexpr UINT WM_APP_SELSUM = WM_APP + 10;     // sélection changée : résumé dans la barre d'état (une fois par rafale)
 constexpr UINT WM_APP_TABEDIT = WM_APP + 11;    // Tab pendant un renommage : renommer l'élément suivant
 constexpr UINT WM_APP_CMDFAIL = WM_APP + 12;    // commande tapée dans la barre d'adresse impossible (lParam = std::wstring*)
@@ -88,7 +89,8 @@ constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-
 // d'événements (copie de milliers de fichiers) et s'espace sur les gros dossiers.
 constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
-enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH, ID_TABS, ID_PANE, ID_LIST2, ID_HDR0, ID_HDR1 };
+enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH, ID_TABS, ID_PANE, ID_LIST2, ID_HDR0, ID_HDR1, ID_CMDBAR,
+       CMD_NEW = 300, CMD_CUT, CMD_COPY, CMD_PASTE, CMD_RENAME, CMD_DELETE, CMD_SORT, CMD_VIEW, CMD_MORE };
 enum class Nav { Normal, Back, Forward, Refresh };
 enum class JobKind { Navigate, Sort };
 
@@ -173,6 +175,9 @@ HWND g_lists[2];
 HWND g_paneHdr[2];             // chemin au-dessus de chaque liste
 int g_side = 0;                // panneau actif : 0 gauche, 1 droite
 bool g_dual = false;
+HWND g_cmdBar;                 // barre de commandes (Nouveau, Couper, Copier…)
+bool g_fullMenu = false;
+void FillCommandBar();       // clic droit : menu complet du Shell plutôt que le menu rapide
 bool g_dualAtStart = false;    // rétabli au premier dossier affiché
 HFONT g_font;
 int g_fontH = 16;
@@ -197,6 +202,7 @@ struct Passive {
 } g_passive;
 std::vector<ColSpec> g_listCols[2];  // colonnes posées sur chaque liste
 void SetDual(bool on);
+void UpdateCommandBar();
 void ReloadPassive();
 std::unordered_map<std::wstring, int> g_iconCache;
 ViewPrefs g_prefs;              // éléments cachés, extensions : réglages de l'Explorateur
@@ -333,6 +339,7 @@ void UpdateButtons() {
     EnableWindow(g_btnBack, !g_back.empty());
     EnableWindow(g_btnFwd, !g_fwd.empty());
     EnableWindow(g_btnUp, HasView() && !g_path.empty());
+    UpdateCommandBar();
 }
 
 // Sous-élément affichant cette colonne (-1 : pas affichée).
@@ -1765,6 +1772,7 @@ void SortView() {
 // changements (Ctrl+A sur 100 000 éléments : un seul parcours).
 void ShowSelectionSummary() {
     g_selPosted = false;
+    UpdateCommandBar();
     if (!HasView()) return SetStatusPart(SB_SEL, L"");
     size_t count = 0;
     bool anyDir = false;
@@ -2076,11 +2084,6 @@ void OnResult(Result* raw) {
     else UpdateColumnsForView();
     RequestSortProps();
     if (Pane_Mode() != PaneMode::None) SetTimer(g_hwnd, TIMER_PANE, 30, nullptr);  // dossier changé, ou fichier modifié
-    if (g_dualAtStart && HasView() && !g_pending.active) {
-        g_dualAtStart = false;
-        SetDual(true);
-    }
-
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
     if (g_path.empty() || IsVirtualPath(g_path) || d.listOnly()) {
         Watch_Stop();
@@ -2150,6 +2153,11 @@ void OnResult(Result* raw) {
             SetFocus(g_list);
             ListView_EditLabel(g_list, row);
         }
+    }
+    // Double panneau de la session précédente : une fois la liste remplie (elle devient le panneau inactif).
+    if (g_dualAtStart && HasView() && !g_pending.active) {
+        g_dualAtStart = false;
+        SetDual(true);
     }
 }
 
@@ -2550,6 +2558,7 @@ struct UndoStep {
     FileOpKind kind = FileOpKind::Copy;
     std::vector<std::wstring> from, to;  // avant / après, chemins complets
     int64_t since = 0;                   // suppression : moment où elle a commencé
+    bool file = false;                   // création : un fichier (pas un dossier)
 };
 std::vector<UndoStep> g_undo, g_redo;
 std::optional<UndoStep> g_undoing;  // annulation en cours
@@ -2580,7 +2589,8 @@ std::wstring StepText(const UndoStep& s) {
                       : std::wstring(what) + L" de " + std::to_wstring(n) + L" éléments";
     };
     switch (s.kind) {
-        case FileOpKind::Rename: return L"renommage de « " + LeafOf(s.from[0]) + L" »";
+        case FileOpKind::Rename:
+            return s.from.size() > 1 ? count(L"renommage") : L"renommage de « " + LeafOf(s.from[0]) + L" »";
         case FileOpKind::NewFolder: return L"création de « " + LeafOf(s.to[0]) + L" »";
         case FileOpKind::Copy: return count(L"copie");
         case FileOpKind::Move: return count(L"déplacement");
@@ -2596,6 +2606,13 @@ bool StepFromResult(const FileOpResult& r, UndoStep& s) {
     const bool ok = SUCCEEDED(r.hr) && !r.aborted;
     switch (r.kind) {
         case FileOpKind::Rename:
+            if (!r.renamedFrom.empty()) {  // plusieurs éléments (même en partie : ceux qui ont changé)
+                for (size_t i = 0; i < r.renamedFrom.size() && i < r.created.size(); ++i) {
+                    s.from.push_back(r.renamedFrom[i]);
+                    s.to.push_back(Join(ParentPath(r.renamedFrom[i]), r.created[i].c_str()));
+                }
+                return true;
+            }
             if (!ok || r.sources.size() != 1 || r.newName.empty()) return false;
             s.from = {r.sources[0]};
             s.to = {Join(ParentPath(r.sources[0]), r.newName.c_str())};
@@ -2603,6 +2620,7 @@ bool StepFromResult(const FileOpResult& r, UndoStep& s) {
         case FileOpKind::NewFolder:
             if (r.created.empty()) return false;
             s.to = {Join(r.folder, r.created[0].c_str())};
+            s.file = r.newFile;
             return true;
         case FileOpKind::Copy:
             if (r.created.empty()) return false;
@@ -2643,13 +2661,22 @@ std::vector<FileOp> OpsFor(const UndoStep& s, bool undo) {
     };
     switch (s.kind) {
         case FileOpKind::Rename: {
+            if (s.from.size() > 1) {  // renommage multiple : une seule opération
+                FileOp* op = add(FileOpKind::Rename, ParentPath(s.from[0]), undo ? s.to : s.from);
+                for (const auto& p : undo ? s.from : s.to) op->newNames.push_back(LeafOf(p));
+                break;
+            }
             const std::wstring& src = undo ? s.to[0] : s.from[0];
             add(FileOpKind::Rename, ParentPath(src), {src})->newName = LeafOf(undo ? s.from[0] : s.to[0]);
             break;
         }
         case FileOpKind::NewFolder:
             if (undo) add(FileOpKind::Delete, ParentPath(s.to[0]), s.to);
-            else add(FileOpKind::NewFolder, ParentPath(s.to[0]), {})->newName = LeafOf(s.to[0]);
+            else {
+                FileOp* op = add(FileOpKind::NewFolder, ParentPath(s.to[0]), {});
+                op->newName = LeafOf(s.to[0]);
+                op->newFile = s.file;
+            }
             break;
         case FileOpKind::Copy:
             if (undo) add(FileOpKind::Delete, ParentPath(s.to[0]), s.to);
@@ -2934,6 +2961,7 @@ void CopyPaths(const std::vector<std::wstring>& names) {
 
 void OnClipboardUpdate() {
     ShellMenu_Discard();  // « Coller » du menu préparé n'est plus à jour
+    UpdateCommandBar();
     if (g_cut.names.empty() || Clipboard_IsOurs()) return;
     g_cut.names.clear();  // le presse-papiers a changé : plus rien n'est « coupé »
     ApplyCutMarks();
@@ -2988,27 +3016,64 @@ void DeleteNames(const std::vector<std::wstring>& names, bool permanent) {
     StartOp(std::move(op));
 }
 
-void NewFolder() {
+void NewFolder(bool file = false) {
     if (!CanModify()) return;
     FileOp op;
     op.kind = FileOpKind::NewFolder;
     op.folder = g_path;
-    op.newName = L"Nouveau dossier";
+    op.newName = file ? L"Nouveau document texte.txt" : L"Nouveau dossier";
+    op.newFile = file;
     StartOp(std::move(op));
 }
+
+// Renommage multiple (F2 sur plusieurs éléments) : noms concernés, dans l'ordre affiché.
+std::vector<std::wstring> g_multiRename;
+bool g_inBeginRename = false;  // la saisie s'ouvre depuis BeginRename (sinon : pas de renommage multiple)
 
 void BeginRename() {
     if (!CanModify()) return;
     int row = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED | LVNI_SELECTED);
     if (row < 0) row = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
     if (row < 0) return;
+    g_multiRename.clear();
+    if (ListView_GetSelectedCount(g_list) > 1)
+        for (int r = -1; (r = ListView_GetNextItem(g_list, r, LVNI_SELECTED)) >= 0;)
+            if (const int e = EntryAt(r); e >= 0) g_multiRename.emplace_back(NameOf(e));
     SetFocus(g_list);
-    ListView_EditLabel(g_list, row);
+    g_inBeginRename = true;
+    const HWND ed = ListView_EditLabel(g_list, row);
+    g_inBeginRename = false;
+    if (!ed) {  // saisie refusée (fenêtre inactive, dossier en cours de lecture)
+        g_multiRename.clear();
+        return;
+    }
+    if (g_multiRename.size() > 1)
+        SetStatus(L"Renommer " + std::to_wstring(g_multiRename.size()) +
+                  L" éléments : « nom (1) », « nom (2) »…   (chacun garde son extension)");
+}
+
+// Noms d'un renommage multiple : « base (1).jpg », « base (2).png »… (dossiers : sans extension).
+// base : texte saisi, sans l'extension de l'élément édité s'il la contenait.
+std::vector<std::wstring> MultiRenameNames(const std::wstring& typed, const std::wstring& edited,
+                                           const std::vector<std::wstring>& names, const std::vector<bool>& dirs) {
+    std::wstring base = typed;
+    const wchar_t* ext = PathFindExtensionW(edited.c_str());
+    const size_t el = wcslen(ext);
+    if (el > 1 && base.size() > el && _wcsicmp(base.c_str() + base.size() - el, ext) == 0) base.resize(base.size() - el);
+    std::vector<std::wstring> out;
+    for (size_t i = 0; i < names.size(); ++i) {
+        const size_t slash = names[i].rfind(L'\\');  // résultat de recherche : le nom seul
+        const std::wstring leaf = slash == std::wstring::npos ? names[i] : names[i].substr(slash + 1);
+        const std::wstring e = dirs[i] ? std::wstring() : std::wstring(PathFindExtensionW(leaf.c_str()));
+        out.push_back(base + L" (" + std::to_wstring(i + 1) + L")" + e);
+    }
+    return out;
 }
 
 BOOL OnBeginLabelEdit(const NMLVDISPINFOW* di) {
     const int idx = EntryAt(di->item.iItem);
     if (!CanModify() || idx < 0 || g_pending.active) return TRUE;  // refusé
+    if (!g_inBeginRename) g_multiRename.clear();  // nouveau dossier, clic sur le nom : un seul élément
     g_editing = true;
     g_editName = NameOf(idx);
     const Entry& e = E(idx);
@@ -3094,8 +3159,51 @@ void OnEndLabelEdit(const NMLVDISPINFOW* di) {
     const std::wstring next = std::move(g_tabNext);
     g_tabNext.clear();
     g_editName.clear();
-    if (!di->item.pszText || old.empty()) return;  // Échap
+    std::vector<std::wstring> multi = std::move(g_multiRename);
+    g_multiRename.clear();
+    if (!di->item.pszText || old.empty()) {  // Échap
+        if (multi.size() > 1) ShowSummary();
+        return;
+    }
     const std::wstring typed = di->item.pszText;
+    if (multi.size() > 1) {  // F2 sur plusieurs éléments : tous renommés d'après ce nom
+        const std::wstring base = CleanFileName(typed);
+        if (base == old || base + g_editExt == old) {  // validé sans changement : rien à renommer
+            ShowSummary();
+            return;
+        }
+        if (const wchar_t* err = FileNameError(base.empty() ? std::wstring() : base + L" (1)")) {
+            g_reedit = Reedit{old, typed, err};
+            g_multiRename = std::move(multi);  // la saisie rouverte reste un renommage multiple
+            PostMessageW(g_hwnd, WM_APP_REEDIT, 0, 0);
+            return;
+        }
+        std::vector<bool> dirs;
+        FileOp op;
+        op.kind = FileOpKind::Rename;
+        op.folder = g_path;
+        std::vector<std::wstring> kept;
+        for (const auto& n : multi) {
+            const int e = FindEntryByName(n);
+            if (e < 0) continue;  // disparu entre-temps
+            kept.push_back(n);
+            dirs.push_back(E(e).isDir());
+            op.paths.push_back(Join(g_path, n.c_str()));
+        }
+        // L'élément édité en premier, puis les autres dans l'ordre affiché (comme l'Explorateur).
+        if (auto it = std::find(kept.begin(), kept.end(), old); it != kept.end()) {
+            const size_t k = (size_t)(it - kept.begin());
+            std::rotate(kept.begin(), kept.begin() + (ptrdiff_t)k, kept.begin() + (ptrdiff_t)k + 1);
+            std::rotate(op.paths.begin(), op.paths.begin() + (ptrdiff_t)k, op.paths.begin() + (ptrdiff_t)k + 1);
+            const bool d = dirs[k];
+            dirs.erase(dirs.begin() + (ptrdiff_t)k);
+            dirs.insert(dirs.begin(), d);
+        }
+        if (kept.empty()) return;
+        op.newNames = MultiRenameNames(base, old, kept, dirs);
+        StartOp(std::move(op));
+        return;
+    }
     std::wstring name = CleanFileName(typed);
     if (!name.empty() && !g_editExt.empty()) name += g_editExt;  // extension masquée : conservée
     const size_t slash = old.rfind(L'\\');  // résultat de recherche : seul le nom change
@@ -3935,6 +4043,10 @@ void ShowArchiveMenu(POINT pt, const std::vector<int>& sel) {
     }
 }
 
+bool QuickMenuApplies(bool shift);
+void ShowQuickMenu(POINT pt, const std::vector<int>& sel);
+void ShowFullMenu(POINT pt, std::vector<int> sel);
+
 void ShowContextMenu(LPARAM lp) {
     if (!HasView()) return;
     POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -3960,6 +4072,15 @@ void ShowContextMenu(LPARAM lp) {
         ShowArchiveMenu(pt, sel);
         return;
     }
+    if (QuickMenuApplies(GetKeyState(VK_SHIFT) < 0)) {
+        ShowQuickMenu(pt, sel);
+        return;
+    }
+    ShowFullMenu(pt, sel);
+}
+
+// Menu complet du Shell (extensions comprises), précédé de nos commandes.
+void ShowFullMenu(POINT pt, std::vector<int> sel) {
     // Les noms (et non des index) : la vue peut être rafraîchie pendant que le menu est ouvert.
     const std::vector<std::wstring> names = NamesOf(sel);
     std::vector<MenuExtra> extras;
@@ -4109,6 +4230,357 @@ void ShowProperties() {
         names.push_back(child);
     }
     if (!ShellMenu_Invoke(g_hwnd, folder, names, "properties")) SetStatus(L"Propriétés indisponibles.");
+}
+
+// ───────────────────────────── Barre de commandes, menu rapide ─────────────────────────────
+// Les commandes courantes en un clic, comme la barre de l'Explorateur de
+// Windows 11. Le menu contextuel « rapide » ne contient que nos commandes :
+// il s'affiche sans attendre les gestionnaires du Shell ; « Afficher plus
+// d'options » (ou Maj+clic droit, Maj+F10) ouvre le menu complet du Shell.
+
+// Menu de nos seules commandes. Séparateur : texte vide.
+void ShowOwnMenu(const std::vector<MenuExtra>& items, POINT pt, UINT flags = TPM_RIGHTBUTTON) {
+    std::vector<const MenuExtra*> flat;
+    std::function<void(HMENU, const std::vector<MenuExtra>&)> add = [&](HMENU m, const std::vector<MenuExtra>& v) {
+        for (const MenuExtra& x : v) {
+            if (x.text.empty()) {
+                if (GetMenuItemCount(m) > 0) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+                continue;
+            }
+            const UINT f = MF_STRING | (x.checked ? MF_CHECKED : 0) | (x.disabled ? MF_GRAYED : 0);
+            if (!x.sub.empty()) {
+                HMENU s = CreatePopupMenu();
+                add(s, x.sub);
+                AppendMenuW(m, f | MF_POPUP, (UINT_PTR)s, x.text.c_str());
+                continue;
+            }
+            flat.push_back(&x);
+            AppendMenuW(m, f, flat.size(), x.text.c_str());
+            if (x.isDefault) SetMenuDefaultItem(m, (UINT)flat.size(), FALSE);
+        }
+    };
+    HMENU m = CreatePopupMenu();
+    add(m, items);
+    const UINT cmd = (UINT)TrackPopupMenuEx(m, TPM_RETURNCMD | flags, pt.x, pt.y, g_hwnd, nullptr);
+    DestroyMenu(m);
+    if (cmd && cmd <= flat.size() && flat[cmd - 1]->run) flat[cmd - 1]->run();
+}
+
+bool ClipboardHasFiles() {
+    static const UINT idList = RegisterClipboardFormatW(CFSTR_SHELLIDLIST);
+    return IsClipboardFormatAvailable(CF_HDROP) || IsClipboardFormatAvailable(idList);
+}
+
+bool InNet() { return HasView() && (g_view.data->path == kNetPath || g_view.data->server); }
+
+// Ouvre un terminal dans le dossier : Windows Terminal, sinon PowerShell.
+void OpenTerminal(const std::wstring& dir) {
+    if (dir.empty() || InVirtual() || InNet()) return;
+    wchar_t found[MAX_PATH];
+    if (SearchPathW(nullptr, L"wt.exe", nullptr, MAX_PATH, found, nullptr)) {
+        std::wstring d = dir;
+        if (d.back() == L'\\') d += L'.';  // « "C:\" » : le \ final échapperait le guillemet
+        RunCommand(L"wt.exe -d \"" + d + L"\"", dir);
+    } else {
+        RunCommand(L"powershell.exe -NoExit", dir);
+    }
+}
+
+void InvertSelection() {
+    if (!HasView()) return;
+    const int n = RowCount();
+    std::vector<uint8_t> was(n, 0);
+    for (int r = -1; (r = ListView_GetNextItem(g_list, r, LVNI_SELECTED)) >= 0;)
+        if (r < n) was[r] = 1;
+    ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED);
+    for (int r = 0; r < n; ++r)
+        if (!was[r]) ListView_SetItemState(g_list, r, LVIS_SELECTED, LVIS_SELECTED);
+    ScheduleSelectionSummary();
+}
+
+void SetFullMenu(bool on) {
+    g_fullMenu = on;
+    const DWORD v = on ? 1 : 0;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"FullMenu", REG_DWORD, &v, sizeof v);
+    ShellMenu_Discard();
+}
+
+MenuExtra NewMenu() {
+    const bool can = CanModify();
+    MenuExtra m;
+    m.text = L"Nouveau";
+    m.sub = {{L"Dossier\tCtrl+Maj+N", [] { NewFolder(); }, false, false, {}, !can},
+             {L"Document texte", [] { NewFolder(true); }, false, false, {}, !can},
+             {},
+             {L"Autres éléments…", [] {  // le sous-menu « Nouveau ▸ » du Shell (Word, raccourci…)
+                  POINT pt;
+                  GetCursorPos(&pt);
+                  ShowFullMenu(pt, {});
+              }, false, false, {}, !can}};
+    return m;
+}
+
+MenuExtra SortMenu() {
+    MenuExtra m;
+    m.text = L"Trier par";
+    for (const ColSpec& c : g_cols) {
+        const ColSpec col = c;
+        m.sub.push_back({col.title, [col] {
+                             if (!SameCol(col, g_sort)) Resort(col);
+                         }, false, SameCol(col, g_sort)});
+    }
+    m.sub.push_back({});
+    m.sub.push_back({L"Croissant", [] { if (!g_sortAsc) Resort(g_sort); }, false, g_sortAsc});
+    m.sub.push_back({L"Décroissant", [] { if (g_sortAsc) Resort(g_sort); }, false, !g_sortAsc});
+    return m;
+}
+
+std::vector<MenuExtra> DisplayItems() {
+    std::vector<MenuExtra> v = ViewMenu().sub;
+    v.push_back({});
+    v.push_back({L"Éléments masqués\tCtrl+H", ToggleHidden, false, g_prefs.showHidden});
+    v.push_back({L"Extensions de noms de fichiers", ToggleExtensions, false, g_prefs.showExtensions});
+    return v;
+}
+
+std::vector<MenuExtra> MoreItems() {
+    const bool view = HasView();
+    std::vector<MenuExtra> v;
+    v.push_back({L"Tout sélectionner\tCtrl+A", [] { ListView_SetItemState(g_list, -1, LVIS_SELECTED, LVIS_SELECTED); },
+                 false, false, {}, !view});
+    v.push_back({L"Ne rien sélectionner", [] { ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED); }, false, false, {},
+                 !view});
+    v.push_back({L"Inverser la sélection", InvertSelection, false, false, {}, !view});
+    v.push_back({});
+    v.push_back({g_undo.empty() ? std::wstring(L"Annuler\tCtrl+Z") : L"Annuler " + StepText(g_undo.back()) + L"\tCtrl+Z",
+                 Undo, false, false, {}, g_undo.empty()});
+    v.push_back({g_redo.empty() ? std::wstring(L"Rétablir\tCtrl+Y") : L"Rétablir " + StepText(g_redo.back()) + L"\tCtrl+Y",
+                 Redo, false, false, {}, g_redo.empty()});
+    v.push_back({});
+    v.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C",
+                 [] { CopyPaths(NamesOf(SelectedEntries())); }, false, false, {}, !view || g_path.empty()});
+    v.push_back({L"Ouvrir dans le Terminal", [] { OpenTerminal(g_path); }, false, false, {},
+                 !view || g_path.empty() || InVirtual() || InNet()});
+    v.push_back({L"Propriétés\tAlt+Entrée", ShowProperties, false, false, {}, !view});
+    v.push_back({});
+    v.push_back({L"Menu contextuel complet par défaut", [] { SetFullMenu(!g_fullMenu); }, false, g_fullMenu});
+    return v;
+}
+
+// Boutons de la barre : identifiant, texte, info-bulle, menu déroulant.
+struct CmdButton {
+    int id;
+    const wchar_t* text;
+    const wchar_t* tip;
+    bool dropdown;
+};
+constexpr CmdButton kCmdButtons[] = {
+    {CMD_NEW, L"Nouveau", L"Nouveau dossier ou document", true},
+    {0, nullptr, nullptr, false},
+    {CMD_CUT, L"Couper", L"Couper (Ctrl+X)", false},
+    {CMD_COPY, L"Copier", L"Copier (Ctrl+C)", false},
+    {CMD_PASTE, L"Coller", L"Coller (Ctrl+V)", false},
+    {CMD_RENAME, L"Renommer", L"Renommer (F2) ; plusieurs éléments : « nom (1) », « nom (2) »…", false},
+    {CMD_DELETE, L"Supprimer", L"Supprimer (Suppr) ; Maj+Suppr : définitivement", false},
+    {0, nullptr, nullptr, false},
+    {CMD_SORT, L"Trier", L"Trier les éléments", true},
+    {CMD_VIEW, L"Afficher", L"Disposition et options d'affichage", true},
+    {CMD_MORE, L"···", L"Voir plus", true},
+};
+
+void UpdateCommandBar();
+
+void CreateCommandBar(HWND parent) {
+    g_cmdBar = CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr,
+                               WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_LIST | TBSTYLE_TOOLTIPS | CCS_NORESIZE |
+                                   CCS_NODIVIDER | CCS_NOPARENTALIGN,
+                               0, 0, 0, 0, parent, (HMENU)(INT_PTR)ID_CMDBAR, g_inst, nullptr);
+    SendMessageW(g_cmdBar, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
+    SendMessageW(g_cmdBar, TB_SETEXTENDEDSTYLE, 0, TBSTYLE_EX_DRAWDDARROWS | TBSTYLE_EX_HIDECLIPPEDBUTTONS);
+    SendMessageW(g_cmdBar, TB_SETIMAGELIST, 0, 0);  // texte seul
+}
+
+// (Re)crée les boutons : leur largeur se calcule avec la police du moment.
+void FillCommandBar() {
+    if (!g_cmdBar) return;
+    while (SendMessageW(g_cmdBar, TB_DELETEBUTTON, 0, 0)) {}
+    std::vector<TBBUTTON> b;
+    for (const CmdButton& c : kCmdButtons) {
+        TBBUTTON t{};
+        if (!c.id) {
+            t.fsStyle = BTNS_SEP;
+            t.iBitmap = S(8);
+        } else {
+            t.iBitmap = I_IMAGENONE;
+            t.idCommand = c.id;
+            t.fsState = TBSTATE_ENABLED;
+            t.fsStyle = BTNS_BUTTON | BTNS_SHOWTEXT | (c.dropdown ? BTNS_WHOLEDROPDOWN : 0);
+            t.iString = (INT_PTR)c.text;
+        }
+        b.push_back(t);
+    }
+    SendMessageW(g_cmdBar, TB_ADDBUTTONSW, b.size(), (LPARAM)b.data());
+    // Largeurs mesurées avec notre police (la mesure du contrôle tronque les libellés).
+    if (HDC dc = GetDC(g_cmdBar)) {
+        HGDIOBJ old = SelectObject(dc, g_font);
+        for (const CmdButton& c : kCmdButtons) {
+            if (!c.id) continue;
+            SIZE sz{};
+            GetTextExtentPoint32W(dc, c.text, (int)wcslen(c.text), &sz);
+            TBBUTTONINFOW bi{sizeof bi};
+            bi.dwMask = TBIF_SIZE;
+            bi.cx = (WORD)(sz.cx + S(18) + (c.dropdown ? S(14) : 0));
+            SendMessageW(g_cmdBar, TB_SETBUTTONINFOW, c.id, (LPARAM)&bi);
+        }
+        SelectObject(dc, old);
+        ReleaseDC(g_cmdBar, dc);
+    }
+    SendMessageW(g_cmdBar, TB_AUTOSIZE, 0, 0);
+    UpdateCommandBar();
+}
+
+// Grise ce qui ne s'applique pas ici (sélection, presse-papiers, emplacement).
+void UpdateCommandBar() {
+    if (!g_cmdBar) return;
+    const bool sel = HasView() && ListView_GetSelectedCount(g_list) > 0;
+    const bool mod = CanModify();
+    auto on = [](int id, bool e) { SendMessageW(g_cmdBar, TB_ENABLEBUTTON, id, MAKELONG(e ? TRUE : FALSE, 0)); };
+    on(CMD_NEW, mod);
+    on(CMD_CUT, sel && mod);
+    on(CMD_COPY, sel && !InNet());
+    on(CMD_PASTE, mod && ClipboardHasFiles());
+    on(CMD_RENAME, sel && mod);
+    on(CMD_DELETE, sel && (mod || InBin() || (HasView() && g_view.data->path == kNetPath)));
+    on(CMD_SORT, HasView());
+    on(CMD_VIEW, true);
+    on(CMD_MORE, true);
+}
+
+int CommandBarHeight() {
+    if (!g_cmdBar) return 0;
+    const DWORD sz = (DWORD)SendMessageW(g_cmdBar, TB_GETBUTTONSIZE, 0, 0);
+    return std::max<int>(HIWORD(sz), g_fontH + S(10));
+}
+
+// Clic sur un bouton de la barre.
+bool OnCommandBar(int id) {
+    switch (id) {
+        case CMD_CUT: CopyNames(NamesOf(SelectedEntries()), true); break;
+        case CMD_COPY: CopyNames(NamesOf(SelectedEntries()), false); break;
+        case CMD_PASTE: Paste(g_path); break;
+        case CMD_RENAME: BeginRename(); break;
+        case CMD_DELETE: DeleteNames(NamesOf(SelectedEntries()), GetKeyState(VK_SHIFT) < 0); break;
+        default: return false;
+    }
+    return true;
+}
+
+// Bouton à menu : le menu s'ouvre sous le bouton.
+void OnCommandDropdown(int id) {
+    RECT r{};
+    SendMessageW(g_cmdBar, TB_GETRECT, id, (LPARAM)&r);
+    MapWindowPoints(g_cmdBar, nullptr, (POINT*)&r, 2);
+    const POINT pt{r.left, r.bottom};
+    std::vector<MenuExtra> items;
+    switch (id) {
+        case CMD_NEW: items = NewMenu().sub; break;
+        case CMD_SORT: items = SortMenu().sub; break;
+        case CMD_VIEW: items = DisplayItems(); break;
+        case CMD_MORE: items = MoreItems(); break;
+        default: return;
+    }
+    SendMessageW(g_cmdBar, TB_PRESSBUTTON, id, MAKELONG(TRUE, 0));
+    ShowOwnMenu(items, pt, TPM_LEFTALIGN | TPM_TOPALIGN);
+    if (IsWindow(g_cmdBar)) SendMessageW(g_cmdBar, TB_PRESSBUTTON, id, MAKELONG(FALSE, 0));
+    if (GetFocus() != g_addr && GetFocus() != g_searchBox) SetFocus(g_list);
+}
+
+const wchar_t* CommandTip(int id) {
+    for (const CmdButton& c : kCmdButtons)
+        if (c.id == id) return c.tip;
+    return nullptr;
+}
+
+// Le menu rapide s'applique-t-il ? (dossier ordinaire, sans Maj, réglage par défaut)
+bool QuickMenuApplies(bool shift) {
+    return !shift && !g_fullMenu && HasView() && !g_path.empty() && !g_view.data->isRoot() && !InVirtual() &&
+           !g_view.data->listOnly() && g_query.empty();
+}
+
+void ShowQuickMenu(POINT pt, const std::vector<int>& sel) {
+    const std::vector<std::wstring> names = NamesOf(sel);
+    const bool mod = CanModify(), clip = ClipboardHasFiles();
+    std::vector<MenuExtra> v;
+    auto more = [names, pt] { ShowFullMenu(pt, FindEntriesByNames(names)); };
+    if (sel.empty()) {  // fond du dossier
+        MenuExtra view = ViewMenu();
+        view.text = L"Affichage";
+        v.push_back(view);
+        v.push_back(SortMenu());
+        v.push_back({L"Actualiser\tF5", [] { g_forceSizes = true; Refresh(); }});
+        v.push_back({});
+        v.push_back({L"Coller\tCtrl+V", [] { Paste(g_path); }, false, false, {}, !mod || !clip});
+        if (!g_undo.empty()) v.push_back({L"Annuler " + StepText(g_undo.back()) + L"\tCtrl+Z", Undo});
+        if (!g_redo.empty()) v.push_back({L"Rétablir " + StepText(g_redo.back()) + L"\tCtrl+Y", Redo});
+        v.push_back(NewMenu());
+        v.push_back({});
+        v.push_back({L"Ouvrir dans le Terminal", [] { OpenTerminal(g_path); }});
+        v.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C", [] { CopyPaths({}); }});
+        for (auto& x : PinExtras(g_path, false)) v.push_back(std::move(x));
+        v.push_back({L"Propriétés\tAlt+Entrée", ShowProperties});
+    } else {
+        const int single = sel.size() == 1 ? sel[0] : -1;
+        const bool dir = single >= 0 && E(single).isDir();
+        v.push_back({L"Ouvrir", [names] {
+                         const auto es = FindEntriesByNames(names);
+                         if (es.size() == 1) ActivateEntry(es[0]);
+                         else
+                             for (int e : es)
+                                 if (!E(e).isDir()) OpenWithShell(FullPath(e));
+                     }, false, false, {}, false, true});
+        if (dir) {
+            const std::wstring path = FullPath(single);
+            v.push_back({L"Ouvrir dans un nouvel onglet", [path] { NewTab(path, true); }});
+            v.push_back({L"Ouvrir dans une nouvelle fenêtre", [path] { NewWindow(path); }});
+            v.push_back({L"Ouvrir dans le Terminal", [path] { OpenTerminal(path); }});
+        } else if (single >= 0) {
+            const std::wstring here = g_path, name = names[0];
+            v.push_back({L"Ouvrir avec…", [here, name] {
+                             if (!ShellMenu_Invoke(g_hwnd, here, {name}, "openas")) SetStatus(L"« Ouvrir avec » indisponible.");
+                         }});
+        }
+        v.push_back({});
+        v.push_back({L"Couper\tCtrl+X", [names] { CopyNames(names, true); }, false, false, {}, !mod});
+        v.push_back({L"Copier\tCtrl+C", [names] { CopyNames(names, false); }});
+        if (dir) {
+            const std::wstring path = FullPath(single);
+            v.push_back({L"Coller dans ce dossier", [path] { Paste(path); }, false, false, {}, !mod || !clip});
+        }
+        v.push_back({names.size() > 1 ? L"Renommer tout\tF2" : L"Renommer\tF2", [] { BeginRename(); }, false, false, {},
+                     !mod});
+        v.push_back({L"Supprimer\tSuppr", [names] { DeleteNames(names, GetKeyState(VK_SHIFT) < 0); }, false, false, {},
+                     !mod});
+        v.push_back({});
+        v.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C", [names] { CopyPaths(names); }});
+        if (single >= 0 && !dir && Archive_IsArchive(names[0])) {
+            const std::wstring arc = FullPath(single), here = g_path;
+            v.push_back({L"Extraire tout", [arc, here] { ExtractArchive(arc, here, true, ThenDo::Nothing); }});
+            v.push_back({L"Extraire vers…", [arc, here] {
+                             const std::wstring to = PickFolder(here, L"Extraire vers");
+                             if (!to.empty()) ExtractArchive(arc, to, false, ThenDo::Nothing);
+                         }});
+        }
+        v.push_back({L"Compresser dans un fichier ZIP", [names] { CompressEntries(FindEntriesByNames(names)); }, false,
+                     false, {}, !mod});
+        if (dir)
+            for (auto& x : PinExtras(FullPath(single), false)) v.push_back(std::move(x));
+        v.push_back({L"Propriétés\tAlt+Entrée", ShowProperties});
+    }
+    v.push_back({});
+    v.push_back({L"Afficher plus d'options\tMaj+F10", more});
+    ShellMenu_Prepare(g_hwnd, g_path, names, false);  // « Afficher plus d'options » : prêt d'avance
+    ShowOwnMenu(v, pt);
+    SetTimer(g_hwnd, TIMER_PINNED, 800, nullptr);
 }
 
 void OnIcon(IconResult* raw) {
@@ -4317,8 +4789,9 @@ void ApplyFont() {
         ReleaseDC(g_hwnd, dc);
     }
     for (HWND h : {g_lists[0], g_lists[1], g_paneHdr[0], g_paneHdr[1], g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp,
-                   g_btnRefresh, g_nav, g_crumbs, g_searchBox, g_tabBar, g_pane})
+                   g_btnRefresh, g_nav, g_crumbs, g_searchBox, g_tabBar, g_pane, g_cmdBar})
         SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
+    FillCommandBar();  // boutons à la taille du texte
 }
 
 // Liste d'icônes système la plus proche de 16 px × échelle de l'écran courant.
@@ -4376,7 +4849,10 @@ void Layout() {
     place(g_crumbs, x, y0 + (h - editH) / 2, addrW, editH);  // même place
     place(g_btnRefresh, x + addrW + S(2), y0, bw, h);  // Actualiser, à droite de l'adresse comme l'Explorateur
     place(g_searchBox, (int)rc.right - m - searchW, y0 + (h - editH) / 2, searchW, editH);
-    const int top = y0 + h + m;
+    // Barre de commandes sous l'adresse.
+    const int cmdY = y0 + h + S(3), cmdH = CommandBarHeight();
+    if (g_cmdBar) place(g_cmdBar, m, cmdY, std::max(0, (int)rc.right - 2 * m), cmdH);
+    const int top = cmdY + cmdH + S(3);
     const int bodyH = std::max(0, (int)rc.bottom - top - statusH);
     // Volet de navigation, séparateur (déplaçable à la souris), liste.
     const int split = S(5);
@@ -4436,6 +4912,8 @@ void CreateChildren(HWND hwnd) {
     g_btnFwd = btn(L"→", ID_FWD);
     g_btnUp = btn(L"↑", ID_UP);
     g_btnRefresh = btn(L"↻", ID_REFRESH);
+    CreateCommandBar(hwnd);
+    g_fullMenu = RegDword(L"Software\\FastExplorer", L"FullMenu", 0) != 0;
 
     // Zone de saisie cachée : le fil d'Ariane occupe sa place, sauf pendant la saisie.
     g_addr = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
@@ -4705,6 +5183,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case ID_FWD: GoForward(); SetFocus(g_list); return 0;
                 case ID_UP: GoUp(); SetFocus(g_list); return 0;
                 case ID_REFRESH: g_forceSizes = true; Refresh(); SetFocus(g_list); return 0;
+                case CMD_CUT: case CMD_COPY: case CMD_PASTE: case CMD_RENAME: case CMD_DELETE:
+                    OnCommandBar(LOWORD(wp));
+                    if (LOWORD(wp) != CMD_RENAME) SetFocus(g_list);
+                    return 0;
                 case ID_ADDR:
                     if (HIWORD(wp) == EN_KILLFOCUS) EndAddressEdit();
                     return 0;
@@ -4718,6 +5200,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (LRESULT r = 0; NavPane_Notify(hdr, &r)) return r;
             if (hdr->hwndFrom == g_status && hdr->code == NM_CLICK && FileOps_Running() > 0) {  // clic sur la progression
                 CopyQueue_Show(hwnd);
+                return 0;
+            }
+            if (g_cmdBar && hdr->hwndFrom == g_cmdBar) {
+                if (hdr->code == TBN_DROPDOWN) {
+                    const int id = ((NMTOOLBARW*)lp)->iItem;
+                    PostMessageW(hwnd, WM_APP_CMDMENU, id, 0);  // après le relâchement du bouton
+                    return TBDDRET_DEFAULT;
+                }
+                if (hdr->code == TBN_GETINFOTIPW) {
+                    auto* tip = (NMTBGETINFOTIPW*)lp;
+                    if (const wchar_t* s = CommandTip(tip->iItem); s && tip->pszText && tip->cchTextMax > 0)
+                        wcsncpy_s(tip->pszText, tip->cchTextMax, s, _TRUNCATE);
+                    return 0;
+                }
                 return 0;
             }
             if (hdr->hwndFrom == g_tabBar) {
@@ -4783,6 +5279,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_APP_RESULT: OnResult((Result*)lp); return 0;
         case WM_APP_SELSUM: ShowSelectionSummary(); return 0;
+        case WM_APP_CMDMENU: OnCommandDropdown((int)wp); return 0;
         case WM_APP_PASSIVE: OnPassiveData((DirData*)lp); return 0;
         case WM_CTLCOLORSTATIC:  // chemins du double panneau : celui du panneau actif en surbrillance
             for (int s = 0; s < 2; ++s)

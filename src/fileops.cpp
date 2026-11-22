@@ -208,14 +208,29 @@ bool SameItem(IShellItem* a, IShellItem* b) {
 // « Nouveau dossier (2) »… ; IFileOperation seulement si l'accès est refusé
 // (dossier protégé : il propose l'élévation UAC).
 HRESULT NewFolder(const FileOp& op, HWND owner, FileOpResult& r) {
+    // Fichier : le numéro va avant l'extension (« Nouveau document texte (2).txt »).
+    const size_t dot = op.newFile ? op.newName.rfind(L'.') : std::wstring::npos;
+    const std::wstring stem = dot == std::wstring::npos || dot == 0 ? op.newName : op.newName.substr(0, dot);
+    const std::wstring ext = stem.size() == op.newName.size() ? L"" : op.newName.substr(dot);
     for (int i = 1; i < 10000; ++i) {
-        const std::wstring name = i == 1 ? op.newName : op.newName + L" (" + std::to_wstring(i) + L")";
-        if (CreateDirectoryW(ToNtPath(Join(op.folder, name.c_str())).c_str(), nullptr)) {
+        const std::wstring name = i == 1 ? op.newName : stem + L" (" + std::to_wstring(i) + L")" + ext;
+        const std::wstring nt = ToNtPath(Join(op.folder, name.c_str()));
+        bool made = false;
+        if (op.newFile) {
+            HANDLE h = CreateFileW(nt.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            made = h != INVALID_HANDLE_VALUE;
+            if (made) CloseHandle(h);
+        } else {
+            made = CreateDirectoryW(nt.c_str(), nullptr) != FALSE;
+        }
+        if (made) {
             r.created.push_back(name);
+            SHChangeNotify(op.newFile ? SHCNE_CREATE : SHCNE_MKDIR, SHCNF_PATHW, Join(op.folder, name.c_str()).c_str(),
+                           nullptr);
             return S_OK;
         }
         const DWORD e = GetLastError();
-        if (e == ERROR_ALREADY_EXISTS) continue;
+        if (e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS) continue;
         if (e != ERROR_ACCESS_DENIED) return HRESULT_FROM_WIN32(e);
         ComPtr<IFileOperation> fo;
         ComPtr<IShellItem> dest = ItemFromPath(op.folder);
@@ -223,7 +238,7 @@ HRESULT NewFolder(const FileOp& op, HWND owner, FileOpResult& r) {
             return HRESULT_FROM_WIN32(e);
         if (owner) fo->SetOwnerWindow(owner);
         Sink* sink = new Sink(dest.Get(), &r.created);
-        fo->NewItem(dest.Get(), FILE_ATTRIBUTE_DIRECTORY, name.c_str(), nullptr, sink);
+        fo->NewItem(dest.Get(), op.newFile ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_DIRECTORY, name.c_str(), nullptr, sink);
         sink->Release();
         const HRESULT hr = fo->PerformOperations();
         BOOL ab = FALSE;
@@ -253,6 +268,64 @@ bool TryFastRename(const FileOp& op, FileOpResult& r) {
     SHChangeNotify((attr & FILE_ATTRIBUTE_DIRECTORY) ? SHCNE_RENAMEFOLDER : SHCNE_RENAMEITEM,
                    SHCNF_PATHW | SHCNF_FLUSHNOWAIT, src.c_str(), dst.c_str());
     return true;
+}
+
+// Renommage de plusieurs éléments (chacun dans son dossier). En deux temps,
+// par des noms provisoires : « a » → « b » et « b » → « a » fonctionnent. Un
+// nom déjà pris par un autre élément (hors sélection) laisse cet élément tel quel.
+HRESULT RenameMany(const FileOp& op, FileOpResult& r) {
+    const size_t n = op.paths.size();
+    if (op.newNames.size() != n) return E_INVALIDARG;
+    struct Item {
+        std::wstring src, dst, tmp, dir;
+        bool active = false, moved = false;
+    };
+    std::vector<Item> items(n);
+    std::vector<std::wstring> srcLower(n);
+    for (size_t i = 0; i < n; ++i) {
+        srcLower[i] = op.paths[i];
+        CharLowerBuffW(srcLower[i].data(), (DWORD)srcLower[i].size());
+    }
+    DWORD first = 0;
+    const DWORD tick = GetTickCount();
+    for (size_t i = 0; i < n; ++i) {
+        Item& it = items[i];
+        it.src = op.paths[i];
+        std::wstring leaf;
+        if (!ParentOf(it.src, it.dir, leaf) || op.newNames[i].empty()) continue;
+        it.dst = Join(it.dir, op.newNames[i].c_str());
+        if (it.dst == it.src) continue;  // rien à faire
+        std::wstring dl = it.dst;
+        CharLowerBuffW(dl.data(), (DWORD)dl.size());
+        const bool sameItem = dl == srcLower[i];  // seule la casse change
+        const bool inSel = std::find(srcLower.begin(), srcLower.end(), dl) != srcLower.end();
+        if (!sameItem && !inSel && GetFileAttributesW(ToNtPath(it.dst).c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (!first) first = ERROR_ALREADY_EXISTS;
+            continue;
+        }
+        it.tmp = Join(it.dir, (L".fe-ren-" + std::to_wstring(tick) + L"-" + std::to_wstring(i)).c_str());
+        it.active = true;
+    }
+    for (Item& it : items) {  // 1. noms provisoires
+        if (!it.active) continue;
+        if (MoveFileExW(ToNtPath(it.src).c_str(), ToNtPath(it.tmp).c_str(), 0)) it.moved = true;
+        else if (!first) first = GetLastError();
+    }
+    for (size_t i = 0; i < n; ++i) {  // 2. noms définitifs (échec : retour au nom d'origine)
+        Item& it = items[i];
+        if (!it.moved) continue;
+        if (MoveFileExW(ToNtPath(it.tmp).c_str(), ToNtPath(it.dst).c_str(), 0)) {
+            r.created.push_back(op.newNames[i]);
+            r.renamedFrom.push_back(it.src);
+            const DWORD a = GetFileAttributesW(ToNtPath(it.dst).c_str());
+            SHChangeNotify(a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) ? SHCNE_RENAMEFOLDER : SHCNE_RENAMEITEM,
+                           SHCNF_PATHW | SHCNF_FLUSHNOWAIT, it.src.c_str(), it.dst.c_str());
+        } else {
+            if (!first) first = GetLastError();
+            MoveFileExW(ToNtPath(it.tmp).c_str(), ToNtPath(it.src).c_str(), 0);
+        }
+    }
+    return first ? HRESULT_FROM_WIN32(first) : S_OK;
 }
 
 // Annuler une suppression : chaque élément revient de la Corbeille.
@@ -371,6 +444,7 @@ HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r, Job* job) {
         const HRESULT hr = SHEmptyRecycleBinW(owner, nullptr, op.silent ? SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND : 0);
         return hr == E_UNEXPECTED ? S_OK : hr;  // Corbeille déjà vide
     }
+    if (op.kind == FileOpKind::Rename && !op.newNames.empty()) return RenameMany(op, r);
     if (op.kind == FileOpKind::Rename && TryFastRename(op, r)) return S_OK;
 
     HRESULT hr = S_OK;
@@ -510,6 +584,7 @@ DWORD WINAPI Run(void* p) {
     r->clipSeq = t->op.clipSeq;
     r->newName = t->op.newName;
     r->permanent = t->op.permanent;
+    r->newFile = t->op.newFile;
     r->tag = t->op.tag;
     r->then = t->op.then;
     FILETIME now;

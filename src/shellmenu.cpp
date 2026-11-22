@@ -477,12 +477,13 @@ void AddExtras(HMENU menu, const std::vector<MenuExtra>& extras, bool shell) {
             HMENU sub = CreatePopupMenu();
             for (size_t j = 0; j < x.sub.size() && j < kSubStride; ++j)
                 if (x.sub[j].text.empty()) AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
-                else AppendMenuW(sub, MF_STRING | (x.sub[j].checked ? MF_CHECKED : 0),
+                else AppendMenuW(sub, MF_STRING | (x.sub[j].checked ? MF_CHECKED : 0) | (x.sub[j].disabled ? MF_GRAYED : 0),
                             kExtraFirst + ((UINT)i + 1) * kSubStride + (UINT)j, x.sub[j].text.c_str());
             InsertMenuW(menu, pos++, MF_BYPOSITION | MF_POPUP, (UINT_PTR)sub, x.text.c_str());
             continue;
         }
-        InsertMenuW(menu, pos++, MF_BYPOSITION | MF_STRING | (x.checked ? MF_CHECKED : 0), kExtraFirst + (UINT)i,
+        InsertMenuW(menu, pos++, MF_BYPOSITION | MF_STRING | (x.checked ? MF_CHECKED : 0) | (x.disabled ? MF_GRAYED : 0),
+                    kExtraFirst + (UINT)i,
                     x.text.c_str());
     }
     if (pos && shell && GetMenuItemCount(menu) > (int)pos) InsertMenuW(menu, pos, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
