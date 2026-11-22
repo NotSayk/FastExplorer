@@ -56,6 +56,7 @@ constexpr UINT WM_APP_REEDIT = WM_APP + 6;      // renommage refusé : on rouvre
 constexpr UINT WM_APP_RECLAIM = WM_APP + 7;     // reprendre le premier plan au moteur de copie
 constexpr UINT WM_APP_SHELLNOTIFY = WM_APP + 8; // lecteur ou média ajouté / retiré (SHChangeNotifyRegister)
 constexpr UINT WM_APP_NAV = WM_APP + 9;         // résultat d'une lecture du volet de navigation
+constexpr UINT WM_APP_PASSIVE = WM_APP + 19;    // double panneau : contenu relu du panneau inactif (lParam = DirData*)
 constexpr UINT WM_APP_SELSUM = WM_APP + 10;     // sélection changée : résumé dans la barre d'état (une fois par rafale)
 constexpr UINT WM_APP_TABEDIT = WM_APP + 11;    // Tab pendant un renommage : renommer l'élément suivant
 constexpr UINT WM_APP_CMDFAIL = WM_APP + 12;    // commande tapée dans la barre d'adresse impossible (lParam = std::wstring*)
@@ -84,7 +85,7 @@ constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-
 // d'événements (copie de milliers de fichiers) et s'espace sur les gros dossiers.
 constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
-enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH, ID_TABS, ID_PANE };
+enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH, ID_TABS, ID_PANE, ID_LIST2, ID_HDR0, ID_HDR1 };
 enum class Nav { Normal, Back, Forward, Refresh };
 enum class JobKind { Navigate, Sort };
 
@@ -161,6 +162,14 @@ HWND g_pane;                   // volet de droite : aperçu ou détails
 int g_paneW96 = 320;           // sa largeur (à 96 ppp)
 bool g_paneDrag = false;
 RECT g_paneSplit{};            // séparateur liste / volet
+// Double panneau (F9) : deux listes côte à côte. g_list est celle du panneau
+// actif, qui seule est « vivante » (lecture, surveillance, icônes) ; l'autre
+// garde l'image de son dernier état (g_passive) et redevient active au clic.
+HWND g_lists[2];
+HWND g_paneHdr[2];             // chemin au-dessus de chaque liste
+int g_side = 0;                // panneau actif : 0 gauche, 1 droite
+bool g_dual = false;
+bool g_dualAtStart = false;    // rétabli au premier dossier affiché
 HFONT g_font;
 int g_fontH = 16;
 UINT g_dpi = 96;
@@ -173,6 +182,18 @@ std::vector<std::wstring> g_back, g_fwd;
 ColSpec g_sort = Columns_Builtin(COL_NAME);  // colonne de tri (même si elle n'est pas affichée)
 std::vector<ColSpec> g_cols = Columns_Default();  // sous-élément i du ListView = g_cols[i]
 bool g_sortAsc = true;
+// Panneau inactif : ce qu'il montrait quand il a perdu la main (ou relu depuis).
+struct Passive {
+    View view;
+    std::vector<ColSpec> cols;
+    std::wstring path, query, filter;
+    int mode = VM_DETAILS;
+    ColSpec sort = Columns_Builtin(COL_NAME);
+    bool asc = true;
+} g_passive;
+std::vector<ColSpec> g_listCols[2];  // colonnes posées sur chaque liste
+void SetDual(bool on);
+void ReloadPassive();
 std::unordered_map<std::wstring, int> g_iconCache;
 ViewPrefs g_prefs;              // éléments cachés, extensions : réglages de l'Explorateur
 std::wstring g_editExt;         // renommage : extension masquée à l'affichage, remise à la fin
@@ -388,8 +409,7 @@ void ApplySelection(const std::vector<int>& sel, int focus, bool scroll) {
 
 // ───────────────────────────── Affichage des lignes ─────────────────────────────
 
-int IconFor(int idx) {
-    const Entry& e = E(idx);
+int IconOf(const DirData& d, const Entry& e) {
     if (e.icon >= 0) return e.icon;  // déjà résolue par le thread de travail (lecteurs de Ce PC)
     std::wstring key, probe;
     DWORD attr;
@@ -398,7 +418,7 @@ int IconFor(int idx) {
         probe = L"folder";
         attr = FILE_ATTRIBUTE_DIRECTORY;
     } else {
-        key.assign(NameOf(idx) + e.extOff, e.nameLen - e.extOff);
+        key.assign(d.name(e) + e.extOff, e.nameLen - e.extOff);
         CharLowerBuffW(key.data(), (DWORD)key.size());
         probe = L"f" + key;
         if (key.empty()) key = L"\x01file";
@@ -414,6 +434,8 @@ int IconFor(int idx) {
     g_iconCache.emplace(std::move(key), icon);
     return icon;
 }
+
+int IconFor(int idx) { return IconOf(*g_view.data, E(idx)); }
 
 
 void FormatDate(int64_t t, wchar_t* out, int cch) {
@@ -764,7 +786,7 @@ void ApplyRowSpacing() {
         const int h = std::max(cy, g_fontH) + S(14);
         if (!g_rowList || g_rowW != cx || g_rowH != h || g_rowSrc != g_smallPick) {
             if (g_rowList) {
-                ListView_SetImageList(g_list, g_smallPick, LVSIL_SMALL);
+                for (HWND lv : g_lists) ListView_SetImageList(lv, g_smallPick, LVSIL_SMALL);  // l'inactive aussi
                 ImageList_Destroy(g_rowList);
             }
             g_rowW = cx;
@@ -874,6 +896,7 @@ MenuExtra ViewMenu() {
              {L"Volet d'aperçu\tAlt+P", [] { TogglePane(PaneMode::Preview); }, false, Pane_Mode() == PaneMode::Preview},
              {L"Volet de détails\tAlt+Maj+P", [] { TogglePane(PaneMode::Details); }, false,
               Pane_Mode() == PaneMode::Details},
+             {L"Double panneau\tF9", [] { SetDual(!g_dual); }, false, g_dual},
              {L"File d'attente des copies…", [] { CopyQueue_Show(g_hwnd); }},
              {},
              {L"Choisir les colonnes…", [] { ChooseColumns(); }},
@@ -1947,6 +1970,10 @@ void OnResult(Result* raw) {
     else UpdateColumnsForView();
     RequestSortProps();
     if (Pane_Mode() != PaneMode::None) SetTimer(g_hwnd, TIMER_PANE, 30, nullptr);  // dossier changé, ou fichier modifié
+    if (g_dualAtStart && HasView() && !g_pending.active) {
+        g_dualAtStart = false;
+        SetDual(true);
+    }
 
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
     if (g_path.empty()) {
@@ -2455,6 +2482,14 @@ void RecordUndo(const FileOpResult& r) {
 void OnFileOp(FileOpResult* raw) {
     std::unique_ptr<FileOpResult> r(raw);
     RecordUndo(*r);
+    if (g_dual && !g_passive.path.empty()) {  // l'autre panneau est touché (copie vers lui, déplacement depuis lui)
+        bool touched = _wcsicmp(r->folder.c_str(), g_passive.path.c_str()) == 0;
+        for (const auto& s : r->sources) {
+            std::wstring parent, leaf;
+            touched = touched || (ParentOf(s, parent, leaf) && _wcsicmp(parent.c_str(), g_passive.path.c_str()) == 0);
+        }
+        if (touched) ReloadPassive();
+    }
     // Tailles des dossiers touchés périmées (le dossier affiché ne change pas
     // forcément : copier dans un sous-dossier ne le modifie pas).
     ForgetSizes(r->folder);
@@ -2755,10 +2790,21 @@ void SetDropRow(int row) {
     UpdateWindow(g_list);
 }
 
-void RegisterDrop() {
+void RegisterDropOn(int k) {
     DropHost h;
-    h.folder = [] { return g_path; };
-    h.hit = [](POINT c, std::wstring& name) {
+    // Liste inactive (double panneau) : dépôt dans son dossier, ou dans un de ses sous-dossiers.
+    h.folder = [k] { return k == g_side ? g_path : g_passive.path; };
+    h.hit = [k](POINT c, std::wstring& name) {
+        if (k != g_side) {
+            const View& v = g_passive.view;
+            if (!g_dual || !v.data || !g_passive.query.empty()) return -1;
+            LVHITTESTINFO hit{};
+            hit.pt = c;
+            const int row = ListView_HitTest(g_lists[k], &hit);
+            if (row < 0 || row >= (int)v.order.size()) return -1;
+            name = v.data->name(v.data->entries[v.order[row]]);
+            return row;
+        }
         if (!HasView() || g_pending.active) return -1;
         LVHITTESTINFO hit{};
         hit.pt = c;
@@ -2768,10 +2814,12 @@ void RegisterDrop() {
         name = NameOf(e);
         return row;
     };
-    h.dragged = [](const std::wstring& n) { return g_dragNames.count(n) > 0; };
-    h.highlight = SetDropRow;
-    h.dropped = [](bool intoFolder) {
-        if (intoFolder && HasView()) g_expectNew = {g_view.data, GetTickCount64() + 15000, true};
+    h.dragged = [k](const std::wstring& n) { return k == g_side && g_dragNames.count(n) > 0; };
+    h.highlight = [k](int row) {
+        if (k == g_side) SetDropRow(row);
+    };
+    h.dropped = [k](bool intoFolder) {
+        if (k == g_side && intoFolder && HasView()) g_expectNew = {g_view.data, GetTickCount64() + 15000, true};
     };
     h.transfer = [](const std::wstring& dest, std::vector<std::wstring> paths, bool move) {
         FileOp op;
@@ -2780,7 +2828,12 @@ void RegisterDrop() {
         op.paths = std::move(paths);
         StartOp(std::move(op));
     };
-    DragDrop_RegisterTarget(g_list, std::move(h));
+    DragDrop_RegisterTarget(g_lists[k], std::move(h));
+}
+
+void RegisterDrop() {
+    RegisterDropOn(0);
+    RegisterDropOn(1);
 }
 
 // ───────────────────────────── Onglets, fenêtres ─────────────────────────────
@@ -2790,7 +2843,10 @@ void RegisterDrop() {
 // puis le dossier est relu en arrière-plan (comme F5). Seul l'onglet affiché
 // est surveillé.
 
+uint64_t g_tabIds = 0;
+
 struct Tab {
+    uint64_t id = ++g_tabIds;  // stable : double panneau (onglet affiché dans l'autre panneau)
     std::wstring path, query, filter, focus;
     std::vector<std::wstring> back, fwd, selected;
     int top = 0;
@@ -2799,6 +2855,17 @@ struct Tab {
 std::vector<Tab> g_tabList(1);
 size_t g_tab = 0;
 int g_tabDrag = -1;  // onglet que l'on fait glisser (réorganisation)
+uint64_t g_otherTabId = 0;  // double panneau : onglet affiché dans le panneau inactif
+
+int TabIndexOf(uint64_t id) {
+    for (size_t i = 0; i < g_tabList.size(); ++i)
+        if (g_tabList[i].id == id) return (int)i;
+    return -1;
+}
+
+void SetDual(bool on);
+void SwitchSide();
+void UpdatePaneHeaders();
 
 std::wstring TabText(const Tab& t) {
     std::wstring s = t.query.empty() ? HistoryText(t.path) : L"Recherche « " + t.query + L" »";
@@ -2807,6 +2874,10 @@ std::wstring TabText(const Tab& t) {
 }
 
 void UpdateTabStrip() {
+    if (g_dual) {  // l'onglet de l'autre panneau a été fermé, ou est devenu l'onglet affiché
+        const int o = TabIndexOf(g_otherTabId);
+        if (o < 0 || o == (int)g_tab) SetDual(false);
+    }
     if (!g_tabBar) return;
     SendMessageW(g_tabBar, WM_SETREDRAW, FALSE, 0);
     TabCtrl_DeleteAllItems(g_tabBar);
@@ -2831,6 +2902,7 @@ void SyncTab() {
     t.path = g_path;
     t.query = g_query;
     t.data = g_view.data;
+    UpdatePaneHeaders();
     if (std::wstring now = TabText(t); now != before && g_tabBar) {
         TCITEMW it{};
         it.mask = TCIF_TEXT;
@@ -2893,6 +2965,11 @@ void ShowTab(size_t i) {
 }
 
 void SwitchTab(size_t i) {
+    if (g_dual && (int)i == TabIndexOf(g_otherTabId)) {  // onglet de l'autre panneau : on y passe
+        SwitchSide();
+        SetFocus(g_list);
+        return;
+    }
     if (i == g_tab || i >= g_tabList.size()) {
         UpdateTabStrip();
         return;
@@ -2948,6 +3025,193 @@ void MoveTab(size_t from, size_t to) {
     UpdateTabStrip();
 }
 
+// ───────────────────────────── Double panneau ─────────────────────────────
+
+
+std::wstring PaneTitle(const std::wstring& path, const std::wstring& query) {
+    if (!query.empty()) return L"Recherche « " + query + L" » dans " + (path.empty() ? L"Ce PC" : path);
+    return path.empty() ? L"Ce PC" : path;
+}
+
+void UpdatePaneHeaders() {
+    if (!g_dual) return;
+    for (int s = 0; s < 2; ++s) {
+        const std::wstring t = L" " + (s == g_side ? PaneTitle(g_pending.active ? g_pending.path : g_path, g_query)
+                                                    : PaneTitle(g_passive.path, g_passive.query));
+        SetWindowTextW(g_paneHdr[s], t.c_str());
+        InvalidateRect(g_paneHdr[s], nullptr, TRUE);
+    }
+}
+
+// Liste du panneau inactif : rendu à partir de l'image gardée, sans rien lire.
+void FillPassive(LVITEMW& it) {
+    View& v = g_passive.view;
+    if (!v.data || it.iItem < 0 || it.iItem >= (int)v.order.size()) return;
+    const int idx = (int)v.order[it.iItem];
+    const Entry& e = v.data->entries[idx];
+    // Lignes espacées : la liste de lignes (commune) ; sinon les listes système.
+    const bool rows = g_rowList && g_passive.mode <= VM_SMALL &&
+                      (HIMAGELIST)SendMessageW(g_lists[g_side ^ 1], LVM_GETIMAGELIST, LVSIL_SMALL, 0) == g_rowList;
+    if (it.mask & LVIF_IMAGE) {
+        const int sys = v.iconState[idx] != ICON_NONE ? v.icons[idx] : IconOf(*v.data, e);
+        it.iImage = rows ? RowSlot(sys) : sys;
+    }
+    if (it.mask & LVIF_STATE) {
+        const bool dim = v.cut[idx] || (!v.data->isRoot() && (e.attr & FILE_ATTRIBUTE_HIDDEN));
+        if (rows) RowOverlay(v.overlays[idx]);
+        it.state = INDEXTOOVERLAYMASK(v.overlays[idx]) | (dim ? LVIS_CUT : 0);
+        it.stateMask = LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED;
+    }
+    if (!(it.mask & (LVIF_TEXT | LVIF_COLUMNS))) return;
+    // Texte et colonnes : le rendu ordinaire, sur l'état du panneau inactif.
+    std::swap(g_view, v);
+    std::swap(g_cols, g_passive.cols);
+    std::swap(g_path, g_passive.path);
+    std::swap(g_viewMode, g_passive.mode);
+    LVITEMW sub = it;
+    sub.mask &= LVIF_TEXT | LVIF_COLUMNS;
+    FillDispInfo(sub);
+    it.cColumns = sub.cColumns;
+    it.puColumns = sub.puColumns;
+    std::swap(g_viewMode, g_passive.mode);
+    std::swap(g_path, g_passive.path);
+    std::swap(g_cols, g_passive.cols);
+    std::swap(g_view, v);
+}
+
+// Image d'un contenu lu : vue triée, sans icônes propres ni tailles de dossiers.
+View PassiveView(std::shared_ptr<const DirData> d, const ColSpec& sort, bool asc, const std::wstring& filter) {
+    View v;
+    const size_t n = d->entries.size();
+    v.order = SortOrder(*d, sort.key == COL_PROP ? COL_NAME : sort.key, asc, g_prefs, filter);
+    v.rowOf.assign(n, -1);
+    for (size_t r = 0; r < v.order.size(); ++r) v.rowOf[v.order[r]] = (int)r;
+    v.icons.assign(n, 0);
+    v.overlays.assign(n, 0);
+    v.iconState.assign(n, ICON_NONE);
+    v.cut.assign(n, 0);
+    v.dirBytes.assign(n, 0);
+    v.dirState.assign(n, 0);
+    v.thumb.assign(n, THUMB_UNKNOWN);
+    v.data = std::move(d);
+    return v;
+}
+
+// Relit le dossier du panneau inactif en arrière-plan (après une copie vers lui…).
+void ReloadPassive() {
+    if (!g_dual || g_passive.path.empty() || !g_passive.query.empty()) return;
+    std::thread([path = g_passive.path, hwnd = g_hwnd] {
+        auto* d = new DirData;
+        d->path = path;
+        Enumerate(*d);
+        if (!PostMessageW(hwnd, WM_APP_PASSIVE, 0, (LPARAM)d)) delete d;
+    }).detach();
+}
+
+void OnPassiveData(DirData* raw) {
+    std::shared_ptr<const DirData> d(raw);
+    if (!g_dual || d->error || _wcsicmp(d->path.c_str(), g_passive.path.c_str()) != 0 || !g_passive.query.empty()) return;
+    g_passive.view = PassiveView(d, g_passive.sort, g_passive.asc, g_passive.filter);
+    if (const int o = TabIndexOf(g_otherTabId); o >= 0) g_tabList[o].data = d;  // y revenir l'affichera tel quel
+    HWND lv = g_lists[g_side ^ 1];
+    ListView_SetItemCountEx(lv, (int)g_passive.view.order.size(), LVSICF_NOSCROLL);
+    InvalidateRect(lv, nullptr, TRUE);
+}
+
+// Le panneau inactif devient actif (clic, Tab, onglet), et inversement.
+void SwitchSide() {
+    const int other = g_dual ? TabIndexOf(g_otherTabId) : -1;
+    if (other < 0 || other == (int)g_tab) return;
+    if (g_editing) SendMessageW(g_list, LVM_CANCELEDITLABEL, 0, 0);
+    SaveFolderView();
+    SaveTab();
+    HWND old = g_list;
+    Passive p;
+    p.view = std::move(g_view);
+    g_view = View{};
+    p.cols = g_cols;
+    p.path = g_path;
+    p.query = g_query;
+    p.filter = g_filter;
+    p.mode = g_viewMode;
+    p.sort = g_sort;
+    p.asc = g_sortAsc;
+    // Ses listes d'images propres (lignes espacées, miniatures) peuvent être recréées : listes système.
+    if ((HIMAGELIST)SendMessageW(old, LVM_GETIMAGELIST, LVSIL_SMALL, 0) != g_rowList) ListView_SetImageList(old, g_smallPick, LVSIL_SMALL);
+    ListView_SetImageList(old, g_imgLarge, LVSIL_NORMAL);
+    g_listCols[g_side] = g_cols;
+    g_otherTabId = g_tabList[g_tab].id;
+    g_passive = std::move(p);
+    g_side ^= 1;
+    g_list = g_lists[g_side];
+    g_cols = g_listCols[g_side];
+    ShowTab((size_t)other);
+    UpdateTabStrip();
+    UpdatePaneHeaders();
+    InvalidateRect(old, nullptr, TRUE);
+}
+
+void Layout();
+
+// F9 : un second panneau à côté (le même dossier, ou l'onglet suivant), ou retour à un seul.
+void SetDual(bool on) {
+    if (on == g_dual || !g_lists[1]) return;
+    const DWORD v = on ? 1 : 0;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"Dual", REG_DWORD, &v, sizeof v);
+    if (on) {
+        if (!HasView()) {  // rien encore d'affiché : au premier dossier
+            g_dualAtStart = true;
+            return;
+        }
+        SaveTab();
+        Tab t;
+        t.path = g_path;
+        t.query = g_query;
+        t.data = g_view.data;  // même contenu : affiché aussitôt, puis relu
+        g_tabList.insert(g_tabList.begin() + (ptrdiff_t)g_tab + 1, std::move(t));
+        g_otherTabId = g_tabList[g_tab + 1].id;
+        g_dual = true;
+        for (HWND h : {g_lists[0], g_lists[1], g_paneHdr[0], g_paneHdr[1]}) ShowWindow(h, SW_SHOW);
+        Layout();
+        SwitchSide();  // le nouvel onglet s'ouvre dans l'autre liste, qui devient active
+        SetFocus(g_list);
+    } else {
+        g_dual = false;
+        HWND other = g_lists[g_side ^ 1];
+        ListView_SetItemCountEx(other, 0, 0);
+        for (HWND h : {other, g_paneHdr[0], g_paneHdr[1]}) ShowWindow(h, SW_HIDE);
+        g_passive = Passive{};
+        Layout();
+        UpdateTabStrip();
+    }
+}
+
+// F5 / F6 en double panneau : copier / déplacer la sélection vers l'autre panneau.
+void TransferToOther(bool move) {
+    if (!g_dual || !HasView() || g_view.data->isRoot()) return;
+    const std::wstring dest = g_passive.path;
+    if (dest.empty() || !g_passive.query.empty()) {
+        Flash(L"L'autre panneau ne montre pas un dossier");
+        return;
+    }
+    if (_wcsicmp(dest.c_str(), g_path.c_str()) == 0 && g_query.empty()) {
+        Flash(L"Les deux panneaux montrent le même dossier");
+        return;
+    }
+    std::vector<int> sel = SelectedEntries();
+    if (sel.empty())
+        if (const int f = FocusedEntry(); f >= 0) sel.push_back(f);
+    if (sel.empty()) return;
+    FileOp op;
+    op.kind = move ? FileOpKind::Move : FileOpKind::Copy;
+    op.folder = dest;
+    for (int e : sel) op.paths.push_back(Join(g_path, NameOf(e)));
+    const size_t n = op.paths.size();
+    StartOp(std::move(op));
+    Flash(std::wstring(move ? L"Déplacement de " : L"Copie de ") + std::to_wstring(n) + (n > 1 ? L" éléments" : L" élément") +
+          L" vers " + dest);
+}
+
 // Nouvelle fenêtre (Ctrl+N), un peu décalée par rapport à celle-ci, sur le même écran.
 void NewWindow(const std::wstring& path) {
     wchar_t exe[MAX_PATH];
@@ -2998,6 +3262,7 @@ void ShowTabMenu(int hit, POINT pt) {
         case 2: {
             SaveTab();
             Tab copy = g_tabList[(size_t)hit];
+            copy.id = ++g_tabIds;
             g_tabList.insert(g_tabList.begin() + hit + 1, std::move(copy));
             if ((size_t)hit < g_tab) ++g_tab;
             UpdateTabStrip();
@@ -3398,8 +3663,8 @@ void ApplyFont() {
         SelectObject(dc, old);
         ReleaseDC(g_hwnd, dc);
     }
-    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_btnRefresh, g_nav, g_crumbs, g_searchBox, g_tabBar,
-                   g_pane})
+    for (HWND h : {g_lists[0], g_lists[1], g_paneHdr[0], g_paneHdr[1], g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp,
+                   g_btnRefresh, g_nav, g_crumbs, g_searchBox, g_tabBar, g_pane})
         SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
 }
 
@@ -3437,7 +3702,7 @@ void Layout() {
     const int editH = g_fontH + S(10);  // texte centré verticalement
     const int h = std::max(S(30), editH);
     // Un seul lot de déplacements : un repaint au lieu d'un par contrôle.
-    HDWP dwp = BeginDeferWindowPos(12);
+    HDWP dwp = BeginDeferWindowPos(16);
     auto place = [&](HWND w, int x, int y, int cx, int cy) {
         if (dwp) dwp = DeferWindowPos(dwp, w, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
         else MoveWindow(w, x, y, cx, cy, TRUE);
@@ -3472,7 +3737,16 @@ void Layout() {
         paneW = std::min(std::clamp(S(g_paneW96), S(160), std::max(S(160), (int)rc.right * 2 / 3)), room);
     }
     const int listW = std::max(0, (int)rc.right - navW - split - (paneW ? paneW + split : 0));
-    place(g_list, navW + split, top, listW, bodyH);
+    const int listX = navW + split;
+    if (g_dual) {  // deux listes, chacune sous son chemin
+        const int hh = g_fontH + S(8), gap = S(4), w0 = std::max(0, (listW - gap) / 2);
+        place(g_paneHdr[0], listX, top, w0, hh);
+        place(g_lists[0], listX, top + hh, w0, std::max(0, bodyH - hh));
+        place(g_paneHdr[1], listX + w0 + gap, top, std::max(0, listW - w0 - gap), hh);
+        place(g_lists[1], listX + w0 + gap, top + hh, std::max(0, listW - w0 - gap), std::max(0, bodyH - hh));
+    } else {
+        place(g_list, listX, top, listW, bodyH);
+    }
     if (paneW) {
         g_paneSplit = {navW + split + listW, top, navW + split + listW + split, top + bodyH};
         place(g_pane, g_paneSplit.right, top, paneW, bodyH);
@@ -3528,13 +3802,19 @@ void CreateChildren(HWND hwnd) {
                                   0, 0, hwnd, (HMENU)ID_SEARCH, g_inst, nullptr);
     Edit_SetCueBannerTextFocused(g_searchBox, L"Filtrer, Entrée : rechercher (Ctrl+F)", TRUE);
 
-    g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
-                             WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_SHAREIMAGELISTS |
-                                 LVS_SHOWSELALWAYS | LVS_EDITLABELS,
-                             0, 0, 0, 0, hwnd, (HMENU)ID_LIST, g_inst, nullptr);
-    ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
-    ListView_SetCallbackMask(g_list, LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED);  // fournis par LVN_GETDISPINFO
-    SetWindowTheme(g_list, L"Explorer", nullptr);
+    for (int k = 0; k < 2; ++k) {  // la seconde ne sert qu'en double panneau
+        HWND lv = CreateWindowExW(0, WC_LISTVIEWW, L"",
+                                  WS_CHILD | (k == 0 ? WS_VISIBLE : 0) | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA |
+                                      LVS_SHAREIMAGELISTS | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
+                                  0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(k == 0 ? ID_LIST : ID_LIST2), g_inst, nullptr);
+        ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP);
+        ListView_SetCallbackMask(lv, LVIS_OVERLAYMASK | LVIS_CUT | LVIS_DROPHILITED);  // fournis par LVN_GETDISPINFO
+        SetWindowTheme(lv, L"Explorer", nullptr);
+        g_lists[k] = lv;
+        g_paneHdr[k] = CreateWindowExW(0, WC_STATICW, L"", WS_CHILD | SS_NOTIFY | SS_PATHELLIPSIS | SS_CENTERIMAGE | SS_NOPREFIX,
+                                       0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(ID_HDR0 + k), g_inst, nullptr);
+    }
+    g_list = g_lists[0];
 
     ApplyColumns(g_cols);
 
@@ -3554,6 +3834,7 @@ void CreateChildren(HWND hwnd) {
     UpdateTabStrip();
     LoadViewMode();  // mode d'affichage de la dernière session
     LoadPane();
+    g_dualAtStart = RegDword(L"Software\\FastExplorer", L"Dual", 0) != 0;  // double panneau au premier dossier
     Layout();  // fenêtre encore invisible : aucun repaint
 }
 
@@ -3761,6 +4042,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case WM_COMMAND:
+            if ((LOWORD(wp) == ID_HDR0 || LOWORD(wp) == ID_HDR1) && HIWORD(wp) == STN_CLICKED) {
+                if (LOWORD(wp) - ID_HDR0 != g_side) SwitchSide();
+                SetFocus(g_list);
+                return 0;
+            }
             switch (LOWORD(wp)) {
                 case ID_BACK: GoBack(); SetFocus(g_list); return 0;
                 case ID_FWD: GoForward(); SetFocus(g_list); return 0;
@@ -3805,6 +4091,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     PostSaveView();
                 break;
             }
+            if (g_dual && hdr->hwndFrom == g_lists[g_side ^ 1]) {  // liste inactive
+                switch (hdr->code) {
+                    case LVN_GETDISPINFOW: FillPassive(((NMLVDISPINFOW*)lp)->item); return 0;
+                    case NM_SETFOCUS: SwitchSide(); return 0;  // clic : elle devient active
+                    case LVN_ODFINDITEMW: return -1;
+                }
+                return 0;
+            }
             if (hdr->hwndFrom != g_list) break;            switch (hdr->code) {
                 case LVN_GETDISPINFOW: FillDispInfo(((NMLVDISPINFOW*)lp)->item); return 0;
                 case LVN_ITEMCHANGED:
@@ -3836,6 +4130,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_APP_RESULT: OnResult((Result*)lp); return 0;
         case WM_APP_SELSUM: ShowSelectionSummary(); return 0;
+        case WM_APP_PASSIVE: OnPassiveData((DirData*)lp); return 0;
+        case WM_CTLCOLORSTATIC:  // chemins du double panneau : celui du panneau actif en surbrillance
+            for (int s = 0; s < 2; ++s)
+                if ((HWND)lp == g_paneHdr[s]) {
+                    const bool on = s == g_side;
+                    SetBkColor((HDC)wp, GetSysColor(on ? COLOR_HIGHLIGHT : COLOR_3DFACE));
+                    SetTextColor((HDC)wp, GetSysColor(on ? COLOR_HIGHLIGHTTEXT : COLOR_GRAYTEXT));
+                    return (LRESULT)GetSysColorBrush(on ? COLOR_HIGHLIGHT : COLOR_3DFACE);
+                }
+            break;
         case WM_DESTROY:
             g_target.store(nullptr);
             Icons_Stop();
@@ -3848,7 +4152,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_taskbar) g_taskbar->Release();
             g_taskbar = nullptr;
             RemoveClipboardFormatListener(hwnd);
-            DragDrop_RevokeTarget(g_list);
+            DragDrop_RevokeTarget(g_lists[0]);
+            DragDrop_RevokeTarget(g_lists[1]);
             if (g_shellNotify) SHChangeNotifyDeregister(g_shellNotify);
             Clipboard_Flush();  // ce qui a été copié reste disponible après la fermeture
             Jobs_NewGeneration();  // périme et interrompt la tâche en cours
@@ -3998,7 +4303,15 @@ bool HandleGlobalKeys(const MSG& m) {
         }
     }
     switch (m.wParam) {
-        case VK_F5: g_forceSizes = true; Refresh(); return true;
+        case VK_F5:
+            if (g_dual && focus == g_list) { TransferToOther(false); return true; }  // double panneau : copier vers l'autre
+            g_forceSizes = true;
+            Refresh();
+            return true;
+        case VK_F6:
+            if (g_dual && focus == g_list) { TransferToOther(true); return true; }  // déplacer vers l'autre
+            return false;
+        case VK_F9: SetDual(!g_dual); return true;
         case 'R':
             if (!ctrl) return false;
             g_forceSizes = true;
@@ -4015,7 +4328,12 @@ bool HandleGlobalKeys(const MSG& m) {
             if (!ctrl) return false;
             FocusSearch();
             return true;
-        case VK_TAB:  // barre d'adresse → recherche → liste
+        case VK_TAB:  // barre d'adresse → recherche → liste ; double panneau : d'une liste à l'autre
+            if (g_dual && focus == g_list) {
+                SwitchSide();
+                SetFocus(g_list);
+                return true;
+            }
             if (focus == g_addr) FocusSearch();
             else if (focus == g_searchBox) SetFocus(g_list);
             else BeginAddressEdit();
