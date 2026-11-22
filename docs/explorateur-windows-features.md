@@ -30,7 +30,7 @@ De haut en bas :
 | **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | P1 |
 | **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accès rapide épinglé + arborescence de Ce PC, séparateur ; Accueil, Galerie, Réseau, Linux à venir) |
 | **Zone de contenu** | La liste des éléments | ✅ P0 |
-| **Volet d'aperçu / de détails** (droite) | Aperçu du fichier, ou métadonnées | P1 |
+| **Volet d'aperçu / de détails** (droite) | Aperçu du fichier, ou métadonnées | ✅ P1 |
 | **Barre d'état** (bas) | Nombre d'éléments, nombre et taille de la sélection, boutons Détails / Grandes icônes | ✅🟡 P0 (trois zones : contenu du dossier, sélection, temps de lecture ; boutons d'affichage à venir avec les autres vues) |
 
 ⚙️ Chaque volet se masque ou s'affiche via **Afficher ▸ Afficher**. L'état est mémorisé globalement.
@@ -132,8 +132,8 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Option | Prio |
 |---|---|
 | Volet de navigation | ✅ P0 |
-| Volet de détails (Alt+Maj+P) | P1 |
-| Volet d'aperçu (Alt+P) | P1 |
+| Volet de détails (Alt+Maj+P) | ✅ P1 |
+| Volet d'aperçu (Alt+P) | ✅ P1 |
 | Cases à cocher des éléments | P2 |
 | **Extensions de noms de fichiers** | ✅ **P0** (réglage de Windows suivi en direct ; menu du fond du dossier ; types connus seulement, NeverShowExt / AlwaysShowExt respectés ; renommer garde l'extension masquée) |
 | **Éléments masqués** | ✅ **P0** (réglage de Windows suivi en direct ; Ctrl+H ou menu du fond du dossier ; affichés estompés ; « n masqués » dans la barre d'état ; même règle dans le volet) |
@@ -307,11 +307,11 @@ comme arrière-plan, Pivoter (images), Monter (ISO/VHD), Graver…
 
 | Volet | Détail | Prio |
 |---|---|---|
-| **Aperçu** (Alt+P) | Images, texte et code, PDF, Word/Excel/PowerPoint (si Office est installé), vidéo/audio avec lecteur, polices, e-mails `.msg`/`.eml`, HTML | P1 ⚙️ preview handlers `IPreviewHandler` (hébergés hors processus par `prevhost.exe`) |
-| Blocage pour les fichiers téléchargés | Depuis octobre 2025, l'aperçu des fichiers marqués « provenant d'Internet » est bloqué ; les PDF ont été rétablis en octobre 2026 | P2 ⚙️ flux `Zone.Identifier` (Mark of the Web) |
-| **Détails** (Alt+Maj+P) | Grande icône ou miniature, métadonnées (taille, dates, dimensions, auteur, balises, note, commentaire…), **modifiables directement** | P1 ⚙️ `IPropertyStore` en écriture |
-| Sélection multiple | Résumé : nombre, taille totale, valeurs communes | P1 |
-| Largeur réglable | Glisser le séparateur | P1 |
+| **Aperçu** (Alt+P) | Images, texte et code, PDF, Word/Excel/PowerPoint (si Office est installé), vidéo/audio avec lecteur, polices, e-mails `.msg`/`.eml`, HTML | ✅ P1 ⚙️ preview handlers `IPreviewHandler` (hébergés hors processus par `prevhost.exe`, jamais dans notre processus, sur un thread dédié ; images et texte / code affichés par nous, plus vite ; fichier en ligne uniquement : jamais téléchargé) |
+| Blocage pour les fichiers téléchargés | Depuis octobre 2025, l'aperçu des fichiers marqués « provenant d'Internet » est bloqué ; les PDF ont été rétablis en octobre 2026 | ✅ P2 ⚙️ flux `Zone.Identifier` (Mark of the Web) |
+| **Détails** (Alt+Maj+P) | Grande icône ou miniature, métadonnées (taille, dates, dimensions, auteur, balises, note, commentaire…), **modifiables directement** | ✅ P1 ⚙️ `IPropertyStore` en écriture (double-clic, F2 ou Entrée sur la valeur ; liste `PreviewDetails` du type de fichier) |
+| Sélection multiple | Résumé : nombre, taille totale, valeurs communes | ✅ P1 (modification appliquée à toute la sélection) |
+| Largeur réglable | Glisser le séparateur | ✅ P1 (largeur et volet ouvert mémorisés) |
 
 ---
 
@@ -518,7 +518,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 |---|---|---|
 | Ctrl+Maj+1 … 8 | Mode d'affichage (voir §4.1) | ✅ P1 |
 | Ctrl+molette | Zoom des icônes | ✅ P1 |
-| Alt+P / Alt+Maj+P | Volet d'aperçu / de détails | P1 |
+| Alt+P / Alt+Maj+P | Volet d'aperçu / de détails | ✅ P1 |
 | Ctrl+pavé num. + | Ajuster toutes les colonnes | P2 |
 
 ---
@@ -631,7 +631,7 @@ dossiers avant l'index…) :
 16. ✅ **Modes d'affichage** : grandes / moyennes icônes, zoom continu (Ctrl+molette), Ctrl+Maj+1…8,
     mode compact, **miniatures** (cache système partagé avec l'Explorateur).
 17. ✅ **Colonnes** : choix des colonnes (Property System), vue mémorisée par dossier.
-18. **Volets d'aperçu et de détails** (Alt+P, Alt+Maj+P) : preview handlers hors processus, propriétés
+18. ✅ **Volets d'aperçu et de détails** (Alt+P, Alt+Maj+P) : preview handlers hors processus, propriétés
     modifiables, sélection multiple, largeur réglable.
 19. **File d'attente de copies** ⭐ : opérations à la suite plutôt qu'en parallèle sur un même disque,
     pause / reprise, liste visible.

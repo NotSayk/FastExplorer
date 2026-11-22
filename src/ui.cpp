@@ -17,6 +17,7 @@
 #include "listing.h"
 #include "crumbs.h"
 #include "navpane.h"
+#include "panes.h"
 #include "paths.h"
 #include "shellmenu.h"
 #include "util.h"
@@ -71,6 +72,7 @@ constexpr UINT_PTR TIMER_AFTEROP = 3;
 constexpr UINT_PTR TIMER_HOVER = 6;   // souris immobile sur la liste : préparer le menu contextuel
 constexpr UINT kMenuHoverMs = 100;
 constexpr UINT_PTR TIMER_PROGRESS = 7;  // progression des copies de notre moteur
+constexpr UINT_PTR TIMER_PANE = 10;     // sélection posée : mettre à jour le volet de droite
 constexpr UINT_PTR TIMER_INDEXASK = 9;  // peu après le premier lancement : proposer la recherche instantanée
 constexpr UINT_PTR TIMER_PINNED = 8;    // après un menu contextuel : relire l'Accès rapide (épinglage)
 constexpr UINT_PTR TIMER_DRIVES = 4;  // Ce PC : regroupe les annonces d'arrivée / retrait de lecteurs
@@ -81,7 +83,7 @@ constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-
 // d'événements (copie de milliers de fichiers) et s'espace sur les gros dossiers.
 constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
-enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH, ID_TABS };
+enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH, ID_TABS, ID_PANE };
 enum class Nav { Normal, Back, Forward, Refresh };
 enum class JobKind { Navigate, Sort };
 
@@ -154,6 +156,10 @@ std::wstring g_filter;          // filtre instantané sur les noms affichés (""
 int g_navW96 = 240;            // largeur du volet de navigation (à 96 ppp)
 bool g_splitDrag = false;      // séparateur volet / liste en cours de déplacement
 RECT g_split{};                // zone du séparateur (coordonnées client)
+HWND g_pane;                   // volet de droite : aperçu ou détails
+int g_paneW96 = 320;           // sa largeur (à 96 ppp)
+bool g_paneDrag = false;
+RECT g_paneSplit{};            // séparateur liste / volet
 HFONT g_font;
 int g_fontH = 16;
 UINT g_dpi = 96;
@@ -845,6 +851,7 @@ void ViewByKey(int k) {
 }
 
 void ChooseColumns();
+void TogglePane(PaneMode m);
 void ApplyViewToAll();
 void ResetFolderView();
 
@@ -862,6 +869,10 @@ MenuExtra ViewMenu() {
              {L"Contenu\tCtrl+Maj+8", [] { ViewByKey(8); }, false, g_viewMode == VM_CONTENT},
              {},
              {L"Mode compact", [] { SetCompact(!g_compact); }, false, g_compact},
+             {},
+             {L"Volet d'aperçu\tAlt+P", [] { TogglePane(PaneMode::Preview); }, false, Pane_Mode() == PaneMode::Preview},
+             {L"Volet de détails\tAlt+Maj+P", [] { TogglePane(PaneMode::Details); }, false,
+              Pane_Mode() == PaneMode::Details},
              {},
              {L"Choisir les colonnes…", [] { ChooseColumns(); }},
              {L"Appliquer à tous les dossiers", [] { ApplyViewToAll(); }},
@@ -1648,6 +1659,58 @@ void ShowSelectionSummary() {
         else anyDir = true;  // taille inconnue : pas de total
     }
     SetStatusPart(SB_SEL, SelectionText(count, anyDir, bytes, !g_view.data->isRoot()));
+    if (Pane_Mode() != PaneMode::None) SetTimer(g_hwnd, TIMER_PANE, 60, nullptr);  // flèches maintenues : une lecture
+}
+
+// ── Volet d'aperçu / de détails ──
+
+// Sélection (100 éléments au plus) ou, sans sélection, le dossier affiché.
+void UpdatePane() {
+    KillTimer(g_hwnd, TIMER_PANE);
+    if (Pane_Mode() == PaneMode::None) return;
+    std::vector<PaneItem> items;
+    std::wstring title, text;
+    if (HasView() && !g_view.data->isRoot()) {
+        for (int r = -1; (r = ListView_GetNextItem(g_list, r, LVNI_SELECTED)) >= 0 && items.size() < 100;) {
+            const int e = EntryAt(r);
+            if (e < 0) continue;
+            items.push_back({Join(g_path, NameOf(e)), E(e).attr, E(e).size, E(e).mtime});
+        }
+    }
+    if (items.empty()) {
+        if (!HasView() || g_view.data->isRoot()) title = L"Ce PC";
+        else if (!g_query.empty()) title = L"Résultats de la recherche";
+        else {
+            title = g_path;
+            while (title.size() > 3 && title.back() == L'\\') title.pop_back();
+            if (title.size() > 3) title = PathFindFileNameW(title.c_str());
+        }
+        const int n = HasView() ? ListView_GetItemCount(g_list) : 0;
+        text = std::to_wstring(n) + (n > 1 ? L" éléments" : L" élément");
+    }
+    Pane_Show(title, text, std::move(items));
+}
+
+void SavePane() {
+    const DWORD mode = (DWORD)Pane_Mode(), w = (DWORD)g_paneW96;
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"PaneMode", REG_DWORD, &mode, sizeof mode);
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"PaneWidth", REG_DWORD, &w, sizeof w);
+}
+
+void LoadPane() {
+    g_paneW96 = (int)std::clamp<DWORD>(RegDword(L"Software\\FastExplorer", L"PaneWidth", 320), 160, 2000);
+    const DWORD m = RegDword(L"Software\\FastExplorer", L"PaneMode", 0);
+    Pane_SetMode(m == 1 ? PaneMode::Preview : m == 2 ? PaneMode::Details : PaneMode::None);
+}
+
+void Layout();
+
+// Alt+P : aperçu ; Alt+Maj+P : détails ; la même touche referme le volet.
+void TogglePane(PaneMode m) {
+    Pane_SetMode(Pane_Mode() == m ? PaneMode::None : m);
+    Layout();
+    UpdatePane();
+    SavePane();
 }
 
 void Refresh();
@@ -1881,6 +1944,7 @@ void OnResult(Result* raw) {
     if (p.view) ApplyFolderView(*p.view);  // autre dossier : son affichage
     else UpdateColumnsForView();
     RequestSortProps();
+    if (Pane_Mode() != PaneMode::None) SetTimer(g_hwnd, TIMER_PANE, 30, nullptr);  // dossier changé, ou fichier modifié
 
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
     if (g_path.empty()) {
@@ -3323,7 +3387,8 @@ void ApplyFont() {
         SelectObject(dc, old);
         ReleaseDC(g_hwnd, dc);
     }
-    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_btnRefresh, g_nav, g_crumbs, g_searchBox, g_tabBar})
+    for (HWND h : {g_list, g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp, g_btnRefresh, g_nav, g_crumbs, g_searchBox, g_tabBar,
+                   g_pane})
         SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
 }
 
@@ -3361,7 +3426,7 @@ void Layout() {
     const int editH = g_fontH + S(10);  // texte centré verticalement
     const int h = std::max(S(30), editH);
     // Un seul lot de déplacements : un repaint au lieu d'un par contrôle.
-    HDWP dwp = BeginDeferWindowPos(11);
+    HDWP dwp = BeginDeferWindowPos(12);
     auto place = [&](HWND w, int x, int y, int cx, int cy) {
         if (dwp) dwp = DeferWindowPos(dwp, w, nullptr, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
         else MoveWindow(w, x, y, cx, cy, TRUE);
@@ -3389,7 +3454,20 @@ void Layout() {
     const int navW = std::clamp(S(g_navW96), S(120), std::max(S(120), (int)rc.right / 2));
     place(g_nav, 0, top, navW, bodyH);
     g_split = {navW, top, navW + split, top + bodyH};
-    place(g_list, navW + split, top, std::max(0, (int)rc.right - navW - split), bodyH);
+    // Volet d'aperçu / de détails à droite, avec son propre séparateur.
+    int paneW = 0;
+    if (g_pane && Pane_Mode() != PaneMode::None) {
+        const int room = std::max(0, (int)rc.right - navW - split - S(160) - split);
+        paneW = std::min(std::clamp(S(g_paneW96), S(160), std::max(S(160), (int)rc.right * 2 / 3)), room);
+    }
+    const int listW = std::max(0, (int)rc.right - navW - split - (paneW ? paneW + split : 0));
+    place(g_list, navW + split, top, listW, bodyH);
+    if (paneW) {
+        g_paneSplit = {navW + split + listW, top, navW + split + listW + split, top + bodyH};
+        place(g_pane, g_paneSplit.right, top, paneW, bodyH);
+    } else {
+        g_paneSplit = {};
+    }
     if (dwp) EndDeferWindowPos(dwp);
     ApplyTileInfo();  // contenu : cases sur toute la largeur
 }
@@ -3454,6 +3532,7 @@ void CreateChildren(HWND hwnd) {
     nav.contextMenu = ShowNavMenu;
     nav.status = [](const std::wstring& text) { SetStatus(text); };
     g_nav = NavPane_Create(hwnd, ID_NAV, WM_APP_NAV, std::move(nav));
+    g_pane = Pane_Create(hwnd, ID_PANE, [](const std::wstring& text) { SetStatus(text); });
 
     g_status = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd,
                                (HMENU)ID_STATUS, g_inst, nullptr);
@@ -3463,6 +3542,7 @@ void CreateChildren(HWND hwnd) {
     UpdateButtons();
     UpdateTabStrip();
     LoadViewMode();  // mode d'affichage de la dernière session
+    LoadPane();
     Layout();  // fenêtre encore invisible : aucun repaint
 }
 
@@ -3510,7 +3590,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 POINT p;
                 GetCursorPos(&p);
                 ScreenToClient(hwnd, &p);
-                if (PtInRect(&g_split, p)) {
+                if (PtInRect(&g_split, p) || PtInRect(&g_paneSplit, p)) {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                     return TRUE;
                 }
@@ -3520,18 +3600,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}; PtInRect(&g_split, p)) {
                 g_splitDrag = true;
                 SetCapture(hwnd);
+            } else if (PtInRect(&g_paneSplit, p)) {
+                g_paneDrag = true;
+                SetCapture(hwnd);
             }
             return 0;
         case WM_MOUSEMOVE:
             if (g_splitDrag) {
                 g_navW96 = MulDiv(std::max(0, (int)GET_X_LPARAM(lp)), 96, (int)g_dpi);
                 Layout();
+            } else if (g_paneDrag) {
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                g_paneW96 = MulDiv(std::max(0, (int)rc.right - (int)GET_X_LPARAM(lp)), 96, (int)g_dpi);
+                Layout();
             }
             return 0;
         case WM_LBUTTONUP:
-            if (g_splitDrag) ReleaseCapture();
+            if (g_splitDrag || g_paneDrag) ReleaseCapture();
             return 0;
-        case WM_CAPTURECHANGED: g_splitDrag = false; return 0;
+        case WM_CAPTURECHANGED:
+            if (g_paneDrag) SavePane();
+            g_splitDrag = g_paneDrag = false;
+            return 0;
         case WM_APP_ICON: OnIcon((IconResult*)lp); return 0;
         case WM_APP_THUMB: OnThumb((ThumbResult*)lp); return 0;
         case WM_APP_PROPS: OnProps((PropResult*)lp); return 0;
@@ -3640,6 +3731,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == TIMER_PINNED) { KillTimer(hwnd, wp); NavPane_RefreshPinned(true); return 0; }
+            if (wp == TIMER_PANE) {
+                UpdatePane();
+                return 0;
+            }
             if (wp == TIMER_HOVER) {
                 KillTimer(hwnd, wp);
                 POINT c;
@@ -3731,6 +3826,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Icons_Stop();
             Thumbs_Stop();
             Props_Stop();
+            Pane_Shutdown();
             DirSizes_Stop();
             Watch_Stop();
             ShellMenu_Discard(true);
@@ -3837,6 +3933,7 @@ bool HandleGlobalKeys(const MSG& m) {
             case VK_RIGHT: GoForward(); return true;
             case VK_UP: GoUp(); return true;
             case 'D': BeginAddressEdit(); return true;
+            case 'P': TogglePane(GetKeyState(VK_SHIFT) < 0 ? PaneMode::Details : PaneMode::Preview); return true;
             case VK_RETURN:
                 if (focus == g_addr) return false;
                 ShowProperties();

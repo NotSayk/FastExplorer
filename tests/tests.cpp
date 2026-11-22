@@ -17,6 +17,7 @@
 #include <atomic>
 #include "crumbs.h"
 #include "navpane.h"
+#include "panes.h"
 #include "pins.h"
 #include "nt.h"
 #include "shellmenu.h"
@@ -1360,6 +1361,42 @@ void TestDrop() {
     CHECK(waitFor(Join(src, L"dans_sous.txt"), false));
 }
 
+void TestPane() {
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const std::wstring dir = Join(tmp, L"fe_test_pane");
+    CreateDirectoryW(dir.c_str(), nullptr);
+    auto write = [&](const wchar_t* name, const std::string& bytes) {
+        const std::wstring p = Join(dir, name);
+        HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD w = 0;
+        WriteFile(h, bytes.data(), (DWORD)bytes.size(), &w, nullptr);
+        CloseHandle(h);
+        return p;
+    };
+    bool cut = true;
+    CHECK_STR(Pane_ReadText(write(L"u8.txt", "\xEF\xBB\xBFh\xC3\xA9\nl\xC3\xA0"), 1000, cut), L"hé\r\nlà");
+    CHECK(!cut);
+    CHECK_STR(Pane_ReadText(write(L"nobom.txt", "a\r\nb\rc"), 1000, cut), L"a\r\nb\r\nc");
+    CHECK_STR(Pane_ReadText(write(L"u16.txt", std::string("\xFF\xFEx\0y\0", 6)), 1000, cut), L"xy");
+    CHECK_STR(Pane_ReadText(write(L"acp.txt", "caf\xE9"), 1000, cut).substr(0, 3), L"caf");  // pas de l'UTF-8 : page locale
+    // Tronqué au milieu d'un caractère UTF-8 : le caractère coupé disparaît.
+    CHECK_STR(Pane_ReadText(write(L"long.txt", "ab\xC3\xA9\xC3\xA9"), 3, cut), L"ab");
+    CHECK(cut);
+    CHECK_STR(Pane_ReadText(write(L"nul.txt", std::string("a\0b", 3)), 1000, cut), L"a b");
+    CHECK_STR(Pane_ReadText(Join(dir, L"absent.txt"), 1000, cut), L"");
+
+    const std::wstring f = write(L"web.pdf", "x");
+    CHECK(!Pane_FromInternet(f));
+    write(L"web.pdf:Zone.Identifier", "[ZoneTransfer]\r\nZoneId=3\r\n");
+    CHECK(Pane_FromInternet(f));
+    write(L"web.pdf:Zone.Identifier", "[ZoneTransfer]\r\nZoneId=1\r\n");
+    CHECK(!Pane_FromInternet(f));
+    for (const wchar_t* n : {L"u8.txt", L"nobom.txt", L"u16.txt", L"acp.txt", L"long.txt", L"nul.txt", L"web.pdf"})
+        DeleteFileW(Join(dir, n).c_str());
+    RemoveDirectoryW(dir.c_str());
+}
+
 }  // namespace
 
 int wmain() {
@@ -1378,6 +1415,7 @@ int wmain() {
     TestVolumeIndex();
     TestSearchFilters();
     TestColumns();
+    TestPane();
     TestEdgeCases();
     TestLongPath();
     TestParallelMatchesSequential();
