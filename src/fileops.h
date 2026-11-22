@@ -16,7 +16,8 @@
 // thread : l'interface reste fluide pendant une copie de plusieurs minutes.
 
 // Restore : remet des éléments de la Corbeille à leur place d'origine (annuler une suppression).
-enum class FileOpKind { Copy, Move, Delete, Rename, NewFolder, Restore };
+// RestoreBin : idem depuis la vue Corbeille (paths = éléments $R…). EmptyBin : vider la Corbeille.
+enum class FileOpKind { Copy, Move, Delete, Rename, NewFolder, Restore, RestoreBin, EmptyBin };
 
 struct FileOp {
     FileOpKind kind = FileOpKind::Copy;
@@ -40,7 +41,7 @@ struct FileOpResult {
     HRESULT hr = S_OK;
     bool aborted = false;               // annulé par l'utilisateur (en tout ou partie)
     std::wstring folder;                // = FileOp::folder
-    std::vector<std::wstring> created;  // noms créés directement dans `folder`
+    std::vector<std::wstring> created;  // noms créés directement dans `folder` (RestoreBin : chemins restaurés)
     std::wstring focusAfter;
     bool clipboardCut = false;
     DWORD clipSeq = 0;
@@ -57,6 +58,16 @@ struct FileOpResult {
 // de son volume : l'élément supprimé le plus récemment, et pas avant `since`.
 // Lit les fichiers $I de $Recycle.Bin\<SID> (format de Windows Vista à 11).
 DWORD Recycle_Restore(const std::wstring& original, int64_t since);
+
+// Dossiers de Corbeille de l'utilisateur (« C:\$Recycle.Bin\<SID>\ »), un par lecteur local.
+std::vector<std::wstring> Recycle_Dirs();
+// Lit un fichier $I : chemin d'origine, date de suppression (FILETIME UTC), taille.
+bool Recycle_ReadInfo(const std::wstring& iPath, std::wstring& original, int64_t& when, uint64_t& size);
+// Fichier $I qui décrit l'élément $R (même suffixe) ; "" si ce n'en est pas un.
+std::wstring Recycle_InfoOf(const std::wstring& rPath);
+// Remet l'élément $R à son emplacement d'origine (dossier parent recréé au besoin ; jamais par-dessus
+// un élément existant : ERROR_ALREADY_EXISTS).
+DWORD Recycle_RestoreItem(const std::wstring& rPath, std::wstring* restoredTo = nullptr);
 
 // Applications qui gardent ces fichiers ouverts (Restart Manager), ex. « Word, Excel » ; "" si aucune connue.
 std::wstring FileOps_Lockers(const std::vector<std::wstring>& paths);

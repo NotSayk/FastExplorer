@@ -742,6 +742,7 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewP
     const wchar_t* P = d.pool.data();
     const uint64_t* DS = dirSizes && dirSizes->size() == n ? dirSizes->data() : nullptr;
     const PropValues* PV = prop && prop->text.size() == n && prop->num.size() == n ? prop : nullptr;
+    const std::wstring* OR = d.origin.size() == n ? d.origin.data() : nullptr;
     auto cmp = [=](uint32_t ia, uint32_t ib) {
         const Entry& a = E[ia];
         const Entry& b = E[ib];
@@ -754,6 +755,12 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewP
             case COL_CTIME: c = Cmp3(a.ctime, b.ctime); break;
             case COL_ATIME: c = Cmp3(a.atime, b.atime); break;
             case COL_ATTR: c = Cmp3(a.attr & kShownAttrs, b.attr & kShownAttrs); break;
+            case COL_ORIGIN:
+                if (OR)
+                    c = CompareStringEx(LOCALE_NAME_USER_DEFAULT, LINGUISTIC_IGNORECASE | SORT_DIGITSASNUMBERS,
+                                        OR[ia].c_str(), (int)OR[ia].size(), OR[ib].c_str(), (int)OR[ib].size(), nullptr,
+                                        nullptr, 0) - CSTR_EQUAL;
+                break;
             case COL_PROP:
                 if (PV) {
                     // Sans valeur : en tête (comme l'Explorateur) ; nombres et dates : par valeur ; sinon texte naturel.

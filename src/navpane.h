@@ -78,6 +78,8 @@ struct NavFolder {
 //   3. si rien de tout ça : Bureau, Téléchargements, Documents, Images, Musique, Vidéos.
 // useShell = false : comme si l'Accès rapide de Windows ne répondait pas (tests).
 std::vector<NavFolder> NavPane_ReadPinned(bool useShell = true);
+// Contenu actuel de l'Accès rapide du volet (thread de l'interface ; pas encore lu : dernière copie connue).
+std::vector<NavFolder> NavPane_ShownPins();
 // Sous-dossiers d'un dossier, dans l'ordre de l'Explorateur (sans les dossiers
 // protégés du système, cachés ET système). "" = lecteurs de Ce PC.
 std::vector<NavFolder> NavPane_ReadChildren(const std::wstring& path);

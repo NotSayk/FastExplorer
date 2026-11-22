@@ -38,6 +38,7 @@ const Builtin kBuiltins[] = {
     {COL_CTIME, L"ctime", L"Date de création", 170, false, &PKEY_DateCreated},
     {COL_ATIME, L"atime", L"Date d'accès", 170, false, &PKEY_DateAccessed},
     {COL_ATTR, L"attr", L"Attributs", 90, false, &PKEY_FileAttributes},
+    {COL_ORIGIN, L"origin", L"Emplacement d'origine", 260, false, nullptr},  // emplacements virtuels seulement,
 };
 
 const Builtin* FindBuiltin(int key) {
@@ -48,7 +49,7 @@ const Builtin* FindBuiltin(int key) {
 
 const Builtin* BuiltinForProp(const PROPERTYKEY& pk) {
     for (const auto& b : kBuiltins)
-        if (IsEqualPropertyKey(*b.pk, pk)) return &b;
+        if (b.pk && IsEqualPropertyKey(*b.pk, pk)) return &b;
     return nullptr;
 }
 

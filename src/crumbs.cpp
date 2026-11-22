@@ -14,6 +14,8 @@ std::vector<Crumb> Crumbs_Split(const std::wstring& path,
     std::wstring p = path;
     while (p.size() > 3 && p.back() == L'\\') p.pop_back();
     if (p.empty()) return {{L"Ce PC", L""}};
+    if (p == L"::bin") return {{L"Corbeille", p}};  // emplacements virtuels (places.h)
+    if (p == L"::home") return {{L"Accueil", p}};
 
     std::wstring cur, rest;
     if (p.size() >= 2 && p[1] == L':') {  // C:\…

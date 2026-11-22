@@ -19,6 +19,7 @@
 #include "navpane.h"
 #include "panes.h"
 #include "pins.h"
+#include "places.h"
 #include "nt.h"
 #include "shellmenu.h"
 #include "watch.h"
@@ -590,6 +591,179 @@ void TestNeedsOwnIcon() {
     CHECK(!Own(FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_REPARSE_POINT, L".exe"));
     CHECK(!Own(FILE_ATTRIBUTE_OFFLINE, L".lnk"));
     CHECK(!Own(FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY, L""));
+}
+
+// ── Corbeille et Accueil (places.h) ──
+
+void WriteBytes(const std::wstring& path, const std::vector<BYTE>& b) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    DWORD n = 0;
+    if (f != INVALID_HANDLE_VALUE) {
+        WriteFile(f, b.data(), (DWORD)b.size(), &n, nullptr);
+        CloseHandle(f);
+    }
+}
+
+// Fichier $I : version 2 (longueur + chemin) ou 1 (chemin sur 260 caractères).
+std::vector<BYTE> RecycleInfo(int ver, uint64_t size, int64_t when, const std::wstring& orig) {
+    std::vector<BYTE> b(24);
+    const int64_t v = ver;
+    memcpy(b.data(), &v, 8);
+    memcpy(b.data() + 8, &size, 8);
+    memcpy(b.data() + 16, &when, 8);
+    std::wstring p = orig;
+    if (ver == 2) {
+        const uint32_t n = (uint32_t)p.size() + 1;
+        b.resize(28);
+        memcpy(b.data() + 24, &n, 4);
+        p.push_back(L'\0');
+    } else {
+        p.resize(260, L'\0');
+    }
+    const size_t at = b.size();
+    b.resize(at + p.size() * 2);
+    memcpy(b.data() + at, p.data(), p.size() * 2);
+    return b;
+}
+
+void SetMtime(const std::wstring& path, int64_t t) {
+    HANDLE f = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    FILETIME ft{(DWORD)t, (DWORD)((uint64_t)t >> 32)};
+    SetFileTime(f, nullptr, nullptr, &ft);
+    CloseHandle(f);
+}
+
+void MakeLnk(const std::wstring& lnk, const std::wstring& target) {
+    IShellLinkW* sl = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl)))) return;
+    sl->SetPath(target.c_str());
+    IPersistFile* pf = nullptr;
+    if (SUCCEEDED(sl->QueryInterface(IID_PPV_ARGS(&pf)))) {
+        pf->Save(lnk.c_str(), TRUE);
+        pf->Release();
+    }
+    sl->Release();
+}
+
+void TestPlaces() {
+    const std::wstring base = Join(g_root, L"places");
+    CreateDirectoryW(base.c_str(), nullptr);
+    const std::wstring bin = Join(base, L"bin");
+    CreateDirectoryW(bin.c_str(), nullptr);
+
+    // Lecture des $I, versions 1 et 2.
+    const std::wstring orig = Join(base, L"restauré\\sous dossier\\note é.txt");
+    WriteBytes(Join(bin, L"$IAB12CD.txt"), RecycleInfo(2, 1234, 133000000000000000LL, orig));
+    WriteBytes(Join(bin, L"$IOLD001.txt"), RecycleInfo(1, 7, 132000000000000000LL, L"D:\\ancien\\v1.txt"));
+    WriteBytes(Join(bin, L"$IBAD001.txt"), {1, 2, 3});
+    std::wstring o;
+    int64_t when = 0;
+    uint64_t size = 0;
+    CHECK(Recycle_ReadInfo(Join(bin, L"$IAB12CD.txt"), o, when, size));
+    CHECK_STR(o, orig);
+    CHECK(when == 133000000000000000LL && size == 1234);
+    CHECK(Recycle_ReadInfo(Join(bin, L"$IOLD001.txt"), o, when, size));
+    CHECK_STR(o, L"D:\\ancien\\v1.txt");
+    CHECK(size == 7);
+    CHECK(!Recycle_ReadInfo(Join(bin, L"$IBAD001.txt"), o, when, size));
+    CHECK(!Recycle_ReadInfo(Join(bin, L"$Iabsent.txt"), o, when, size));
+    CHECK_STR(Recycle_InfoOf(L"C:\\$Recycle.Bin\\S-1\\$RAB12CD.txt"), L"C:\\$Recycle.Bin\\S-1\\$IAB12CD.txt");
+    CHECK_STR(Recycle_InfoOf(L"C:\\x\\fichier.txt"), L"");
+
+    // Restaurer : dossiers d'origine recréés, $I effacé ; jamais par-dessus un élément existant.
+    const std::wstring r = Join(bin, L"$RAB12CD.txt");
+    WriteBytes(r, {'o', 'k'});
+    std::wstring to;
+    CHECK(Recycle_RestoreItem(r, &to) == 0);
+    CHECK_STR(to, orig);
+    CHECK(GetFileAttributesW(orig.c_str()) != INVALID_FILE_ATTRIBUTES);
+    CHECK(GetFileAttributesW(r.c_str()) == INVALID_FILE_ATTRIBUTES);
+    CHECK(GetFileAttributesW(Join(bin, L"$IAB12CD.txt").c_str()) == INVALID_FILE_ATTRIBUTES);
+    WriteBytes(Join(bin, L"$IAB12CE.txt"), RecycleInfo(2, 2, 133000000000000001LL, orig));
+    WriteBytes(Join(bin, L"$RAB12CE.txt"), {'x'});
+    CHECK(Recycle_RestoreItem(Join(bin, L"$RAB12CE.txt")) == ERROR_ALREADY_EXISTS);
+    CHECK(GetFileAttributesW(Join(bin, L"$RAB12CE.txt").c_str()) != INVALID_FILE_ATTRIBUTES);  // resté dans la Corbeille
+
+    // Vraie Corbeille : chaque entrée a son élément $R et son emplacement d'origine.
+    {
+        DirData d;
+        Recycle_Enumerate(d);
+        CHECK(d.path == kBinPath && d.isVirtual() && !d.isRoot());
+        CHECK(d.target.size() == d.entries.size() && d.origin.size() == d.entries.size());
+        bool ok = true;
+        for (const auto& t : d.target) ok = ok && t.find(L"\\$R") != std::wstring::npos;
+        CHECK(ok);
+    }
+
+    // Accueil : raccourcis récents, du plus récent au plus ancien ; disparus et dossiers ignorés.
+    const std::wstring recent = Join(base, L"recent");
+    CreateDirectoryW(recent.c_str(), nullptr);
+    const std::wstring docs = Join(base, L"docs");
+    CreateDirectoryW(docs.c_str(), nullptr);
+    WriteBytes(Join(docs, L"a.txt"), {'a'});
+    WriteBytes(Join(docs, L"b.pdf"), {'b', 'b'});
+    MakeLnk(Join(recent, L"a.txt.lnk"), Join(docs, L"a.txt"));
+    MakeLnk(Join(recent, L"b.pdf.lnk"), Join(docs, L"b.pdf"));
+    MakeLnk(Join(recent, L"absent.lnk"), Join(docs, L"absent.txt"));
+    MakeLnk(Join(recent, L"docs.lnk"), docs);
+    SetMtime(Join(recent, L"a.txt.lnk"), 133000000000000000LL);
+    SetMtime(Join(recent, L"b.pdf.lnk"), 133100000000000000LL);  // le plus récent
+    SetMtime(Join(recent, L"absent.lnk"), 133200000000000000LL);
+    SetMtime(Join(recent, L"docs.lnk"), 133300000000000000LL);
+    {
+        DirData d;
+        Home_EnumerateFrom(d, recent, {}, {}, 40);
+        CHECK(d.path == kHomePath && d.isVirtual());
+        CHECK(d.entries.size() == 2);
+        if (d.entries.size() == 2) {
+            CHECK_STR(d.name(d.entries[0]), L"b.pdf");
+            CHECK_STRI(d.target[0], Join(docs, L"b.pdf"));
+            CHECK_STRI(d.origin[0], docs);
+            CHECK(d.entries[0].mtime == 133100000000000000LL && d.entries[0].size == 2);
+            CHECK_STR(d.name(d.entries[1]), L"a.txt");
+            const auto order = SortOrder(d, COL_DATE, false);
+            CHECK(order.size() == 2 && order[0] == 0);
+        }
+        DirData one;
+        Home_EnumerateFrom(one, recent, {}, {}, 1);
+        CHECK(one.entries.size() == 1 && one.target.size() == 1);
+    }
+
+    // Tri par emplacement d'origine.
+    {
+        DirData d;
+        d.path = kBinPath;
+        for (const wchar_t* n : {L"x.txt", L"y.txt", L"z.txt"}) DirData_Add(d, n, (uint32_t)wcslen(n), FILE_ATTRIBUTE_NORMAL, 1, 1);
+        d.origin = {L"C:\\b", L"C:\\a", L"C:\\c"};
+        d.target = {L"1", L"2", L"3"};
+        DirData_BuildKeys(d);
+        const auto order = SortOrder(d, COL_ORIGIN, true);
+        CHECK(order == (std::vector<uint32_t>{1, 0, 2}));
+        CHECK(SortOrder(d, COL_ORIGIN, false) == (std::vector<uint32_t>{2, 0, 1}));
+        ColSpec c;
+        CHECK(Columns_FromId(L"origin", c) && c.key == COL_ORIGIN);
+    }
+
+    {  // durée sur le vrai dossier Recent (information)
+        const ULONGLONG t0 = GetTickCount64();
+        DirData d;
+        Home_Enumerate(d, {});
+        const ULONGLONG t1 = GetTickCount64();
+        DirData b;
+        Recycle_Enumerate(b);
+        printf("  Accueil : %zu elements en %llu ms ; Corbeille : %zu elements en %llu ms\n", d.entries.size(), t1 - t0,
+               b.entries.size(), GetTickCount64() - t1);
+    }
+    CHECK_STR(Places_FromAlias(L"Corbeille"), kBinPath);
+    CHECK_STR(Places_FromAlias(L"shell:RecycleBinFolder"), kBinPath);
+    CHECK_STR(Places_FromAlias(L"accueil"), kHomePath);
+    CHECK_STR(Places_FromAlias(L"C:\\Windows"), L"");
+    CHECK_STR(Places_Title(kBinPath), L"Corbeille");
+    const auto crumbs = Crumbs_Split(kBinPath, {});
+    CHECK(crumbs.size() == 1 && crumbs[0].text == L"Corbeille" && crumbs[0].path == kBinPath);
+    CHECK(IsVirtualPath(kHomePath) && !IsVirtualPath(L"C:\\") && !IsVirtualPath(L""));
 }
 
 void TestShortcut() {
@@ -1517,6 +1691,7 @@ int wmain() {
     TestSearch();
     TestFastCopy();
     TestFileOps();
+    TestPlaces();
     TestCopyQueue();  // après TestFileOps : classe de fenêtre FeTestSink
     TestDrop();
     RemoveTree(g_root);

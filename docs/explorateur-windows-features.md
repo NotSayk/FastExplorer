@@ -28,7 +28,7 @@ De haut en bas :
 | **Barre d'onglets** (barre de titre) | Onglets, bouton « + », boutons fenêtre | ✅ P1 (barre sous la barre de titre) |
 | **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅ (bouton Actualiser : bloc 10) |
 | **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | P1 |
-| **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accès rapide épinglé + arborescence de Ce PC, séparateur ; Accueil, Galerie, Réseau, Linux à venir) |
+| **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accueil, Accès rapide épinglé, arborescence de Ce PC, Corbeille ; Galerie, Réseau, Linux à venir) |
 | **Zone de contenu** | La liste des éléments | ✅ P0 |
 | **Volet d'aperçu / de détails** (droite) | Aperçu du fichier, ou métadonnées | ✅ P1 |
 | **Barre d'état** (bas) | Nombre d'éléments, nombre et taille de la sélection, boutons Détails / Grandes icônes | ✅🟡 P0 (trois zones : contenu du dossier, sélection, temps de lecture ; boutons d'affichage à venir avec les autres vues) |
@@ -76,7 +76,7 @@ De haut en bas :
 
 | Emplacement | Ce que c'est | Prio |
 |---|---|---|
-| **Accueil** (Home) | Page d'accueil : *Accès rapide* (dossiers épinglés et fréquents), *Favoris* (fichiers épinglés), *Récents*, *Recommandés* (2025 : aussi pour les comptes locaux et Microsoft), *Partagés* (comptes pro). Colonne « Activité » avec avatars pour les comptes Entra ID. Depuis 2026 : « Ouvrir l'emplacement du fichier » et « Demander à Copilot » (comptes pro/scolaires) | P1 (Accès rapide), P3 (le reste) |
+| **Accueil** (Home) | Page d'accueil : *Accès rapide* (dossiers épinglés et fréquents), *Favoris* (fichiers épinglés), *Récents*, *Recommandés* (2025 : aussi pour les comptes locaux et Microsoft), *Partagés* (comptes pro). Colonne « Activité » avec avatars pour les comptes Entra ID. Depuis 2026 : « Ouvrir l'emplacement du fichier » et « Demander à Copilot » (comptes pro/scolaires) | ✅🟡 P1 (bloc 21 : dossiers de l'Accès rapide puis 40 fichiers récents, colonnes Emplacement / Utilisé le, « Ouvrir l'emplacement du fichier », menu du Shell sur les vrais fichiers ; raccourcis récents lus directement, sans le Shell : ~80 ms), P3 (Favoris, Recommandés, Partagés) |
 | **Galerie** | Mosaïque chronologique de toutes les photos (dossier Images + sources ajoutées), regroupées par mois, filtre de collection | P2 |
 | **Dossiers épinglés** | Bureau, Téléchargements, Documents, Images, Musique, Vidéos + vos épingles (« Épingler à Accès rapide ») | **P0** |
 | **Ce PC** | Lecteurs (avec jauge d'espace libre), dossiers de l'utilisateur, emplacements réseau, appareils (téléphones MTP, appareils photo) | ✅ P0 (lecteurs : libellé, jauge, espace libre ; réseau et appareils à venir) |
@@ -84,7 +84,7 @@ De haut en bas :
 | **Linux** | Distributions WSL via `\\wsl.localhost\<distro>` | P2 |
 | **Téléphone mobile Android** | Accès sans fil aux fichiers du téléphone via « Lien avec Windows » (2025) | P3 |
 | **Bibliothèques** | Masquées par défaut. Vues agrégées de plusieurs dossiers (Documents, Musique, Images, Vidéos) | P3 |
-| **Corbeille** | Voir §11 | P1 |
+| **Corbeille** | Voir §11 | ✅ P1 (bloc 21) |
 | **Panneau de configuration** | Visible si « Afficher tous les dossiers » est coché | P3 |
 | Clic droit sur le volet | Épingler, détacher, développer, ouvrir dans un nouvel onglet, propriétés | ✅🟡 P1 (menu du Shell + épingler / désépingler, nouvel onglet ; développer à venir) |
 
@@ -352,9 +352,9 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Parcourir | Colonnes *Emplacement d'origine* et *Date de suppression* | P1 |
-| Restaurer | La sélection, ou tous les éléments | P1 |
-| Vider | Tout supprimer définitivement | P1 |
+| Parcourir | Colonnes *Emplacement d'origine* et *Date de suppression* | ✅ P1 (bloc 21 : lecture directe des `$I` de tous les lecteurs locaux, ~30 ms pour 70 éléments ; colonnes fixes Nom, Emplacement d'origine, Date de suppression, Taille, Type ; les plus récents d'abord ; triable par emplacement) |
+| Restaurer | La sélection, ou tous les éléments | ✅ P1 (clic droit ▸ Restaurer / fond ▸ Restaurer tous les éléments ; dossier d'origine recréé s'il a disparu ; jamais par-dessus un élément existant) |
+| Vider | Tout supprimer définitivement | ✅ P1 (fond ▸ Vider la Corbeille, confirmation et progression du Shell ; Suppr dans la Corbeille = suppression définitive de la sélection, confirmée) |
 | Propriétés | Taille maximale **par lecteur**, option « Ne pas déplacer les fichiers vers la Corbeille », confirmation de suppression | P2 |
 | Fonctionnement | ⚙️ Un dossier `$Recycle.Bin\<SID>` par volume ; chaque élément = `$R…` (données) + `$I…` (nom d'origine, taille, date) ; API : `IFileOperation` avec `FOFX_RECYCLEONDELETE`, énumération via le dossier Shell `CLSID_RecycleBin` | — |
 
@@ -636,7 +636,7 @@ dossiers avant l'index…) :
 19. ✅ **File d'attente de copies** ⭐ : opérations à la suite plutôt qu'en parallèle sur un même disque,
     pause / reprise, liste visible.
 20. ✅ **Double panneau** ⭐ (à la Total Commander), sur la base des onglets.
-21. **Corbeille et Accueil** : parcourir, restaurer, vider ; page d'Accueil (Accès rapide, récents).
+21. ✅ **Corbeille et Accueil** : parcourir, restaurer, vider ; page d'Accueil (Accès rapide, récents).
 22. **Archives** : parcourir un ZIP comme un dossier, extraire tout, compresser.
 23. **Réseau** : lister les partages d'un serveur (`\\serveur`).
 24. **Barre de commandes et menu rapide** : nos commandes courantes en un clic, accès au menu du Shell,

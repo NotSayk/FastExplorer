@@ -99,7 +99,7 @@ std::vector<NavFolder> FoldersOf(const DirData& d, bool probeChildren) {
 
 // ── État du volet (thread de l'interface) ──
 
-enum class Kind { Quick, Pinned, Pc, Drive, Folder };
+enum class Kind { Quick, Pinned, Pc, Drive, Folder, Place };  // Place : Accueil, Corbeille (sans enfants)
 
 struct Node {
     Kind kind;
@@ -113,7 +113,7 @@ UINT g_msg = 0;
 NavHost g_host;
 std::unordered_map<uintptr_t, Node> g_nodes;
 uintptr_t g_nextId = 1;
-HTREEITEM g_quick = nullptr, g_pc = nullptr;
+HTREEITEM g_quick = nullptr, g_pc = nullptr, g_home = nullptr, g_bin = nullptr;
 int g_folderIcon = 0;
 bool g_syncing = false;  // sélection faite par le programme : pas de navigation
 ULONGLONG g_pinnedAt = 0;
@@ -124,6 +124,7 @@ struct Result {
     uintptr_t id = 0;  // Children : nœud visé
     std::vector<NavFolder> folders;
     int rootIcon = -1;  // icône du nœud racine (Accès rapide, Ce PC)
+    int homeIcon = -1, binIcon = -1;  // Pinned : icônes de l'Accueil et de la Corbeille
     bool unpinFailed = false;
 };
 std::wstring g_unpinQueued;  // désépinglage demandé pendant une lecture
@@ -378,6 +379,8 @@ std::vector<NavFolder> NavPane_ReadPinned(bool useShell) {
     return out;
 }
 
+std::vector<NavFolder> NavPane_ShownPins() { return g_shownPins.empty() ? NavPane_ReadPinned(false) : g_shownPins; }
+
 NavPin NavPane_PinOf(const std::wstring& path) {
     for (const auto& f : g_shownPins)
         if (SamePath(f.path, path)) return f.pin;
@@ -407,12 +410,16 @@ HWND NavPane_Create(HWND parent, UINT id, UINT msg, NavHost host) {
                        SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES))
         g_folderIcon = sfi.iIcon;
 
+    NavFolder home{L"Accueil", L"::home", -1, false};
+    g_home = Insert(TVI_ROOT, TVI_LAST, home, Kind::Place);
     NavFolder quick{L"Accès rapide", L"", -1, true};
     g_quick = Insert(TVI_ROOT, TVI_LAST, quick, Kind::Quick);
     if (Node* n = NodeOf(g_quick)) n->loaded = true;  // ses enfants viennent de NavPane_RefreshPinned
     NavFolder pc{L"Ce PC", L"", -1, true};
     g_pc = Insert(TVI_ROOT, TVI_LAST, pc, Kind::Pc);
     if (Node* n = NodeOf(g_pc)) n->expandWhenLoaded = true;  // ouvert d'emblée, comme l'Explorateur
+    NavFolder bin{L"Corbeille", L"::bin", -1, false};
+    g_bin = Insert(TVI_ROOT, TVI_LAST, bin, Kind::Place);
     StartLoad(IdOf(g_pc));
     NavPane_RefreshPinned(true);
     return g_tree;
@@ -478,6 +485,16 @@ void StartPinnedRead(const std::wstring& unpinFirst) {
             if (SHGetFileInfoW((LPCWSTR)p, 0, &sfi, sizeof sfi, SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_SMALLICON))
                 r->rootIcon = sfi.iIcon;
             CoTaskMemFree(p);
+        }
+        for (auto [icon, place] : {std::pair{&r->homeIcon, L"shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}"},
+                                   std::pair{&r->binIcon, L"shell:::{645FF040-5081-101B-9F08-00AA002F954E}"}}) {
+            PIDLIST_ABSOLUTE q = nullptr;
+            if (SUCCEEDED(SHParseDisplayName(place, nullptr, &q, 0, nullptr))) {
+                SHFILEINFOW sfi{};
+                if (SHGetFileInfoW((LPCWSTR)q, 0, &sfi, sizeof sfi, SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_SMALLICON))
+                    *icon = sfi.iIcon;
+                CoTaskMemFree(q);
+            }
         }
         if (SUCCEEDED(co)) CoUninitialize();
         Post(r);
@@ -570,6 +587,8 @@ void NavPane_OnResult(LPARAM lp) {
         const bool first = !TreeView_GetChild(g_tree, g_quick);
         SyncChildren(g_quick, r->folders, Kind::Pinned);
         SetIcon(g_quick, r->rootIcon);
+        SetIcon(g_home, r->homeIcon);
+        SetIcon(g_bin, r->binIcon);
         SetChildrenFlag(g_quick, !r->folders.empty());
         if (first && !r->folders.empty()) TreeView_Expand(g_tree, g_quick, TVE_EXPAND);
         return;
@@ -665,7 +684,7 @@ void NavPane_ContextMenu(LPARAM lp) {
         if (!(hit.flags & TVHT_ONITEM)) h = nullptr;
     }
     Node* n = NodeOf(h);
-    if (!n || n->kind == Kind::Quick) return;
+    if (!n || n->kind == Kind::Quick || n->kind == Kind::Place) return;
     const std::wstring path = n->path;
     TreeView_SelectDropTarget(g_tree, h);  // repère l'élément visé, comme l'Explorateur
     g_host.contextMenu(path, pt);

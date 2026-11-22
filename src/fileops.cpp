@@ -268,9 +268,41 @@ HRESULT Restore(const FileOp& op, FileOpResult& r) {
     return first && r.created.empty() ? HRESULT_FROM_WIN32(first) : S_OK;
 }
 
+// Vue Corbeille : « Restaurer » (chaque élément $R à son emplacement d'origine).
+HRESULT RestoreBin(const FileOp& op, FileOpResult& r) {
+    DWORD first = 0;
+    size_t done = 0;
+    for (const auto& p : op.paths) {
+        std::wstring to;
+        if (const DWORD e = Recycle_RestoreItem(p, &to)) {
+            if (!first) {
+                first = e;
+                std::wstring o;
+                int64_t w = 0;
+                uint64_t s = 0;
+                if (e == ERROR_ALREADY_EXISTS && Recycle_ReadInfo(Recycle_InfoOf(p), o, w, s))
+                    r.detail = L"« " + o + L" » existe déjà.";
+            }
+            continue;
+        }
+        ++done;
+        r.created.push_back(to);  // chemins complets (dossiers différents)
+        std::wstring parent, leaf;
+        if (ParentOf(to, parent, leaf))
+            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, parent.c_str(), nullptr);
+    }
+    return first && !done ? HRESULT_FROM_WIN32(first) : S_OK;
+}
+
 HRESULT Perform(const FileOp& op, HWND owner, FileOpResult& r, Job* job) {
     if (op.kind == FileOpKind::NewFolder) return NewFolder(op, owner, r);
     if (op.kind == FileOpKind::Restore) return Restore(op, r);
+    if (op.kind == FileOpKind::RestoreBin) return RestoreBin(op, r);
+    if (op.kind == FileOpKind::EmptyBin) {
+        // Le Shell confirme lui-même (sauf en silence), avec sa progression.
+        const HRESULT hr = SHEmptyRecycleBinW(owner, nullptr, op.silent ? SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND : 0);
+        return hr == E_UNEXPECTED ? S_OK : hr;  // Corbeille déjà vide
+    }
     if (op.kind == FileOpKind::Rename && TryFastRename(op, r)) return S_OK;
 
     HRESULT hr = S_OK;
@@ -741,6 +773,77 @@ const std::wstring& UserSid() {
 
 }  // namespace
 
+bool Recycle_ReadInfo(const std::wstring& iPath, std::wstring& original, int64_t& when, uint64_t& size) {
+    // $I : version (8 octets), taille (8), date de suppression (8, FILETIME UTC), puis
+    // version 2 : longueur (4, en caractères, \0 compris) et chemin ; version 1 : chemin sur 260 caractères.
+    std::vector<BYTE> buf(28 + 2 * 32768);
+    HANDLE f = CreateFileW(iPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD got = 0;
+    const BOOL ok = ReadFile(f, buf.data(), (DWORD)buf.size(), &got, nullptr);
+    CloseHandle(f);
+    if (!ok || got < 24) return false;
+    int64_t ver = 0;
+    memcpy(&ver, buf.data(), 8);
+    memcpy(&size, buf.data() + 8, 8);
+    memcpy(&when, buf.data() + 16, 8);
+    size_t off = 24, chars = (got - 24) / 2;
+    if (ver == 2) {
+        if (got < 28) return false;
+        uint32_t n = 0;
+        memcpy(&n, buf.data() + 24, 4);
+        off = 28;
+        chars = std::min<size_t>(n, (got - 28) / 2);
+    } else if (ver != 1) {
+        return false;
+    }
+    original.assign(chars, L'\0');
+    memcpy(original.data(), buf.data() + off, chars * 2);
+    original.resize(wcsnlen(original.c_str(), chars));
+    return !original.empty();
+}
+
+std::vector<std::wstring> Recycle_Dirs() {
+    std::vector<std::wstring> out;
+    if (UserSid().empty()) return out;
+    const DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if (!(mask & (1u << i))) continue;
+        const wchar_t root[] = {wchar_t(L'A' + i), L':', L'\\', 0};
+        const UINT type = GetDriveTypeW(root);
+        if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE) continue;
+        std::wstring dir = std::wstring(root) + L"$Recycle.Bin\\" + UserSid() + L"\\";
+        const DWORD a = GetFileAttributesW(dir.c_str());
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) out.push_back(dir);
+    }
+    return out;
+}
+
+std::wstring Recycle_InfoOf(const std::wstring& rPath) {
+    const size_t s = rPath.find_last_of(L'\\');
+    std::wstring i = rPath;
+    if (s == std::wstring::npos || s + 2 >= i.size() || i[s + 1] != L'$') return L"";
+    i[s + 2] = L'I';
+    return i;
+}
+
+DWORD Recycle_RestoreItem(const std::wstring& rPath, std::wstring* restoredTo) {
+    const std::wstring info = Recycle_InfoOf(rPath);
+    std::wstring orig;
+    int64_t when = 0;
+    uint64_t size = 0;
+    if (info.empty() || !Recycle_ReadInfo(info, orig, when, size)) return ERROR_FILE_NOT_FOUND;
+    if (GetFileAttributesW(ToNtPath(orig).c_str()) != INVALID_FILE_ATTRIBUTES) return ERROR_ALREADY_EXISTS;
+    std::wstring parent, leaf;
+    if (ParentOf(orig, parent, leaf) && GetFileAttributesW(parent.c_str()) == INVALID_FILE_ATTRIBUTES)
+        SHCreateDirectoryExW(nullptr, parent.c_str(), nullptr);  // dossier d'origine supprimé depuis : recréé
+    if (!MoveFileExW(ToNtPath(rPath).c_str(), ToNtPath(orig).c_str(), 0)) return GetLastError();
+    DeleteFileW(info.c_str());
+    if (restoredTo) *restoredTo = orig;
+    return 0;
+}
+
 DWORD Recycle_Restore(const std::wstring& original, int64_t since) {
     if (original.size() < 4 || original[1] != L':' || UserSid().empty()) return ERROR_NOT_SUPPORTED;
     const std::wstring bin = original.substr(0, 2) + L"\\$Recycle.Bin\\" + UserSid() + L"\\";
@@ -749,33 +852,11 @@ DWORD Recycle_Restore(const std::wstring& original, int64_t since) {
     if (h == INVALID_HANDLE_VALUE) return ERROR_FILE_NOT_FOUND;
     std::wstring best;
     int64_t bestT = INT64_MIN;
-    std::vector<BYTE> buf(28 + 2 * 32768);
     do {
-        // $I : version (8 octets), taille (8), date de suppression (8, FILETIME UTC), puis
-        // version 2 : longueur (4, en caractères, \0 compris) et chemin ; version 1 : chemin sur 260 caractères.
-        HANDLE f = CreateFileW((bin + fd.cFileName).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                               nullptr, OPEN_EXISTING, 0, nullptr);
-        if (f == INVALID_HANDLE_VALUE) continue;
-        DWORD got = 0;
-        const BOOL ok = ReadFile(f, buf.data(), (DWORD)buf.size(), &got, nullptr);
-        CloseHandle(f);
-        if (!ok || got < 24) continue;
-        int64_t ver = 0, when = 0;
-        memcpy(&ver, buf.data(), 8);
-        memcpy(&when, buf.data() + 16, 8);
-        size_t off = 24, chars = (got - 24) / 2;
-        if (ver == 2) {
-            if (got < 28) continue;
-            uint32_t n = 0;
-            memcpy(&n, buf.data() + 24, 4);
-            off = 28;
-            chars = std::min<size_t>(n, (got - 28) / 2);
-        } else if (ver != 1) {
-            continue;
-        }
-        std::wstring orig(chars, L'\0');
-        memcpy(orig.data(), buf.data() + off, chars * 2);
-        orig.resize(wcsnlen(orig.c_str(), chars));
+        std::wstring orig;
+        int64_t when = 0;
+        uint64_t size = 0;
+        if (!Recycle_ReadInfo(bin + fd.cFileName, orig, when, size)) continue;
         // Petite marge : l'horloge de la suppression est prise par le Shell, un peu après la nôtre.
         if (when >= since - 20000000LL && when >= bestT && _wcsicmp(orig.c_str(), original.c_str()) == 0) {
             bestT = when;

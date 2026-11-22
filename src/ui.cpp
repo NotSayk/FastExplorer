@@ -20,6 +20,7 @@
 #include "navpane.h"
 #include "panes.h"
 #include "paths.h"
+#include "places.h"
 #include "shellmenu.h"
 #include "util.h"
 #include "watch.h"
@@ -437,6 +438,22 @@ int IconOf(const DirData& d, const Entry& e) {
 
 int IconFor(int idx) { return IconOf(*g_view.data, E(idx)); }
 
+// Chemin complet d'une entrée : réel pour la Corbeille et l'Accueil (DirData::target), sinon dans g_path.
+std::wstring FullPathOf(const DirData& d, int idx) {
+    if (d.isVirtual()) return (size_t)idx < d.target.size() ? d.target[idx] : std::wstring();
+    return Join(d.path, d.name(d.entries[idx]));
+}
+std::wstring FullPath(int idx) { return FullPathOf(*g_view.data, idx); }
+
+bool InVirtual() { return HasView() && g_view.data->isVirtual(); }
+
+// Nom affiché d'un emplacement : « Ce PC », « Corbeille », « Accueil » ou le chemin.
+std::wstring PlaceText(const std::wstring& path) {
+    if (path.empty()) return L"Ce PC";
+    if (IsVirtualPath(path)) return Places_Title(path);
+    return path;
+}
+
 
 void FormatDate(int64_t t, wchar_t* out, int cch) {
     out[0] = 0;
@@ -497,7 +514,7 @@ void ForgetSizes(const std::wstring& path) {
 }
 
 bool SizesWanted(const DirData& d) {
-    if (d.isRoot() || !d.query.empty() || d.path.size() < 2) return false;
+    if (d.isRoot() || d.isVirtual() || !d.query.empty() || d.path.size() < 2) return false;
     if (d.path[0] == L'\\' && d.path[1] == L'\\') return false;  // UNC
     const wchar_t root[4] = {d.path[0], L':', L'\\', 0};
     const UINT t = GetDriveTypeW(root);
@@ -529,7 +546,7 @@ void RequestDirSizes() {
         const ULONGLONG now = GetTickCount64();
         for (uint32_t i : g_view.order) {
             if (!E((int)i).isDir()) break;  // dossiers d'abord
-            std::wstring full = Join(g_path, NameOf((int)i));
+            std::wstring full = FullPath((int)i);
             auto it = g_sizeCache.find(SizeKey(full));
             if (!force && it != g_sizeCache.end() && now - it->second.at < kSizeFreshMs) continue;
             g_view.dirState[i] |= SIZE_PENDING;
@@ -749,7 +766,7 @@ int BigImage(int idx, int sysIcon) {
         // Dossier : aperçu de ses premiers fichiers, lisible à partir de 48 px.
         if (!g_view.data->isRoot() && Thumbs_Wanted(e.attr, e.size) && !(e.isDir() && g_bigPx < S(48))) {
             th = THUMB_PENDING;
-            Thumbs_Request(g_view.serial, (uint32_t)idx, Join(g_path, NameOf(idx)), g_bigPx);
+            Thumbs_Request(g_view.serial, (uint32_t)idx, FullPath(idx), g_bigPx);
         }
     }
     return th >= 0 ? th : SysSlot(sysIcon);
@@ -934,7 +951,7 @@ void RequestRowProps(int idx, bool urgent) {
     if (keys.empty()) return;
     constexpr uint32_t kNotLocal =
         FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE;
-    Props_Request(g_view.serial, (uint32_t)idx, Join(g_path, NameOf(idx)), !(E(idx).attr & kNotLocal), std::move(keys),
+    Props_Request(g_view.serial, (uint32_t)idx, FullPath(idx), !(E(idx).attr & kNotLocal), std::move(keys),
                   urgent);
 }
 
@@ -983,7 +1000,7 @@ void FillDispInfo(LVITEMW& it) {
             st = ICON_GENERIC;
             if (!g_view.data->isRoot() && NeedsOwnIcon(e.attr, NameOf(idx) + e.extOff, e.nameLen - e.extOff)) {
                 st = ICON_PENDING;
-                Icons_Request(g_view.serial, (uint32_t)idx, Join(g_path, NameOf(idx)));
+                Icons_Request(g_view.serial, (uint32_t)idx, FullPath(idx));
             }
         }
         const int sys = g_view.icons[idx];
@@ -1021,6 +1038,7 @@ void FillDispInfo(LVITEMW& it) {
     out[0] = 0;
     if (it.iSubItem < 0 || it.iSubItem >= (int)g_cols.size()) return;
     const bool root = g_view.data->isRoot();
+    const bool virt = g_view.data->isVirtual();
     switch (const ColSpec& col = g_cols[it.iSubItem]; col.key) {
         case COL_NAME:
             if (const DriveInfo* di = DriveOfEntry(idx))
@@ -1037,6 +1055,9 @@ void FillDispInfo(LVITEMW& it) {
                 if (di->total)
                     wcsncpy_s(out, cch, (BytesText(di->free) + L" libres sur " + BytesText(di->total)).c_str(), _TRUNCATE);
             } else if (!e.isDir()) StrFormatKBSizeW((LONGLONG)e.size, out, (UINT)cch);
+            else if (virt) {  // Corbeille : taille totale du dossier supprimé ($I)
+                if (e.size) wcsncpy_s(out, cch, BytesText(e.size).c_str(), _TRUNCATE);
+            }
             else if (const uint8_t st = g_view.dirState[idx]; st & SIZE_KNOWN) {
                 // Unités adaptées (« 106 Go ») ; dossier en partie illisible : au moins cette taille.
                 const std::wstring s = ((st & SIZE_PARTIAL) ? L"≥ " : L"") + BytesText(g_view.dirBytes[idx]);
@@ -1063,6 +1084,10 @@ void FillDispInfo(LVITEMW& it) {
         case COL_ATTR:
             if (!root) wcsncpy_s(out, cch, AttrText(e.attr).c_str(), _TRUNCATE);
             break;
+        case COL_ORIGIN:
+            if ((size_t)idx < g_view.data->origin.size())
+                wcsncpy_s(out, cch, g_view.data->origin[idx].c_str(), _TRUNCATE);
+            break;
         case COL_PROP:
             if (root) break;
             if (PropValues* pv = PropsOf(col.pk)) {
@@ -1082,6 +1107,23 @@ std::vector<ColSpec> RootColumns() {
     v[3].title = L"Utilisation";
     return v;
 }
+
+// Corbeille et Accueil : colonnes fixes, comme l'Explorateur.
+std::vector<ColSpec> VirtualColumns(const std::wstring& path) {
+    std::vector<ColSpec> v = {Columns_Builtin(COL_NAME), Columns_Builtin(COL_ORIGIN), Columns_Builtin(COL_DATE),
+                              Columns_Builtin(COL_SIZE), Columns_Builtin(COL_TYPE)};
+    v[0].width96 = 300;
+    if (path == kBinPath) {
+        v[2].title = L"Date de suppression";
+    } else {
+        v[1].title = L"Emplacement";
+        v[2].title = L"Utilisé le";
+    }
+    return v;
+}
+
+// Colonnes imposées (Ce PC, Corbeille, Accueil) : ni mémorisées ni appliquées aux dossiers.
+bool FixedColumns() { return HasView() && (g_view.data->isRoot() || g_view.data->isVirtual()); }
 
 bool g_applyingCols = false;  // colonnes reconstruites par le programme : rien à mémoriser
 std::vector<ColSpec> g_folderCols = Columns_Default();  // colonnes des dossiers (hors Ce PC), dans l'ordre affiché
@@ -1150,7 +1192,7 @@ void ApplyColumns(std::vector<ColSpec> cols) {
 // Ce PC ↔ dossier : colonnes à changer ?
 void UpdateColumnsForView() {
     const bool root = HasView() && g_view.data->isRoot();
-    const std::vector<ColSpec>& want = root ? RootColumns() : g_folderCols;
+    const std::vector<ColSpec> want = root ? RootColumns() : InVirtual() ? VirtualColumns(g_view.data->path) : g_folderCols;
     if (ColumnsKey(want) != ColumnsKey(CurrentColumns())) ApplyColumns(want);
 }
 
@@ -1268,14 +1310,21 @@ FolderView DefaultView() {
 
 FolderView ViewFor(const std::wstring& path) {
     FolderView v;
-    return ReadView(ViewName(path), v) ? v : DefaultView();
+    if (ReadView(ViewName(path), v)) return v;
+    v = DefaultView();
+    if (IsVirtualPath(path)) {  // Corbeille, Accueil : en détails, les plus récents d'abord
+        v.mode = VM_DETAILS;
+        v.sort = Columns_Builtin(COL_DATE);
+        v.asc = false;
+    }
+    return v;
 }
 
 FolderView CurrentView() {
     FolderView v;
     v.mode = g_viewMode;
     v.px = g_iconPx;
-    v.cols = HasView() && g_view.data->isRoot() ? g_folderCols : CurrentColumns();  // Ce PC : colonnes fixes
+    v.cols = FixedColumns() ? g_folderCols : CurrentColumns();  // Ce PC, Corbeille, Accueil : colonnes fixes
     v.sort = g_sort;
     v.asc = g_sortAsc;
     return v;
@@ -1303,7 +1352,7 @@ void PruneViews() {
 void SaveFolderView() {
     if (!HasView() || !g_list) return;
     const FolderView v = CurrentView();
-    if (!g_view.data->isRoot()) g_folderCols = v.cols;
+    if (!FixedColumns()) g_folderCols = v.cols;
     const std::wstring name = ViewName(g_path);
     RegDeleteKeyValueW(HKEY_CURRENT_USER, kViewsKey, name.c_str());  // réécrite à la fin : la plus récente
     WriteView(name, v);
@@ -1328,7 +1377,7 @@ void Flash(const std::wstring& msg);
 // L'affichage courant devient celui de tous les dossiers (les réglages propres à chacun sont oubliés).
 void ApplyViewToAll() {
     FolderView v = CurrentView();
-    v.cols = g_view.data && g_view.data->isRoot() ? g_folderCols : v.cols;
+    v.cols = FixedColumns() ? g_folderCols : v.cols;
     RegDeleteTreeW(HKEY_CURRENT_USER, kViewsKey);
     WriteView(L"Default", v);
     Flash(L"Cet affichage s'applique maintenant à tous les dossiers");
@@ -1375,7 +1424,7 @@ void ChooseColumns() {
 // Clic droit sur l'en-tête : colonnes usuelles à cocher, « Plus… ».
 void ShowHeaderMenu(POINT pt) {
     if (!HasView()) return;
-    const bool root = g_view.data->isRoot();  // Ce PC : colonnes fixes
+    const bool root = FixedColumns();  // Ce PC, Corbeille, Accueil : colonnes fixes
     std::vector<ColSpec> items = Columns_Common();
     for (const ColSpec& c : g_cols)
         if (c.key == COL_PROP && std::none_of(items.begin(), items.end(), [&](const ColSpec& x) { return SameCol(x, c); }))
@@ -1575,10 +1624,16 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
     const int col = g_pending.view ? g_pending.view->sort.key : g_sort.key;
     const bool asc = g_pending.view ? g_pending.view->asc : g_sortAsc;
     const bool climb = nav == Nav::Refresh && q.empty();  // dossier affiché disparu : on remonte, comme l'Explorateur
-    Jobs_Spawn([ct, path, col, asc, climb, q, prefs = g_prefs, filter = g_filter] {
+    std::vector<NavFolder> pins;
+    if (path == kHomePath) pins = NavPane_ShownPins();  // Accueil : l'Accès rapide déjà lu par le volet
+    Jobs_Spawn([ct, path, col, asc, climb, q, prefs = g_prefs, filter = g_filter, pins = std::move(pins)] {
         auto d = std::make_shared<DirData>();
         d->path = path;
-        if (!q.empty()) {
+        if (path == kBinPath) {
+            Recycle_Enumerate(*d, ct);
+        } else if (path == kHomePath) {
+            Home_Enumerate(*d, pins, ct);
+        } else if (!q.empty()) {
             if (SearchIndexed(*d, q, prefs, ct)) {
                 // index : tout est là d'un coup
             } else if (ct.cancelled()) {
@@ -1699,11 +1754,11 @@ void UpdatePane() {
         for (int r = -1; (r = ListView_GetNextItem(g_list, r, LVNI_SELECTED)) >= 0 && items.size() < 100;) {
             const int e = EntryAt(r);
             if (e < 0) continue;
-            items.push_back({Join(g_path, NameOf(e)), E(e).attr, E(e).size, E(e).mtime});
+            items.push_back({FullPath(e), E(e).attr, E(e).size, E(e).mtime});
         }
     }
     if (items.empty()) {
-        if (!HasView() || g_view.data->isRoot()) title = L"Ce PC";
+        if (!HasView() || g_view.data->isRoot() || InVirtual()) title = PlaceText(HasView() ? g_path : L"");
         else if (!g_query.empty()) title = L"Résultats de la recherche";
         else {
             title = g_path;
@@ -1860,7 +1915,7 @@ void OnResult(Result* raw) {
             RunCommand(p.command, g_path);
             return;
         }
-        SetStatus(L"Impossible d'ouvrir « " + (d.path.empty() ? std::wstring(L"Ce PC") : d.path) + L" » : " +
+        SetStatus(L"Impossible d'ouvrir « " + PlaceText(d.path) + L" » : " +
                   ErrorText(d.error));
         if (!HasView()) Navigate(L"", Nav::Normal);  // démarrage raté → Ce PC
         return;
@@ -1976,7 +2031,7 @@ void OnResult(Result* raw) {
     }
 
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
-    if (g_path.empty()) {
+    if (g_path.empty() || IsVirtualPath(g_path)) {
         Watch_Stop();
         g_watchPath.clear();
         g_watchFailed.clear();
@@ -1986,9 +2041,9 @@ void OnResult(Result* raw) {
         Watch_Start(g_hwnd, WM_APP_DIRCHANGED, g_path, ++g_watchId);
     }
 
-    SetWindowTextW(g_addr, g_path.c_str());
+    SetWindowTextW(g_addr, PlaceText(g_path).c_str());
     Crumbs_SetPath(g_path);
-    SetWindowTextW(g_hwnd, (L"FastExplorer — " + (g_path.empty() ? std::wstring(L"Ce PC") : g_path)).c_str());
+    SetWindowTextW(g_hwnd, (L"FastExplorer — " + PlaceText(g_path)).c_str());
     ListView_SetItemCountEx(g_list, (int)g_view.order.size(), refresh ? LVSICF_NOSCROLL : 0);
     if (refresh) {
         ApplySelection(FindEntriesByNames(p.selected), FindEntryByName(p.focus), false);
@@ -2012,7 +2067,7 @@ void OnResult(Result* raw) {
     if (!d.vanished.empty()) g_goneNote = L"« " + d.vanished + L" » n'est plus accessible";
     else if (p.nav != Nav::Refresh) g_goneNote.clear();
     ShowSummary();
-    if (!g_path.empty()) WarmUpMenus(d);
+    if (!g_path.empty() && !d.isVirtual()) WarmUpMenus(d);
     RegisterShellNotify();
 
     // Nouvel élément créé par une commande du fond du dossier : renommage direct.
@@ -2059,7 +2114,7 @@ void GoForward() { GoHistory(false); }
 
 // Nom court d'un dossier de l'historique, comme l'Explorateur : « Documents », « Données (D:) ».
 std::wstring HistoryText(const std::wstring& path) {
-    if (path.empty()) return L"Ce PC";
+    if (path.empty() || IsVirtualPath(path)) return PlaceText(path);
     std::wstring parent, leaf;
     if (!ParentOf(path, parent, leaf) || leaf.empty()) return NavPane_DriveText(path);
     return leaf;
@@ -2088,7 +2143,8 @@ void ShowHistoryMenu(bool back) {
 }
 void GoUp() {
     std::wstring parent, child;
-    if (HasView() && ParentOf(g_path, parent, child)) Navigate(parent, Nav::Normal, child);
+    if (HasView() && IsVirtualPath(g_path)) Navigate(L"", Nav::Normal);  // Corbeille, Accueil : vers Ce PC
+    else if (HasView() && ParentOf(g_path, parent, child)) Navigate(parent, Nav::Normal, child);
 }
 void Refresh() {
     if (!HasView()) return;
@@ -2137,7 +2193,7 @@ void RunCommand(const std::wstring& cmd, const std::wstring& dir) {
 // Barre d'adresse : fil d'Ariane, ou zone de saisie le temps de taper un chemin.
 void BeginAddressEdit() {
     if (!IsWindowVisible(g_addr)) {
-        SetWindowTextW(g_addr, g_path.empty() ? L"Ce PC" : g_path.c_str());
+        SetWindowTextW(g_addr, PlaceText(g_path).c_str());
         ShowWindow(g_addr, SW_SHOW);
         ShowWindow(g_crumbs, SW_HIDE);
     }
@@ -2149,7 +2205,7 @@ void EndAddressEdit() {
     if (!IsWindowVisible(g_addr)) return;
     ShowWindow(g_crumbs, SW_SHOW);
     ShowWindow(g_addr, SW_HIDE);
-    SetWindowTextW(g_addr, g_path.c_str());
+    SetWindowTextW(g_addr, PlaceText(g_path).c_str());
 }
 
 void NavigateAddress() {
@@ -2157,6 +2213,19 @@ void NavigateAddress() {
     std::wstring t(n + 1, L'\0');
     GetWindowTextW(g_addr, t.data(), n + 1);
     t.resize(n);
+    std::wstring trimmed = t;
+    while (!trimmed.empty() && iswspace(trimmed.back())) trimmed.pop_back();
+    while (!trimmed.empty() && iswspace(trimmed.front())) trimmed.erase(0, 1);
+    if (const std::wstring place = Places_FromAlias(trimmed); !place.empty()) {  // « corbeille », « shell:home »…
+        Navigate(place, Nav::Normal);
+        SetFocus(g_list);
+        return;
+    }
+    if (_wcsicmp(trimmed.c_str(), L"Ce PC") == 0 || _wcsicmp(trimmed.c_str(), L"shell:MyComputerFolder") == 0) {
+        Navigate(L"", Nav::Normal);
+        SetFocus(g_list);
+        return;
+    }
     const std::wstring path = NormalizePath(t, g_path);
     Navigate(path, Nav::Normal, {}, {}, path);  // un fichier tapé dans la barre s'ouvre
     // « cmd », « wt », « notepad x.txt », « code . » : lancés dans le dossier
@@ -2176,7 +2245,11 @@ bool IsLnk(int idx) {
 
 void ActivateEntry(int idx) {
     if (idx < 0) return;
-    const std::wstring full = Join(g_path, NameOf(idx));
+    if (g_view.data->path == kBinPath) {  // comme l'Explorateur : un élément supprimé ne s'ouvre pas
+        Flash(L"Restaurez l'élément pour l'ouvrir (clic droit ▸ Restaurer)");
+        return;
+    }
+    const std::wstring full = FullPath(idx);
     if (E(idx).isDir()) {
         Navigate(full, Nav::Normal);
         return;
@@ -2205,7 +2278,7 @@ std::vector<std::wstring> NamesOf(const std::vector<int>& entries) {
 
 // ───────────────────────────── Opérations sur les fichiers ─────────────────────────────
 
-bool CanModify() { return HasView() && !g_view.data->isRoot(); }
+bool CanModify() { return HasView() && !g_view.data->isRoot() && !g_view.data->isVirtual(); }
 
 void StartOp(FileOp op) {
     FileOps_Start(g_hwnd, g_hwnd, WM_APP_FILEOP, std::move(op));
@@ -2503,6 +2576,13 @@ void OnFileOp(FileOpResult* raw) {
         return;
     }
     const auto& c = r->created;
+    // Corbeille, Accueil : pas de surveillance du dossier, on relit après chaque opération.
+    if (IsVirtualPath(r->folder) || (r->kind == FileOpKind::Delete && !r->permanent)) {
+        if (HasView() && InVirtual() && !g_pending.active) Refresh();
+        if (r->kind == FileOpKind::RestoreBin && SUCCEEDED(r->hr) && !c.empty())
+            Flash(c.size() == 1 ? L"Restauré : " + c[0] : std::to_wstring(c.size()) + L" éléments restaurés");
+        if (IsVirtualPath(r->folder)) return;
+    }
     switch (r->kind) {
         case FileOpKind::NewFolder:
             if (!c.empty()) AfterOpSelect(r->folder, {c[0]}, c[0], c[0]);
@@ -2528,7 +2608,66 @@ void OnFileOp(FileOpResult* raw) {
     }
 }
 
+// ── Corbeille et Accueil : les actions portent sur les entrées (les noms affichés peuvent se répéter) ──
+
+std::vector<std::wstring> TargetsOf(const std::vector<int>& entries) {
+    std::vector<std::wstring> v;
+    for (int e : entries)
+        if (std::wstring p = FullPath(e); !p.empty()) v.push_back(std::move(p));
+    return v;
+}
+
+bool InBin() { return HasView() && g_view.data->path == kBinPath; }
+
+void BinRestore(bool all) {
+    if (!InBin()) return;
+    std::vector<int> sel;
+    if (all)
+        for (uint32_t i : g_view.order) sel.push_back((int)i);
+    else
+        sel = SelectedEntries();
+    if (sel.empty()) return;
+    FileOp op;
+    op.kind = FileOpKind::RestoreBin;
+    op.folder = kBinPath;
+    op.paths = TargetsOf(sel);
+    StartOp(std::move(op));
+}
+
+void BinPurge() {
+    if (!InBin()) return;
+    const auto sel = SelectedEntries();
+    if (sel.empty() || !ConfirmDelete(g_hwnd, NamesOf(sel), true)) return;
+    FileOp op;
+    op.kind = FileOpKind::Delete;
+    op.folder = kBinPath;
+    op.permanent = true;
+    for (const auto& r : TargetsOf(sel)) {
+        op.paths.push_back(r);
+        if (std::wstring i = Recycle_InfoOf(r); !i.empty()) op.paths.push_back(std::move(i));
+    }
+    StartOp(std::move(op));
+}
+
+void BinEmpty() {
+    if (!InBin() || g_view.data->entries.empty()) {
+        Flash(L"La Corbeille est vide.");
+        return;
+    }
+    FileOp op;
+    op.kind = FileOpKind::EmptyBin;
+    op.folder = kBinPath;
+    StartOp(std::move(op));
+}
+
 void CopyNames(const std::vector<std::wstring>& names, bool cut) {
+    if (InVirtual() && !InBin() && !cut) {  // Accueil : copie des fichiers eux-mêmes (dossiers différents)
+        const auto t = TargetsOf(SelectedEntries());
+        if (!t.empty() && Clipboard_Put(g_hwnd, L"", t, false))
+            SetStatus(std::to_wstring(t.size()) + (t.size() > 1 ? L" éléments copiés" : L" élément copié") +
+                      L" dans le presse-papiers.");
+        return;
+    }
     if (!CanModify() || names.empty()) return;
     if (!Clipboard_Put(g_hwnd, g_path, names, cut)) {
         SetStatus(L"Impossible d'utiliser le presse-papiers.");
@@ -2550,11 +2689,16 @@ void CopyNames(const std::vector<std::wstring>& names, bool cut) {
 void CopyPaths(const std::vector<std::wstring>& names) {
     if (!HasView()) return;
     std::vector<std::wstring> full;
-    if (names.empty()) {
+    if (InVirtual()) {  // Accueil (Corbeille : chemins d'origine)
+        for (int e : SelectedEntries())
+            full.push_back(InBin() && (size_t)e < g_view.data->origin.size() ? Join(g_view.data->origin[e], NameOf(e)) : FullPath(e));
+        if (full.empty()) return;
+    } else if (names.empty()) {
         if (g_path.empty()) return;
         full.push_back(g_path);
     }
-    for (const auto& n : names) full.push_back(g_path.empty() ? n : Join(g_path, n.c_str()));  // Ce PC : lecteurs
+    if (!InVirtual())
+        for (const auto& n : names) full.push_back(g_path.empty() ? n : Join(g_path, n.c_str()));  // Ce PC : lecteurs
     std::wstring text;
     for (const auto& p : full) text += (text.empty() ? L"\"" : L"\r\n\"") + p + L"\"";
     bool ok = false;
@@ -2595,6 +2739,10 @@ void Paste(const std::wstring& dest) {
 
 // Supprime ; la cible passe ensuite à l'élément suivant (ou précédent), comme dans l'Explorateur.
 void DeleteNames(const std::vector<std::wstring>& names, bool permanent) {
+    if (InBin()) {  // dans la Corbeille, supprimer = définitivement
+        BinPurge();
+        return;
+    }
     if (!CanModify() || names.empty() || !ConfirmDelete(g_hwnd, names, permanent)) return;
     std::vector<int> rows;
     for (int e : FindEntriesByNames(names))
@@ -2772,6 +2920,13 @@ void ReclaimForeground() {
 
 void StartDrag(POINT client) {
     if (!HasView()) return;
+    if (InVirtual()) {  // Accueil : les vrais fichiers (copie) ; Corbeille : rien à glisser
+        if (InBin()) return;
+        const auto t = TargetsOf(SelectedEntries());
+        if (!t.empty()) DragDrop_Start(g_list, L"", t, client);
+        ShellMenu_Discard();
+        return;
+    }
     const std::vector<std::wstring> names = NamesOf(SelectedEntries());
     if (names.empty()) return;
     g_dragNames.clear();
@@ -2793,11 +2948,14 @@ void SetDropRow(int row) {
 void RegisterDropOn(int k) {
     DropHost h;
     // Liste inactive (double panneau) : dépôt dans son dossier, ou dans un de ses sous-dossiers.
-    h.folder = [k] { return k == g_side ? g_path : g_passive.path; };
+    h.folder = [k] {
+        const std::wstring& p = k == g_side ? g_path : g_passive.path;
+        return IsVirtualPath(p) ? std::wstring() : p;  // Corbeille, Accueil : pas de dépôt
+    };
     h.hit = [k](POINT c, std::wstring& name) {
         if (k != g_side) {
             const View& v = g_passive.view;
-            if (!g_dual || !v.data || !g_passive.query.empty()) return -1;
+            if (!g_dual || !v.data || !g_passive.query.empty() || v.data->isVirtual()) return -1;
             LVHITTESTINFO hit{};
             hit.pt = c;
             const int row = ListView_HitTest(g_lists[k], &hit);
@@ -2805,7 +2963,7 @@ void RegisterDropOn(int k) {
             name = v.data->name(v.data->entries[v.order[row]]);
             return row;
         }
-        if (!HasView() || g_pending.active) return -1;
+        if (!HasView() || g_pending.active || InVirtual()) return -1;
         LVHITTESTINFO hit{};
         hit.pt = c;
         const int row = ListView_HitTest(g_list, &hit);
@@ -3029,8 +3187,8 @@ void MoveTab(size_t from, size_t to) {
 
 
 std::wstring PaneTitle(const std::wstring& path, const std::wstring& query) {
-    if (!query.empty()) return L"Recherche « " + query + L" » dans " + (path.empty() ? L"Ce PC" : path);
-    return path.empty() ? L"Ce PC" : path;
+    if (!query.empty()) return L"Recherche « " + query + L" » dans " + PlaceText(path);
+    return PlaceText(path);
 }
 
 void UpdatePaneHeaders() {
@@ -3100,10 +3258,14 @@ View PassiveView(std::shared_ptr<const DirData> d, const ColSpec& sort, bool asc
 // Relit le dossier du panneau inactif en arrière-plan (après une copie vers lui…).
 void ReloadPassive() {
     if (!g_dual || g_passive.path.empty() || !g_passive.query.empty()) return;
-    std::thread([path = g_passive.path, hwnd = g_hwnd] {
+    std::vector<NavFolder> pins;
+    if (g_passive.path == kHomePath) pins = NavPane_ShownPins();
+    std::thread([path = g_passive.path, hwnd = g_hwnd, pins = std::move(pins)] {
         auto* d = new DirData;
         d->path = path;
-        Enumerate(*d);
+        if (path == kBinPath) Recycle_Enumerate(*d);
+        else if (path == kHomePath) Home_Enumerate(*d, pins);
+        else Enumerate(*d);
         if (!PostMessageW(hwnd, WM_APP_PASSIVE, 0, (LPARAM)d)) delete d;
     }).detach();
 }
@@ -3188,9 +3350,10 @@ void SetDual(bool on) {
 
 // F5 / F6 en double panneau : copier / déplacer la sélection vers l'autre panneau.
 void TransferToOther(bool move) {
-    if (!g_dual || !HasView() || g_view.data->isRoot()) return;
+    if (!g_dual || !HasView() || g_view.data->isRoot() || InBin()) return;  // Corbeille : restaurer d'abord
+    if (move && InVirtual()) move = false;  // Accueil : on copie (les originaux restent où ils sont)
     const std::wstring dest = g_passive.path;
-    if (dest.empty() || !g_passive.query.empty()) {
+    if (dest.empty() || IsVirtualPath(dest) || !g_passive.query.empty()) {
         Flash(L"L'autre panneau ne montre pas un dossier");
         return;
     }
@@ -3205,7 +3368,7 @@ void TransferToOther(bool move) {
     FileOp op;
     op.kind = move ? FileOpKind::Move : FileOpKind::Copy;
     op.folder = dest;
-    for (int e : sel) op.paths.push_back(Join(g_path, NameOf(e)));
+    for (int e : sel) op.paths.push_back(FullPath(e));
     const size_t n = op.paths.size();
     StartOp(std::move(op));
     Flash(std::wstring(move ? L"Déplacement de " : L"Copie de ") + std::to_wstring(n) + (n > 1 ? L" éléments" : L" élément") +
@@ -3319,6 +3482,85 @@ std::vector<MenuExtra> PinExtras(const std::wstring& path, bool withOpen) {
     return x;
 }
 
+// Corbeille, Accueil : nos propres commandes ; un élément de l'Accueil (ou des éléments
+// d'un même dossier) garde le menu du Shell de son vrai dossier.
+void ShowVirtualMenu(POINT pt, const std::vector<int>& sel) {
+    const DirData& d = *g_view.data;
+    const bool bin = d.path == kBinPath;
+    if (!bin && !sel.empty()) {
+        std::wstring parent;
+        std::vector<std::wstring> leaves;
+        bool same = true;
+        for (int e : sel) {
+            std::wstring par, leaf;
+            if (!ParentOf(FullPath(e), par, leaf) || leaf.empty()) { same = false; break; }
+            if (parent.empty()) parent = par;
+            else if (_wcsicmp(parent.c_str(), par.c_str()) != 0) { same = false; break; }
+            leaves.push_back(leaf);
+        }
+        if (same && !parent.empty()) {
+            std::vector<MenuExtra> extras;
+            if (leaves.size() == 1) {
+                const std::wstring leaf = leaves[0];
+                extras.push_back({L"Ouvrir l'emplacement du fichier", [parent, leaf] {
+                                      Navigate(parent, Nav::Normal, leaf, {leaf});
+                                      SetFocus(g_list);
+                                  }});
+            }
+            extras.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C", [] { CopyPaths({}); }});
+            const std::vector<std::wstring> full = TargetsOf(sel);
+            const bool ok = ShellMenu_Show(g_hwnd, parent, leaves, pt, GetKeyState(VK_SHIFT) < 0,
+                                           [full](const std::wstring& verb) {
+                auto is = [&](const wchar_t* v) { return _wcsicmp(verb.c_str(), v) == 0; };
+                if (full.size() == 1 && (is(L"open") || is(L"explore"))) {
+                    const DWORD a = GetFileAttributesW(full[0].c_str());
+                    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) Navigate(full[0], Nav::Normal);
+                    else OpenWithShell(full[0]);
+                    return true;
+                }
+                return false;  // le reste : le Shell, sur les vrais fichiers
+            }, extras);
+            if (!ok) SetStatus(L"Menu contextuel indisponible pour cet élément.");
+            return;
+        }
+    }
+    enum : UINT { kOpen = 1, kRestore, kRestoreAll, kPurge, kEmpty, kCopy, kPaths, kRefresh };
+    HMENU m = CreatePopupMenu();
+    if (bin) {
+        if (!sel.empty()) {
+            AppendMenuW(m, MF_STRING, kRestore, L"Restaurer");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, kPurge, L"Supprimer définitivement\tSuppr");
+        } else {
+            AppendMenuW(m, MF_STRING | (d.entries.empty() ? MF_GRAYED : 0), kEmpty, L"Vider la Corbeille");
+            AppendMenuW(m, MF_STRING | (d.entries.empty() ? MF_GRAYED : 0), kRestoreAll, L"Restaurer tous les éléments");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, kRefresh, L"Actualiser\tF5");
+        }
+    } else if (!sel.empty()) {
+        AppendMenuW(m, MF_STRING, kOpen, L"Ouvrir");
+        AppendMenuW(m, MF_STRING, kCopy, L"Copier\tCtrl+C");
+        AppendMenuW(m, MF_STRING, kPaths, L"Copier en tant que chemin d'accès\tCtrl+Maj+C");
+    } else {
+        AppendMenuW(m, MF_STRING, kRefresh, L"Actualiser\tF5");
+    }
+    if (bin && !sel.empty()) SetMenuDefaultItem(m, kRestore, FALSE);
+    const UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    DestroyMenu(m);
+    switch (cmd) {
+        case kOpen:
+            for (int e : sel) ActivateEntry(e);
+            break;
+        case kRestore: BinRestore(false); break;
+        case kRestoreAll: BinRestore(true); break;
+        case kPurge: BinPurge(); break;
+        case kEmpty: BinEmpty(); break;
+        case kCopy: CopyNames({}, false); break;
+        case kPaths: CopyPaths({}); break;
+        case kRefresh: Refresh(); break;
+    }
+}
+
 void ShowContextMenu(LPARAM lp) {
     if (!HasView()) return;
     POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -3335,6 +3577,10 @@ void ShowContextMenu(LPARAM lp) {
         LVHITTESTINFO hit{};
         hit.pt = c;
         if (ListView_HitTest(g_list, &hit) < 0) sel.clear();  // clic dans le vide : menu du dossier
+    }
+    if (InVirtual()) {
+        ShowVirtualMenu(pt, sel);
+        return;
     }
     // Les noms (et non des index) : la vue peut être rafraîchie pendant que le menu est ouvert.
     const std::vector<std::wstring> names = NamesOf(sel);
@@ -3373,7 +3619,7 @@ void ShowContextMenu(LPARAM lp) {
         // Opérations de fichiers : notre moteur (resélection, estompage des éléments coupés…).
         if (!background && (is(L"copy") || is(L"cut"))) { CopyNames(names, is(L"cut")); return true; }
         if (is(L"paste")) {
-            Paste(single >= 0 && E(single).isDir() ? Join(g_path, NameOf(single)) : g_path);
+            Paste(single >= 0 && E(single).isDir() ? FullPath(single) : g_path);
             return true;
         }
         if (!background && is(L"delete")) { DeleteNames(names, GetKeyState(VK_SHIFT) < 0); return true; }
@@ -3431,7 +3677,7 @@ void ShowNavMenu(const std::wstring& path, POINT pt) {
 // pas sélectionné, la sélection entière sinon, le fond du dossier dans le vide.
 // Si la prédiction se révèle fausse, ShellMenu_Show reconstruit simplement.
 void PrepareContextMenu(LPARAM lp, bool shift) {
-    if (!HasView()) return;
+    if (!HasView() || InVirtual()) return;
     LVHITTESTINFO hit{};
     hit.pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
     const int row = ListView_HitTest(g_list, &hit);
@@ -3447,6 +3693,14 @@ void PrepareContextMenu(LPARAM lp, bool shift) {
 // Alt+Entrée : propriétés de la sélection, ou du dossier courant si rien n'est sélectionné.
 void ShowProperties() {
     if (!HasView()) return;
+    if (InVirtual()) {  // élément réel (Accueil) ; Corbeille : celui qui est dans $Recycle.Bin
+        const auto sel = SelectedEntries();
+        std::wstring parent, leaf;
+        if (sel.empty() || !ParentOf(FullPath(sel[0]), parent, leaf) ||
+            !ShellMenu_Invoke(g_hwnd, parent, {leaf}, "properties"))
+            SetStatus(L"Propriétés indisponibles.");
+        return;
+    }
     std::vector<std::wstring> names = NamesOf(SelectedEntries());
     std::wstring folder = g_path;
     if (names.empty()) {
@@ -4010,7 +4264,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_LOADING) {
                 KillTimer(hwnd, TIMER_LOADING);
                 if (g_pending.active)
-                    SetStatus(L"Chargement de " + (g_pending.path.empty() ? std::wstring(L"Ce PC") : g_pending.path) +
+                    SetStatus(L"Chargement de " + PlaceText(g_pending.path) +
                               L"…");
                 return 0;
             }
@@ -4115,7 +4369,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case NM_DBLCLK: {
                     const int e = HasView() ? EntryAt(((NMITEMACTIVATE*)lp)->iItem) : -1;
                     if (e >= 0 && E(e).isDir() && GetKeyState(VK_CONTROL) < 0) {  // Ctrl+double-clic : nouvelle fenêtre
-                        NewWindow(g_path.empty() ? std::wstring(NameOf(e)) : Join(g_path, NameOf(e)));
+                        NewWindow(g_path.empty() ? std::wstring(NameOf(e)) : FullPath(e));
                         return 0;
                     }
                     Activate(((NMITEMACTIVATE*)lp)->iItem);
@@ -4217,7 +4471,7 @@ bool HandleGlobalKeys(const MSG& m) {
             ht.pt = c;
             const int e = HasView() ? EntryAt(ListView_HitTest(g_list, &ht)) : -1;
             if (e >= 0 && E(e).isDir())
-                NewTab(g_path.empty() ? std::wstring(NameOf(e)) : Join(g_path, NameOf(e)), false);
+                NewTab(g_path.empty() ? std::wstring(NameOf(e)) : FullPath(e), false);
         } else {
             POINT s = c;
             ClientToScreen(g_nav, &s);
@@ -4274,7 +4528,7 @@ bool HandleGlobalKeys(const MSG& m) {
                 if (focus == g_list && HasView()) {
                     const int e = FocusedEntry();
                     if (e >= 0 && E(e).isDir()) {
-                        NewWindow(g_path.empty() ? std::wstring(NameOf(e)) : Join(g_path, NameOf(e)));
+                        NewWindow(g_path.empty() ? std::wstring(NameOf(e)) : FullPath(e));
                         return true;
                     }
                 }
