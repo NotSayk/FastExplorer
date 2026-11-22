@@ -24,3 +24,12 @@ void Home_EnumerateFrom(DirData& d, const std::wstring& recentDir, const std::ve
 const wchar_t* Places_Title(const std::wstring& path);
 // Texte tapé dans la barre d'adresse → emplacement virtuel (« corbeille », « shell:RecycleBinFolder »…), "" sinon.
 std::wstring Places_FromAlias(const std::wstring& text);
+
+// « shell:downloads », « shell:startup », « shell:sendto\x »… (noms des dossiers connus de Windows).
+// 0 : pas une commande shell: ; 1 : dossier de fichiers (path) ; -1 : nom inconnu ;
+// -2 : emplacement sans chemin (Applications, Panneau de configuration…).
+int Places_ShellCommand(const std::wstring& text, std::wstring& path);
+
+// Chemins tapés dans la barre d'adresse (F4), le plus récent d'abord, 25 au plus.
+std::vector<std::wstring> Places_Typed();
+void Places_RememberTyped(const std::wstring& text);

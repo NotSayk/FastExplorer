@@ -80,7 +80,7 @@ public:
         data_ = data;
         right_ = (keys & MK_RBUTTON) != 0;
         row_ = kNoRow;
-        folder_ = host_.folder();
+        folder_ = host_.folder ? host_.folder() : std::wstring();
         if (helper_) {
             POINT p{pt.x, pt.y};
             helper_->DragEnter(list_, data, &p, *effect);
@@ -91,7 +91,7 @@ public:
     }
 
     IFACEMETHODIMP DragOver(DWORD keys, POINTL pt, DWORD* effect) override {
-        AutoScroll(pt);
+        if (!host_.fullPaths) AutoScroll(pt);
         Track(keys, pt, effect);
         last_ = *effect;
         if (helper_) {
@@ -122,7 +122,7 @@ public:
         // (bouton droit → son menu « Copier ici / Déplacer ici… »).
         ComPtr<IDropTarget> t = std::move(target_);
         const bool accepted = t && *effect != DROPEFFECT_NONE;
-        const std::wstring dest = item_ ? Join(folder_, name_.c_str()) : folder_;
+        const std::wstring dest = item_ ? (host_.fullPaths ? name_ : Join(folder_, name_.c_str())) : folder_;
         data_.Reset();
         item_ = false;
         row_ = kNoRow;
@@ -144,14 +144,14 @@ public:
             } else {
                 *effect = DROPEFFECT_COPY;
             }
-            host_.dropped(intoFolder);
+            if (host_.dropped) host_.dropped(intoFolder);
             return S_OK;
         }
         if (accepted) {
             DWORD e = allowed;
             t->Drop(data, keys, pt, &e);
             *effect = e;
-            if (e != DROPEFFECT_NONE) host_.dropped(intoFolder);
+            if (e != DROPEFFECT_NONE && host_.dropped) host_.dropped(intoFolder);
         } else {
             if (t) t->DragLeave();
             *effect = DROPEFFECT_NONE;
@@ -168,7 +168,7 @@ private:
         std::wstring name;
         int row = host_.hit(c, name);
         if (keys & MK_RBUTTON) right_ = true;
-        if (row >= 0 && host_.dragged(name)) row = kBlocked;
+        if (row >= 0 && host_.dragged && host_.dragged(name)) row = kBlocked;
 
         if (row != row_) {
             if (target_) target_->DragLeave();
@@ -176,9 +176,18 @@ private:
             item_ = false;
             host_.highlight(-1);
             row_ = row;
-            if (row >= 0 && DragDrop_ShellTarget(nullptr, folder_, name, &target_)) item_ = true;
+            if (row >= 0 && host_.fullPaths) {  // chemin complet : la cible de cet élément dans son dossier parent
+                std::wstring parent, leaf;
+                if (!ParentOf(name, parent, leaf) || leaf.empty()) {  // lecteur : élément de Ce PC
+                    parent.clear();
+                    leaf = name;
+                }
+                if (DragDrop_ShellTarget(nullptr, parent, leaf, &target_)) item_ = true;
+            } else if (row >= 0 && DragDrop_ShellTarget(nullptr, folder_, name, &target_)) {
+                item_ = true;
+            }
             name_ = item_ ? name : std::wstring();
-            if (!target_ && row != kBlocked) DragDrop_ShellTarget(nullptr, folder_, L"", &target_);  // dossier affiché
+            if (!target_ && row != kBlocked && !host_.fullPaths) DragDrop_ShellTarget(nullptr, folder_, L"", &target_);  // dossier affiché
             DWORD e = allowed;
             if (target_ && SUCCEEDED(target_->DragEnter(data_.Get(), keys, pt, &e))) {
                 *effect = e;

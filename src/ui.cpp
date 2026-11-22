@@ -128,6 +128,7 @@ struct Pending {
     int top = -1;                   // retour sur un onglet : première ligne visible à rétablir
     std::optional<FolderView> view; // autre dossier : son affichage mémorisé, appliqué avec le résultat
     bool credsAsked = false;        // identifiants réseau déjà demandés pour cette navigation
+    std::wstring typed;             // texte tapé dans la barre d'adresse : mémorisé (F4) si l'ouverture réussit
 };
 
 enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
@@ -1969,6 +1970,7 @@ void OnResult(Result* raw) {
             if (c == NO_ERROR) {
                 Navigate(p.path, p.nav, p.focus, p.selected);
                 g_pending.credsAsked = true;
+                g_pending.typed = p.typed;
                 return;
             }
             if (c != ERROR_CANCELLED) d_errorNote = Net_ErrorText(c);
@@ -1979,6 +1981,8 @@ void OnResult(Result* raw) {
         if (!HasView()) Navigate(L"", Nav::Normal);  // démarrage raté → Ce PC
         return;
     }
+
+    if (!p.typed.empty()) Places_RememberTyped(p.typed);
 
     if (HasView()) {
         switch (p.nav) {
@@ -2277,16 +2281,35 @@ void NavigateAddress() {
     while (!trimmed.empty() && iswspace(trimmed.front())) trimmed.erase(0, 1);
     if (const std::wstring place = Places_FromAlias(trimmed); !place.empty()) {  // « corbeille », « shell:home »…
         Navigate(place, Nav::Normal);
+        g_pending.typed = trimmed;
         SetFocus(g_list);
         return;
     }
     if (_wcsicmp(trimmed.c_str(), L"Ce PC") == 0 || _wcsicmp(trimmed.c_str(), L"shell:MyComputerFolder") == 0) {
         Navigate(L"", Nav::Normal);
+        g_pending.typed = trimmed;
         SetFocus(g_list);
+        return;
+    }
+    // « shell:downloads », « shell:startup »… : dossiers connus de Windows.
+    if (std::wstring known; const int sc = Places_ShellCommand(trimmed, known)) {
+        if (sc == 1) {
+            Navigate(known, Nav::Normal);
+            g_pending.typed = trimmed;
+            SetFocus(g_list);
+        } else if (sc == -2) {  // sans chemin (Applications, Panneau de configuration…) : Windows l'ouvre
+            ShellExecuteW(g_hwnd, nullptr, trimmed.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            Places_RememberTyped(trimmed);
+            SetStatus(L"« " + trimmed + L" » n'est pas un dossier de fichiers : ouvert par Windows.");
+            SetFocus(g_list);
+        } else {
+            SetStatus(L"Commande inconnue : « " + trimmed + L" » (exemples : shell:downloads, shell:startup, shell:sendto).");
+        }
         return;
     }
     const std::wstring path = NormalizePath(t, g_path);
     Navigate(path, Nav::Normal, {}, {}, path);  // un fichier tapé dans la barre s'ouvre
+    g_pending.typed = trimmed;
     // « cmd », « wt », « notepad x.txt », « code . » : lancés dans le dossier
     // affiché si ce n'est pas un dossier, comme dans l'Explorateur.
     std::wstring cmd = t;
@@ -2295,6 +2318,52 @@ void NavigateAddress() {
     const std::wstring first = cmd.substr(0, std::min(cmd.find(L' '), cmd.size()));
     if (!first.empty() && first.find_first_of(L"\\/:") == std::wstring::npos) g_pending.command = cmd;
     SetFocus(g_list);
+}
+
+// F4 : chemins tapés récemment, sous la barre d'adresse.
+void ShowTypedHistory() {
+    BeginAddressEdit();
+    const std::vector<std::wstring> typed = Places_Typed();
+    if (typed.empty()) return;
+    HMENU m = CreatePopupMenu();
+    for (size_t i = 0; i < typed.size(); ++i) {
+        std::wstring text;
+        for (wchar_t c : typed[i]) text += c == L'&' ? std::wstring(L"&&") : std::wstring(1, c);
+        AppendMenuW(m, MF_STRING, i + 1, text.c_str());
+    }
+    RECT r;
+    GetWindowRect(g_addr, &r);
+    const UINT cmd = (UINT)TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, r.left, r.bottom, g_hwnd, nullptr);
+    DestroyMenu(m);
+    if (cmd >= 1 && cmd <= typed.size()) {
+        SetWindowTextW(g_addr, typed[cmd - 1].c_str());
+        NavigateAddress();
+    } else {
+        SetFocus(g_addr);
+    }
+}
+
+// F11 : plein écran (sans cadre, sur tout l'écran), et retour.
+WINDOWPLACEMENT g_fsPlace{sizeof(WINDOWPLACEMENT)};
+bool g_fullscreen = false;
+void ToggleFullscreen() {
+    const LONG style = GetWindowLongW(g_hwnd, GWL_STYLE);
+    if (!g_fullscreen) {
+        MONITORINFO mi{sizeof mi};
+        if (!GetWindowPlacement(g_hwnd, &g_fsPlace) ||
+            !GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        SetWindowLongW(g_hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+        SetWindowPos(g_hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_fullscreen = true;
+    } else {
+        SetWindowLongW(g_hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(g_hwnd, &g_fsPlace);
+        SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_fullscreen = false;
+    }
 }
 
 bool IsLnk(int idx) {
@@ -3350,6 +3419,19 @@ void RegisterDropOn(int k) {
 void RegisterDrop() {
     RegisterDropOn(0);
     RegisterDropOn(1);
+    // Fil d'Ariane : déposer sur un segment copie / déplace vers ce dossier.
+    DropHost c;
+    c.fullPaths = true;
+    c.hit = [](POINT client, std::wstring& path) { return Crumbs_DropHit(client, path); };
+    c.highlight = [](int part) { Crumbs_DropHighlight(part); };
+    c.transfer = [](const std::wstring& dest, std::vector<std::wstring> paths, bool move) {
+        FileOp op;
+        op.kind = move ? FileOpKind::Move : FileOpKind::Copy;
+        op.folder = dest;
+        op.paths = std::move(paths);
+        StartOp(std::move(op));
+    };
+    DragDrop_RegisterTarget(g_crumbs, std::move(c));
 }
 
 // ───────────────────────────── Onglets, fenêtres ─────────────────────────────
@@ -4928,6 +5010,24 @@ void CreateChildren(HWND hwnd) {
     crumbs.edit = BeginAddressEdit;
     crumbs.openNewTab = [](const std::wstring& path) { NewTab(path, false); };
     crumbs.driveText = NavPane_DriveText;
+    crumbs.roots = [] {
+        std::vector<Crumb> r;
+        auto known = [&](REFKNOWNFOLDERID id, const wchar_t* text) {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_DONT_VERIFY, nullptr, &p)) && p) {
+                std::wstring path = p;
+                r.push_back({text ? std::wstring(text) : LeafOf(path), path});
+            }
+            if (p) CoTaskMemFree(p);
+        };
+        r.push_back({L"Accueil", kHomePath});
+        known(FOLDERID_Desktop, L"Bureau");
+        known(FOLDERID_Profile, nullptr);
+        r.push_back({L"Ce PC", L""});
+        r.push_back({L"Réseau", kNetPath});
+        r.push_back({L"Corbeille", kBinPath});
+        return r;
+    };
     g_crumbs = Crumbs_Create(hwnd, ID_CRUMBS, std::move(crumbs));
     g_searchBox = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0,
                                   0, 0, hwnd, (HMENU)ID_SEARCH, g_inst, nullptr);
@@ -5263,6 +5363,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case NM_DBLCLK: {
                     const int e = HasView() ? EntryAt(((NMITEMACTIVATE*)lp)->iItem) : -1;
+                    if (e >= 0 && GetKeyState(VK_MENU) < 0) {  // Alt+double-clic : propriétés
+                        ShowProperties();
+                        return 0;
+                    }
                     if (e >= 0 && E(e).isDir() && GetKeyState(VK_CONTROL) < 0) {  // Ctrl+double-clic : nouvelle fenêtre
                         NewWindow(g_path.empty() ? std::wstring(NameOf(e)) : FullPath(e));
                         return 0;
@@ -5462,6 +5566,7 @@ bool HandleGlobalKeys(const MSG& m) {
             if (g_dual && focus == g_list) { TransferToOther(true); return true; }  // déplacer vers l'autre
             return false;
         case VK_F9: SetDual(!g_dual); return true;
+        case VK_F11: ToggleFullscreen(); return true;
         case 'R':
             if (!ctrl) return false;
             g_forceSizes = true;
@@ -5471,11 +5576,15 @@ bool HandleGlobalKeys(const MSG& m) {
             if (!ctrl) return false;
             BeginAddressEdit();
             return true;
-        case VK_F4: BeginAddressEdit(); return true;
+        case VK_F4: ShowTypedHistory(); return true;
         case VK_F3: FocusSearch(); return true;
         case 'F':
         case 'E':
             if (!ctrl) return false;
+            if (m.wParam == 'E' && GetKeyState(VK_SHIFT) < 0) {  // Ctrl+Maj+E : le dossier courant dans l'arborescence
+                if (HasView()) NavPane_ExpandTo(g_path);
+                return true;
+            }
             FocusSearch();
             return true;
         case VK_TAB:  // barre d'adresse → recherche → liste ; double panneau : d'une liste à l'autre

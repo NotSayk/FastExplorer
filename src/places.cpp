@@ -232,3 +232,51 @@ std::wstring Places_FromAlias(const std::wstring& text) {
         return L"::net";
     return L"";
 }
+
+int Places_ShellCommand(const std::wstring& text, std::wstring& path) {
+    if (text.size() < 7 || _wcsnicmp(text.c_str(), L"shell:", 6) != 0) return 0;
+    PIDLIST_ABSOLUTE p = nullptr;
+    if (FAILED(SHParseDisplayName(text.c_str(), nullptr, &p, 0, nullptr)) || !p) return -1;
+    std::wstring buf(32768, L'\0');
+    const bool fs = SHGetPathFromIDListEx(p, buf.data(), (DWORD)buf.size(), GPFIDL_DEFAULT) != FALSE;
+    CoTaskMemFree(p);
+    if (!fs || !buf[0]) return -2;
+    buf.resize(wcslen(buf.c_str()));
+    path = std::move(buf);
+    return 1;
+}
+
+namespace {
+constexpr wchar_t kTypedKey[] = L"Software\\FastExplorer";
+constexpr wchar_t kTypedValue[] = L"TypedPaths";
+constexpr size_t kTypedMax = 25;
+}  // namespace
+
+std::vector<std::wstring> Places_Typed() {
+    std::vector<std::wstring> out;
+    DWORD type = 0, size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kTypedKey, kTypedValue, RRF_RT_REG_MULTI_SZ, &type, nullptr, &size) !=
+            ERROR_SUCCESS || size < sizeof(wchar_t))
+        return out;
+    std::wstring buf(size / sizeof(wchar_t) + 1, L'\0');
+    if (RegGetValueW(HKEY_CURRENT_USER, kTypedKey, kTypedValue, RRF_RT_REG_MULTI_SZ, &type, buf.data(), &size) !=
+        ERROR_SUCCESS)
+        return out;
+    for (const wchar_t* s = buf.c_str(); *s && out.size() < kTypedMax; s += wcslen(s) + 1) out.emplace_back(s);
+    return out;
+}
+
+void Places_RememberTyped(const std::wstring& text) {
+    if (text.empty() || text.size() > 2048) return;
+    std::vector<std::wstring> all = Places_Typed();
+    all.erase(std::remove_if(all.begin(), all.end(),
+                             [&](const std::wstring& s) { return _wcsicmp(s.c_str(), text.c_str()) == 0; }),
+              all.end());
+    all.insert(all.begin(), text);
+    if (all.size() > kTypedMax) all.resize(kTypedMax);
+    std::wstring multi;
+    for (const auto& s : all) multi += s + L'\0';
+    multi += L'\0';
+    RegSetKeyValueW(HKEY_CURRENT_USER, kTypedKey, kTypedValue, REG_MULTI_SZ, multi.data(),
+                    (DWORD)(multi.size() * sizeof(wchar_t)));
+}

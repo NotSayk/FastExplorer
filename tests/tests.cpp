@@ -1039,6 +1039,38 @@ void TestPlaces() {
     CHECK_STR(Places_FromAlias(L"shell:RecycleBinFolder"), kBinPath);
     CHECK_STR(Places_FromAlias(L"accueil"), kHomePath);
     CHECK_STR(Places_FromAlias(L"C:\\Windows"), L"");
+    {  // Commandes shell: (dossiers connus)
+        std::wstring p;
+        CHECK(Places_ShellCommand(L"C:\\Windows", p) == 0);
+        PWSTR dl = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &dl))) {
+            CHECK(Places_ShellCommand(L"shell:downloads", p) == 1);
+            CHECK(_wcsicmp(p.c_str(), dl) == 0);
+            CoTaskMemFree(dl);
+        }
+        wchar_t win[MAX_PATH];
+        GetWindowsDirectoryW(win, MAX_PATH);
+        CHECK(Places_ShellCommand(L"shell:Windows", p) == 1 && _wcsicmp(p.c_str(), win) == 0);
+        CHECK(Places_ShellCommand(L"shell:System", p) == 1 && _wcsicmp(p.c_str(), (std::wstring(win) + L"\\System32").c_str()) == 0);
+        CHECK(Places_ShellCommand(L"shell:sendto", p) == 1 && p.find(L"SendTo") != std::wstring::npos);
+        CHECK(Places_ShellCommand(L"shell:pas-un-dossier-connu", p) == -1);
+        CHECK(Places_ShellCommand(L"shell:AppsFolder", p) == -2);  // pas de chemin
+    }
+    {  // Historique des chemins tapés (valeur de l'utilisateur sauvegardée puis remise)
+        const std::vector<std::wstring> saved = Places_Typed();
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"TypedPaths");
+        CHECK(Places_Typed().empty());
+        for (int i = 0; i < 30; ++i) Places_RememberTyped(L"C:\\t" + std::to_wstring(i));
+        Places_RememberTyped(L"c:\\T5");  // déjà là (autre casse) : remonte en tête, sans doublon
+        const auto typed = Places_Typed();
+        CHECK(typed.size() == 25);
+        CHECK(!typed.empty() && typed[0] == L"c:\\T5");
+        CHECK(typed.size() > 1 && typed[1] == L"C:\\t29");
+        CHECK(std::count_if(typed.begin(), typed.end(), [](const std::wstring& s) { return _wcsicmp(s.c_str(), L"c:\\t5") == 0; }) == 1);
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"TypedPaths");
+        for (auto it = saved.rbegin(); it != saved.rend(); ++it) Places_RememberTyped(*it);
+        CHECK(Places_Typed() == saved);
+    }
     CHECK_STR(Places_Title(kBinPath), L"Corbeille");
     const auto crumbs = Crumbs_Split(kBinPath, {});
     CHECK(crumbs.size() == 1 && crumbs[0].text == L"Corbeille" && crumbs[0].path == kBinPath);

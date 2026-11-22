@@ -50,7 +50,7 @@ De haut en bas :
 | Rafraîchissement automatique | Le dossier se met à jour seul quand des fichiers sont créés, supprimés ou renommés | ✅ P0 (dossier affiché, lecteurs de Ce PC, dossier disparu → parent, éjection libérée) ⚙️ `ReadDirectoryChangesW` / `SHChangeNotifyRegister` |
 | Ouvrir dans une nouvelle fenêtre | Ctrl+N, Ctrl+double-clic, Ctrl+Entrée | ✅ P1 |
 | Ouvrir dans un nouvel onglet | Clic milieu sur un dossier (contenu, volet de navigation, et depuis 2026 barre d'adresse et Accueil), menu contextuel | ✅ P1 (contenu, volet, fil d'Ariane, menus) |
-| Développer l'arborescence jusqu'au dossier courant | Ctrl+Maj+E (option « Développer jusqu'au dossier ouvert ») | P2 |
+| Développer l'arborescence jusqu'au dossier courant | Ctrl+Maj+E (option « Développer jusqu'au dossier ouvert ») | ✅ P2 (bloc 25 : Ctrl+Maj+E, niveau par niveau sur un thread, puis focus dans le volet) |
 
 ### 2.2 Barre d'adresse
 
@@ -58,17 +58,17 @@ De haut en bas :
 |---|---|---|
 | **Fil d'Ariane** (breadcrumb) | Chaque segment est cliquable | ✅ **P0** (segments, chevrons ▸ menu des sous-dossiers, « « » pour les segments qui débordent, clic dans le vide = saisie) |
 | Chevrons `>` entre les segments | Clic : menu des sous-dossiers frères, pour sauter latéralement | ✅ (bloc 6) |
-| Chevron le plus à gauche | Liste des emplacements racines (Bureau, Ce PC, Réseau…) | P2 |
+| Chevron le plus à gauche | Liste des emplacements racines (Bureau, Ce PC, Réseau…) | ✅ P2 (bloc 25 : segments masqués, puis Accueil, Bureau, dossier personnel, Ce PC, Réseau, Corbeille) |
 | Clic dans le vide de la barre | Bascule en mode texte, chemin complet sélectionné | ✅ (mode texte seul pour l'instant) |
 | Saisie de chemin | Chemin absolu, relatif, `..`, `%VARIABLES%`, UNC `\\serveur\partage` | ✅ |
 | **Autocomplétion** | Suggestions de sous-dossiers et fichiers pendant la frappe, Tab pour compléter | ✅🟡 P1 (bloc 11 : dossiers, `SHAutoComplete` sur son propre thread ; chemins absolus) |
-| Liste déroulante d'historique | F4 ou flèche de droite : chemins tapés récemment | P2 |
+| Liste déroulante d'historique | F4 ou flèche de droite : chemins tapés récemment | ✅ P2 (bloc 25 : F4, 25 derniers chemins ouverts avec succès, HKCU TypedPaths) |
 | Lancer une commande | Taper `cmd`, `powershell`, `wt`, `notepad`… dans la barre : ouvre le programme **dans le dossier courant** | ✅ (bloc 11 : si ce n'est pas un dossier ; arguments acceptés, ex. `code .` ; lancé sur un thread) |
 | URL | `https://…` ouvre le navigateur, `ftp://` ouvre l'accès FTP en lecture | P3 |
-| Commandes `shell:` | `shell:startup`, `shell:sendto`, `shell:downloads`, `shell:appsfolder`, `shell:recyclebinfolder`, `shell:common startup`… (~120 noms) | P2 ⚙️ Known Folders + `SHParseDisplayName` |
+| Commandes `shell:` | `shell:startup`, `shell:sendto`, `shell:downloads`, `shell:appsfolder`, `shell:recyclebinfolder`, `shell:common startup`… (~120 noms) | ✅ P2 (bloc 25 : tous les dossiers connus, sous-dossier compris ; sans chemin, ex. `shell:appsfolder` : ouvert par Windows) ⚙️ Known Folders + `SHParseDisplayName` |
 | CLSID | `::{20D04FE0-3AEA-1069-A2D8-08002B30309D}` (Ce PC), etc. | P3 |
 | Copier le chemin | Clic droit sur la barre ▸ Copier l'adresse / Copier l'adresse sous forme de texte | P1 |
-| Glisser-déposer sur un segment | Déposer des fichiers sur un segment du fil d'Ariane = copier/déplacer vers ce dossier | P2 |
+| Glisser-déposer sur un segment | Déposer des fichiers sur un segment du fil d'Ariane = copier/déplacer vers ce dossier | ✅ P2 (bloc 25 : segment en surbrillance, cible du Shell, notre moteur de copie au bouton gauche) |
 | Icône de la barre glissable | Glisser l'icône du dossier = créer un raccourci ailleurs | P3 |
 | Modifier dans la barre ▸ Échap | Annule et revient au fil d'Ariane | ✅ |
 
@@ -484,7 +484,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Ctrl+N | Nouvelle fenêtre | ✅ P1 |
 | Ctrl+T / Ctrl+W / Ctrl+F4 | Nouvel onglet / fermer l'onglet | ✅ P1 |
 | Ctrl+Tab / Ctrl+Maj+Tab | Onglet suivant / précédent | ✅ P1 |
-| F11 | Plein écran | P2 |
+| F11 | Plein écran | ✅ P2 (bloc 25) |
 
 ### Navigation
 | Raccourci | Action | État |
@@ -495,7 +495,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Ctrl+E, Ctrl+F, F3 | Recherche | ✅ P0 |
 | F5, Ctrl+R | Actualiser | ✅ |
 | F6, Tab | Passer d'un volet à l'autre | 🟡 (Tab : adresse ↔ liste) |
-| Ctrl+Maj+E | Développer le volet de navigation jusqu'au dossier courant | P2 |
+| Ctrl+Maj+E | Développer le volet de navigation jusqu'au dossier courant | ✅ P2 (bloc 25) |
 | Pavé num. * / + / − , ← / → (volet de navigation) | Tout développer / développer / réduire | ✅ (natif) |
 | Entrée | Ouvrir | ✅ |
 | Ctrl+Entrée | Ouvrir le dossier dans une nouvelle fenêtre ⚠️ | ✅ P2 |
@@ -531,7 +531,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Clic lent sur un élément sélectionné | Renommer | ✅ |
 | Clic milieu sur un dossier | Nouvel onglet | ✅ P1 |
 | Boutons 4/5 | Précédent / Suivant | ✅ |
-| Alt+double-clic | Propriétés | P2 |
+| Alt+double-clic | Propriétés | ✅ P2 (bloc 25) |
 | Ctrl+double-clic | Nouvelle fenêtre | ✅ P2 |
 | Glisser (et ses variantes avec modificateurs) | Voir §6.2 | ✅ |
 | Glisser **depuis** l'application vers d'autres (mail, navigateur, éditeur) | ✅ P0 (objet de données du Shell, image de glissement) |
@@ -642,7 +642,25 @@ dossiers avant l'index…) :
 24. ✅ **Barre de commandes et menu rapide** : nos commandes courantes en un clic, accès au menu du Shell,
     renommage multiple.
 
-Plus tard, une fois l'interface aboutie : intégration Git (changer de branche) ⭐, onglet WSL ⭐,
+P2, en blocs (dans cet ordre) :
+
+25. ✅ **Navigation et barre d'adresse** : commandes `shell:`, chevron des emplacements racines, historique des
+    chemins tapés (F4), déposer sur un segment du fil d'Ariane, Ctrl+Maj+E, F11, Alt+double-clic.
+26. **Onglets et sessions** : détacher / fusionner un onglet, ouverture au survol pendant un glisser, onglets
+    restaurés à la réouverture, sessions nommées ⭐, signets ⭐.
+27. **Affichage** : regrouper par, filtres de colonne, cases à cocher, info-bulles, type de dossier et ses
+    colonnes, Ctrl+pavé num. +.
+28. **Opérations** : copier vers / déplacer vers, coller en tant que raccourci, renommage par lot avancé ⭐,
+    « qui utilise ce fichier ? » ⭐, reprise après erreur et vérification des copies, perte de propriétés,
+    raccourci dont la cible a disparu.
+29. **Recherche** : syntaxe AQS, recherches récentes, contenu des fichiers (index Windows Search).
+30. **Cloud et lecteurs** : états de synchronisation, Toujours conserver / Libérer de l'espace, monter
+    ISO / VHD, formater, renommer un volume, appareils MTP, propriétés de la Corbeille.
+31. **Productivité** ⭐ : palette de commandes, raccourcis personnalisables, terminal intégré, aperçu du code
+    coloré, panneau rapide (empreintes).
+32. **Intégrations** : Git ⭐, WSL ⭐, découverte du réseau, Galerie, remplacer l'Explorateur par défaut.
+
+Plus tard, une fois l'interface aboutie :
 connexions SFTP ⭐, connexions cloud (Google Drive, OneDrive, Dropbox…) ⭐.
 
 ---

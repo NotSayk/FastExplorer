@@ -36,6 +36,8 @@ void NavPane_ContextMenu(LPARAM lp);
 
 // Dossier affiché : sélectionné dans le volet s'il y figure.
 void NavPane_ShowPath(const std::wstring& path);
+// Ctrl+Maj+E : ouvre l'arborescence jusqu'à ce dossier (lectures sur un thread), le sélectionne et prend le focus.
+void NavPane_ExpandTo(const std::wstring& path);
 // Contenu d'un dossier tout juste relu : ses sous-dossiers déjà affichés dans le
 // volet sont mis à jour sans nouvelle lecture du disque.
 void NavPane_FolderListed(const DirData& d);

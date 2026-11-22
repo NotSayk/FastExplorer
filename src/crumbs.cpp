@@ -83,6 +83,7 @@ std::vector<Hit> g_hits;
 int g_firstShown = 0;     // segments avant : dans le menu « « »
 int g_hot = -1;           // partie survolée (index dans g_hits)
 int g_pressed = -1;       // partie enfoncée (clic en cours, menu ouvert)
+int g_dropHot = -1;       // segment survolé par un glisser
 bool g_tracking = false;  // TrackMouseEvent armé
 unsigned g_menuSerial = 0;
 
@@ -117,16 +118,15 @@ void LayoutParts() {
 
     const int avail = std::max(0, (int)rc.right - fh * 2);  // garde une marge cliquable pour la saisie
     int first = 0;
-    while (first + 1 < (int)g_crumbs.size() && total + (first ? over : 0) > avail) {
+    total += over;  // chevron de gauche : emplacements racines (et segments masqués)
+    while (first + 1 < (int)g_crumbs.size() && total > avail) {
         total -= textW[first] + chev;
         ++first;
     }
     g_firstShown = first;
     int x = 0;
-    if (first) {
-        g_hits.push_back({{x, 0, x + over, rc.bottom}, Part::Overflow, -1});
-        x += over;
-    }
+    g_hits.push_back({{x, 0, x + over, rc.bottom}, Part::Overflow, -1});
+    x += over;
     for (int i = first; i < (int)g_crumbs.size(); ++i) {
         g_hits.push_back({{x, 0, x + textW[i], rc.bottom}, Part::Text, i});
         x += textW[i];
@@ -170,8 +170,8 @@ void Paint(HDC target, const RECT& rc) {
         const Hit& h = g_hits[i];
         RECT r = h.rc;
         InflateRect(&r, 0, -1);
-        if ((int)i == g_pressed || (int)i == g_hot) {
-            HBRUSH b = CreateSolidBrush((int)i == g_pressed ? RGB(204, 232, 255) : RGB(229, 243, 255));
+        if ((int)i == g_pressed || (int)i == g_hot || (int)i == g_dropHot) {
+            HBRUSH b = CreateSolidBrush((int)i == g_pressed || (int)i == g_dropHot ? RGB(204, 232, 255) : RGB(229, 243, 255));
             FillRect(dc, &r, b);
             DeleteObject(b);
         }
@@ -185,6 +185,10 @@ void Paint(HDC target, const RECT& rc) {
             }
             case Part::Chevron: Chevron(dc, h.rc, (int)i == g_pressed, gray); break;
             case Part::Overflow: {
+                if (!g_firstShown) {  // rien de masqué : chevron des emplacements racines
+                    Chevron(dc, h.rc, (int)i == g_pressed, gray);
+                    break;
+                }
                 SetTextColor(dc, gray);
                 RECT t = h.rc;
                 DrawTextW(dc, L"«", 1, &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
@@ -228,6 +232,21 @@ void ShowOverflow(int hit) {
     for (int i = g_firstShown - 1; i >= 0; --i) {  // le plus proche d'abord, comme l'Explorateur
         paths.push_back(&g_crumbs[i].path);
         AppendMenuW(menu, MF_STRING, paths.size(), MenuText(g_crumbs[i].text).c_str());
+    }
+    // Puis les emplacements racines, comme le chevron de gauche de l'Explorateur.
+    const std::vector<Crumb> roots = g_host.roots ? g_host.roots() : std::vector<Crumb>{};
+    if (!paths.empty() && !roots.empty()) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    const size_t hidden = paths.size();
+    for (const Crumb& r : roots) {
+        bool dup = false;  // déjà dans les segments masqués (« Ce PC »)
+        for (size_t k = 0; k < hidden && !dup; ++k) dup = _wcsicmp(paths[k]->c_str(), r.path.c_str()) == 0;
+        if (dup) continue;
+        paths.push_back(&r.path);
+        AppendMenuW(menu, MF_STRING, paths.size(), MenuText(r.text).c_str());
+    }
+    if (paths.empty()) {
+        DestroyMenu(menu);
+        return;
     }
     const std::wstring* pick = TrackUnder(hit, menu, paths);
     DestroyMenu(menu);
@@ -393,7 +412,21 @@ void Crumbs_Update() {
     if (same) return;
     g_crumbs = std::move(crumbs);
     ++g_menuSerial;  // un menu en attente ne correspond plus au fil
-    g_hot = g_pressed = -1;
+    g_hot = g_pressed = g_dropHot = -1;
     LayoutParts();
+    if (g_wnd) InvalidateRect(g_wnd, nullptr, FALSE);
+}
+
+int Crumbs_DropHit(POINT client, std::wstring& path) {
+    const int hit = HitTest(client);
+    if (hit < 0 || g_hits[hit].part != Part::Text) return -1;
+    path = g_crumbs[g_hits[hit].index].path;
+    if (path.empty() || (path.size() > 1 && path[0] == L':' && path[1] == L':')) return -1;  // Ce PC, emplacements virtuels
+    return hit;
+}
+
+void Crumbs_DropHighlight(int part) {
+    if (part == g_dropHot) return;
+    g_dropHot = part;
     if (g_wnd) InvalidateRect(g_wnd, nullptr, FALSE);
 }

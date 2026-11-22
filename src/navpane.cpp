@@ -130,7 +130,7 @@ struct Result {
     bool unpinFailed = false;
 };
 std::wstring g_unpinQueued;  // désépinglage demandé pendant une lecture
-
+std::wstring g_expandTo;     // Ctrl+Maj+E : dossier à atteindre dans l'arborescence (lectures en cours)
 Node* NodeOf(HTREEITEM h) {
     if (!h) return nullptr;
     TVITEMW it{};
@@ -264,7 +264,74 @@ HTREEITEM FindByPath(const std::wstring& path) {
     return pinned;
 }
 
+// Nœud de l'arborescence de Ce PC (pas un épinglé) pour ce chemin.
+HTREEITEM FindTreeNode(const std::wstring& path) {
+    if (path.empty()) return g_pc;
+    for (const auto& [id, n] : g_nodes)
+        if ((n.kind == Kind::Drive || n.kind == Kind::Folder || n.kind == Kind::Place) &&
+            _wcsicmp(n.path.c_str(), path.c_str()) == 0)
+            return n.h;
+    return nullptr;
+}
+
+void SelectSynced(HTREEITEM h) {
+    g_syncing = true;
+    TreeView_SelectItem(g_tree, h);
+    g_syncing = false;
+    TreeView_EnsureVisible(g_tree, h);
+}
+
+// Ouvre l'arborescence un niveau après l'autre jusqu'à g_expandTo ; chaque
+// lecture de sous-dossiers se fait sur un thread et rappelle cette fonction.
+void ExpandStep() {
+    for (int guard = 0; guard < 128 && !g_expandTo.empty(); ++guard) {
+        if (HTREEITEM h = FindTreeNode(g_expandTo)) {
+            g_expandTo.clear();
+            SelectSynced(h);
+            return;
+        }
+        // Ancêtre le plus proche déjà présent.
+        std::wstring p = g_expandTo, parent, leaf;
+        HTREEITEM a = nullptr;
+        while (!a) {
+            if (!ParentOf(p, parent, leaf)) { a = g_pc; break; }
+            p = parent;
+            a = FindTreeNode(p);
+        }
+        Node* n = NodeOf(a);
+        if (!n) { g_expandTo.clear(); return; }
+        if (!n->loaded) {  // lecture, puis on reprend ici
+            n->expandWhenLoaded = true;
+            StartLoad(IdOf(a));
+            return;
+        }
+        if (TreeView_GetItemState(g_tree, a, TVIS_EXPANDED) & TVIS_EXPANDED) {  // ouvert, mais l'enfant manque
+            g_expandTo.clear();
+            SelectSynced(a);
+            return;
+        }
+        TreeView_Expand(g_tree, a, TVE_EXPAND);
+        if (!(TreeView_GetItemState(g_tree, a, TVIS_EXPANDED) & TVIS_EXPANDED)) {  // rien à ouvrir
+            g_expandTo.clear();
+            SelectSynced(a);
+            return;
+        }
+    }
+}
+
 }  // namespace
+
+void NavPane_ExpandTo(const std::wstring& path) {
+    if (!g_tree) return;
+    g_expandTo = path;
+    if (IsVirtualPath(path) && path != kNetPath) {  // Accueil, Corbeille : déjà à la racine du volet
+        g_expandTo.clear();
+        if (HTREEITEM h = FindByPath(path)) SelectSynced(h);
+    } else {
+        ExpandStep();
+    }
+    SetFocus(g_tree);
+}
 
 std::vector<NavFolder> NavPane_ReadChildren(const std::wstring& path) {
     DirData d;
@@ -620,6 +687,7 @@ void NavPane_OnResult(LPARAM lp) {
     if (h == g_pc) SetIcon(h, r->rootIcon);
     SetChildrenFlag(h, !r->folders.empty());
     if (expand && !r->folders.empty()) TreeView_Expand(g_tree, h, TVE_EXPAND);
+    if (!g_expandTo.empty()) ExpandStep();
 }
 
 void NavPane_ShowPath(const std::wstring& path) {
