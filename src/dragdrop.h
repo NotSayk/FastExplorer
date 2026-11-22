@@ -30,6 +30,9 @@ struct DropHost {
     std::function<void(bool intoFolder)> dropped;            // dépôt fait ; intoFolder : dans le dossier affiché
     // Copier (move = false) ou déplacer `paths` dans `dest` ; vide = toujours le Shell.
     std::function<void(const std::wstring& dest, std::vector<std::wstring> paths, bool move)> transfer;
+    // Survol prolongé d'une ligne (≈ 0,7 s) : l'ouvrir (dossier, onglet). true : le dossier affiché a changé,
+    // la cible est rechoisie quand folder() le reflète.
+    std::function<bool(int row, const std::wstring& name)> spring;
     // hit() renvoie des chemins complets (fil d'Ariane) : pas de dossier affiché, ni de défilement.
     bool fullPaths = false;
 };

@@ -21,6 +21,7 @@
 #include "panes.h"
 #include "paths.h"
 #include "places.h"
+#include "sessions.h"
 #include "archive.h"
 #include "net.h"
 #include "shellmenu.h"
@@ -3400,6 +3401,13 @@ void RegisterDropOn(int k) {
         return row;
     };
     h.dragged = [k](const std::wstring& n) { return k == g_side && g_dragNames.count(n) > 0; };
+    h.spring = [k](int row, const std::wstring&) {  // dossier survolé : on y entre
+        if (k != g_side || !HasView() || g_pending.active) return false;
+        const int e = EntryAt(row);
+        if (e < 0 || !E(e).isDir()) return false;
+        Navigate(FullPath(e), Nav::Normal);
+        return true;
+    };
     h.highlight = [k](int row) {
         if (k == g_side) SetDropRow(row);
     };
@@ -3415,6 +3423,8 @@ void RegisterDropOn(int k) {
     };
     DragDrop_RegisterTarget(g_lists[k], std::move(h));
 }
+
+void RegisterTabDrop();
 
 void RegisterDrop() {
     RegisterDropOn(0);
@@ -3432,6 +3442,7 @@ void RegisterDrop() {
         StartOp(std::move(op));
     };
     DragDrop_RegisterTarget(g_crumbs, std::move(c));
+    RegisterTabDrop();
 }
 
 // ───────────────────────────── Onglets, fenêtres ─────────────────────────────
@@ -3454,6 +3465,8 @@ std::vector<Tab> g_tabList(1);
 size_t g_tab = 0;
 int g_tabDrag = -1;  // onglet que l'on fait glisser (réorganisation)
 uint64_t g_otherTabId = 0;  // double panneau : onglet affiché dans le panneau inactif
+uint64_t g_restoreOther = 0;  // onglets rouverts : onglet actif, montré quand le double panneau se rétablit
+bool g_tabOut = false;  // onglet glissé hors de la barre : détacher ou fusionner au relâchement
 
 int TabIndexOf(uint64_t id) {
     for (size_t i = 0; i < g_tabList.size(); ++i)
@@ -3623,6 +3636,38 @@ void MoveTab(size_t from, size_t to) {
     UpdateTabStrip();
 }
 
+void RegisterTabDrop() {
+    // Onglets : déposer dans le dossier d'un onglet ; le survoler l'affiche.
+    DropHost t;
+    t.fullPaths = true;
+    t.hit = [](POINT client, std::wstring& path) {
+        TCHITTESTINFO ht{client, 0};
+        const int i = TabCtrl_HitTest(g_tabBar, &ht);
+        if (i < 0 || i >= (int)g_tabList.size()) return -1;
+        path = (size_t)i == g_tab ? g_path : g_tabList[(size_t)i].path;
+        return i;
+    };
+    t.highlight = [](int i) {
+        static int hot = -1;
+        if (i == hot) return;
+        if (hot >= 0) TabCtrl_HighlightItem(g_tabBar, hot, FALSE);
+        hot = i;
+        if (i >= 0) TabCtrl_HighlightItem(g_tabBar, i, TRUE);
+    };
+    t.spring = [](int i, const std::wstring&) {
+        if (i >= 0 && (size_t)i != g_tab) SwitchTab((size_t)i);
+        return false;
+    };
+    t.transfer = [](const std::wstring& dest, std::vector<std::wstring> paths, bool move) {
+        FileOp op;
+        op.kind = move ? FileOpKind::Move : FileOpKind::Copy;
+        op.folder = dest;
+        op.paths = std::move(paths);
+        StartOp(std::move(op));
+    };
+    DragDrop_RegisterTarget(g_tabBar, std::move(t));
+}
+
 // ───────────────────────────── Double panneau ─────────────────────────────
 
 
@@ -3769,12 +3814,19 @@ void SetDual(bool on) {
             return;
         }
         SaveTab();
-        Tab t;
-        t.path = g_path;
-        t.query = g_query;
-        t.data = g_view.data;  // même contenu : affiché aussitôt, puis relu
-        g_tabList.insert(g_tabList.begin() + (ptrdiff_t)g_tab + 1, std::move(t));
-        g_otherTabId = g_tabList[g_tab + 1].id;
+        // Onglets rouverts : le panneau actif de la dernière fois existe déjà.
+        const int keep = g_restoreOther ? TabIndexOf(g_restoreOther) : -1;
+        g_restoreOther = 0;
+        if (keep >= 0 && keep != (int)g_tab) {
+            g_otherTabId = g_tabList[(size_t)keep].id;
+        } else {
+            Tab t;
+            t.path = g_path;
+            t.query = g_query;
+            t.data = g_view.data;  // même contenu : affiché aussitôt, puis relu
+            g_tabList.insert(g_tabList.begin() + (ptrdiff_t)g_tab + 1, std::move(t));
+            g_otherTabId = g_tabList[g_tab + 1].id;
+        }
         g_dual = true;
         for (HWND h : {g_lists[0], g_lists[1], g_paneHdr[0], g_paneHdr[1]}) ShowWindow(h, SW_SHOW);
         Layout();
@@ -3833,21 +3885,27 @@ void TransferToOther(bool move) {
           L" vers " + dest);
 }
 
-// Nouvelle fenêtre (Ctrl+N), un peu décalée par rapport à celle-ci, sur le même écran.
-void NewWindow(const std::wstring& path) {
+// Nouvelle fenêtre (Ctrl+N), un peu décalée par rapport à celle-ci, sur le même écran ;
+// at : sous ce point (onglet détaché), sur son écran.
+void NewWindow(const std::wstring& path, const POINT* under = nullptr) {
     wchar_t exe[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return;
     WINDOWPLACEMENT wp{sizeof wp};
     GetWindowPlacement(g_hwnd, &wp);
     // Décalée de 30 px, sans déborder de la zone de travail de l'écran.
     MONITORINFO mi{sizeof mi};
-    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    GetMonitorInfoW(under ? MonitorFromPoint(*under, MONITOR_DEFAULTTONEAREST) : MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST),
+                    &mi);
     const RECT& wa = mi.rcWork;
     const LONG w = std::min(wp.rcNormalPosition.right - wp.rcNormalPosition.left, wa.right - wa.left);
     const LONG h = std::min(wp.rcNormalPosition.bottom - wp.rcNormalPosition.top, wa.bottom - wa.top);
     LONG x = wp.rcNormalPosition.left + S(30), y = wp.rcNormalPosition.top + S(30);
-    if (x + w > wa.right) x = wa.left;
-    if (y + h > wa.bottom) y = wa.top;
+    if (under) {  // l'onglet reste sous le curseur
+        x = under->x - S(80);
+        y = under->y - S(12);
+    }
+    if (x + w > wa.right) x = under ? wa.right - w : wa.left;
+    if (y + h > wa.bottom) y = under ? wa.bottom - h : wa.top;
     x = std::max(x, wa.left);
     y = std::max(y, wa.top);
     std::wstring arg = path;
@@ -3865,8 +3923,167 @@ void NewWindow(const std::wstring& path) {
     }
 }
 
-void ShowTabMenu(int hit, POINT pt) {
-    HMENU m = CreatePopupMenu();
+constexpr ULONG_PTR kCopyTab = 0x46454254;  // WM_COPYDATA « FEBT » : onglet glissé depuis une autre fenêtre
+
+// Onglet relâché hors de la barre : sur une autre fenêtre FastExplorer, il la
+// rejoint ; ailleurs, il part dans une nouvelle fenêtre, sous le curseur.
+void DetachTab(size_t i, POINT s) {
+    if (i >= g_tabList.size()) return;
+    if (i == g_tab) SaveTab();
+    const std::wstring path = g_tabList[i].path;
+    HWND w = GetAncestor(WindowFromPoint(s), GA_ROOT);
+    if (w == g_hwnd) return;
+    wchar_t cls[64] = {};
+    if (w && GetClassNameW(w, cls, 64) && wcscmp(cls, L"FastExplorerWnd") == 0) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        AllowSetForegroundWindow(pid);
+        COPYDATASTRUCT cd{kCopyTab, (DWORD)((path.size() + 1) * sizeof(wchar_t)), (void*)path.c_str()};
+        DWORD_PTR r = 0;
+        if (SendMessageTimeoutW(w, WM_COPYDATA, (WPARAM)g_hwnd, (LPARAM)&cd, SMTO_ABORTIFHUNG, 3000, &r) && r)
+            CloseTab(i);  // c'était le seul onglet : cette fenêtre se ferme
+        else
+            Flash(L"L'autre fenêtre ne répond pas.");
+        return;
+    }
+    if (g_tabList.size() < 2) return;  // seul onglet : c'est la fenêtre qu'on déplace
+    NewWindow(path, &s);
+    CloseTab(i);
+}
+
+// Onglet reçu d'une autre fenêtre (WM_COPYDATA).
+bool ReceiveTab(const COPYDATASTRUCT* cd) {
+    if (!cd || cd->dwData != kCopyTab || !cd->lpData || cd->cbData < sizeof(wchar_t) || cd->cbData % sizeof(wchar_t))
+        return false;
+    const auto* s = (const wchar_t*)cd->lpData;
+    const std::wstring path(s, wcsnlen(s, cd->cbData / sizeof(wchar_t)));
+    NewTab(path, true);
+    if (IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE);
+    SetForegroundWindow(g_hwnd);
+    return true;
+}
+
+// Onglets ouverts (dossier de chacun), pour la réouverture et les sessions.
+SessionTabs CurrentTabs() {
+    SaveTab();
+    SessionTabs s;
+    for (const Tab& t : g_tabList) s.paths.push_back(t.path);
+    s.active = (int)g_tab;
+    s.other = g_dual ? TabIndexOf(g_otherTabId) : -1;
+    return s;
+}
+
+// Remplace les onglets par ceux d'une session.
+void LoadTabs(const SessionTabs& s) {
+    if (s.paths.empty()) return;
+    if (g_dual) SetDual(false);
+    std::vector<Tab> v;
+    for (const auto& p : s.paths) {
+        Tab t;
+        t.path = p;
+        v.push_back(std::move(t));
+    }
+    g_tabList = std::move(v);
+    g_tab = std::min<size_t>((size_t)std::max(s.active, 0), g_tabList.size() - 1);
+    UpdateTabStrip();
+    ShowTab(g_tab);
+}
+
+std::wstring MenuText(std::wstring s) {  // « & » affiché tel quel dans un menu
+    for (size_t i = 0; (i = s.find(L'&', i)) != std::wstring::npos; i += 2) s.insert(i, 1, L'&');
+    return s;
+}
+
+std::wstring Plural(size_t n, const wchar_t* one, const wchar_t* many) {
+    return std::to_wstring(n) + L" " + (n > 1 ? many : one);
+}
+
+void SaveSessionAs() {
+    const SessionTabs s = CurrentTabs();
+    std::wstring name = TabText(g_tabList[g_tab]);
+    if (!AskText(g_hwnd, L"Enregistrer la session",
+                 L"Nom de la session (" + Plural(s.paths.size(), L"onglet", L"onglets") + L") :", name))
+        return;
+    const auto names = Session_Names();
+    const bool existed = std::any_of(names.begin(), names.end(), [&](const std::wstring& n) { return _wcsicmp(n.c_str(), name.c_str()) == 0; });
+    if (!Session_Save(name, s)) {
+        SetStatus(L"Impossible d'enregistrer la session « " + name + L" ».");
+        return;
+    }
+    Flash((existed ? L"Session remplacée : « " : L"Session enregistrée : « ") + name + L" » (" +
+          Plural(s.paths.size(), L"onglet", L"onglets") + L")");
+}
+
+void OpenSession(const std::wstring& name) {
+    SessionTabs s;
+    if (!Session_Load(name, s)) {
+        SetStatus(L"Session « " + name + L" » illisible.");
+        return;
+    }
+    LoadTabs(s);
+    Flash(L"Session « " + name + L" » : " + Plural(s.paths.size(), L"onglet", L"onglets"));
+}
+
+std::vector<MenuExtra> SessionItems() {
+    std::vector<MenuExtra> v, del;
+    for (const auto& n : Session_Names()) {
+        v.push_back({MenuText(n), [n] { OpenSession(n); }});
+        del.push_back({MenuText(n), [n] {
+                           if (Session_Delete(n)) Flash(L"Session supprimée : « " + n + L" »");
+                       }});
+    }
+    if (v.empty()) v.push_back({L"Aucune session enregistrée", nullptr, false, false, {}, true});
+    v.push_back({});
+    v.push_back({L"Enregistrer les onglets…", SaveSessionAs});
+    if (!del.empty()) v.push_back({L"Supprimer", nullptr, false, false, std::move(del)});
+    v.push_back({});
+    v.push_back({L"Rouvrir les onglets au démarrage", [] { Session_SetRestore(!Session_RestoreEnabled()); }, false,
+                 Session_RestoreEnabled()});
+    return v;
+}
+
+// Signets : Alt+1…9 pour y aller, Alt+Maj+1…9 pour y ranger le dossier affiché.
+void GoBookmark(int n) {
+    std::wstring path;
+    if (!Bookmark_Get(n, path)) {
+        Flash(L"Signet " + std::to_wstring(n) + L" vide : Alt+Maj+" + std::to_wstring(n) + L" pour y ranger ce dossier");
+        return;
+    }
+    Navigate(path, Nav::Normal);
+}
+
+void SetBookmark(int n) {
+    const std::wstring path = g_pending.active ? g_pending.path : g_path;
+    if (!Bookmark_Set(n, path)) {
+        SetStatus(L"Impossible d'enregistrer le signet.");
+        return;
+    }
+    Flash(L"Signet " + std::to_wstring(n) + L" (Alt+" + std::to_wstring(n) + L") : " + HistoryText(path));
+}
+
+std::vector<MenuExtra> BookmarkItems() {
+    std::vector<MenuExtra> v, del;
+    int free = 0;
+    for (int n = 1; n <= kBookmarks; ++n) {
+        std::wstring path;
+        if (!Bookmark_Get(n, path)) {
+            if (!free) free = n;
+            continue;
+        }
+        const std::wstring k = std::to_wstring(n);
+        v.push_back({L"&" + k + L"  " + MenuText(HistoryText(path)) + L"\tAlt+" + k, [n] { GoBookmark(n); }});
+        del.push_back({MenuText(HistoryText(path)), [n] { Bookmark_Clear(n); }});
+    }
+    if (v.empty()) v.push_back({L"Aucun signet", nullptr, false, false, {}, true});
+    v.push_back({});
+    v.push_back({free ? L"Ajouter ce dossier aux signets\tAlt+Maj+" + std::to_wstring(free)
+                      : std::wstring(L"Ajouter ce dossier aux signets"),
+                 [free] { SetBookmark(free); }, false, false, {}, !free});
+    if (!del.empty()) v.push_back({L"Retirer", nullptr, false, false, std::move(del)});
+    return v;
+}
+
+void ShowTabMenu(int hit, POINT pt) {    HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, 1, L"Nouvel onglet\tCtrl+T");
     if (hit >= 0) {
         AppendMenuW(m, MF_STRING, 2, L"Dupliquer l'onglet");
@@ -4444,6 +4661,9 @@ std::vector<MenuExtra> MoreItems() {
     v.push_back({L"Ouvrir dans le Terminal", [] { OpenTerminal(g_path); }, false, false, {},
                  !view || g_path.empty() || InVirtual() || InNet()});
     v.push_back({L"Propriétés\tAlt+Entrée", ShowProperties, false, false, {}, !view});
+    v.push_back({});
+    v.push_back({L"Signets", nullptr, false, false, BookmarkItems()});
+    v.push_back({L"Sessions", nullptr, false, false, SessionItems()});
     v.push_back({});
     v.push_back({L"Menu contextuel complet par défaut", [] { SetFullMenu(!g_fullMenu); }, false, g_fullMenu});
     return v;
@@ -5193,7 +5413,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (lp && wcscmp((const wchar_t*)lp, L"ShellState") == 0) ApplyViewPrefs(ReadViewPrefs());
             break;
         case WM_CLIPBOARDUPDATE: OnClipboardUpdate(); return 0;
+        case WM_COPYDATA: return ReceiveTab((const COPYDATASTRUCT*)lp) ? TRUE : FALSE;
+        case WM_ENDSESSION:
+            if (wp) Session_SaveLast(CurrentTabs());
+            return 0;
         case WM_CLOSE:
+            if (IsWindowVisible(hwnd)) Session_SaveLast(CurrentTabs());  // rouverts au prochain démarrage
             // Une copie en cours continue jusqu'au bout : on masque la fenêtre et on attend.
             if (FileOps_Running() > 0) {
                 g_quitWhenIdle = true;
@@ -5484,7 +5709,22 @@ bool HandleGlobalKeys(const MSG& m) {
             TCHITTESTINFO ht{{GET_X_LPARAM(m.lParam), GET_Y_LPARAM(m.lParam)}, 0};
             const int hit = TabCtrl_HitTest(g_tabBar, &ht);
             g_tabDrag = hit >= 0 && hit < (int)g_tabList.size() ? hit : -1;
+            g_tabOut = false;
+            if (g_tabDrag >= 0) SetCapture(g_tabBar);  // suivi même hors de la barre (détacher l'onglet)
+        } else if (m.message == WM_MOUSEMOVE && g_tabDrag >= 0 && !(m.wParam & MK_LBUTTON)) {
+            g_tabDrag = -1;  // bouton relâché ailleurs (capture perdue)
+            g_tabOut = false;
         } else if (m.message == WM_MOUSEMOVE && g_tabDrag >= 0 && (m.wParam & MK_LBUTTON)) {
+            POINT s{GET_X_LPARAM(m.lParam), GET_Y_LPARAM(m.lParam)};
+            ClientToScreen(g_tabBar, &s);
+            RECT br;
+            GetWindowRect(g_tabBar, &br);
+            InflateRect(&br, S(8), S(24));
+            g_tabOut = !PtInRect(&br, s);
+            if (g_tabOut) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                return true;
+            }
             TCHITTESTINFO ht{{GET_X_LPARAM(m.lParam), GET_Y_LPARAM(m.lParam)}, 0};
             const int hit = TabCtrl_HitTest(g_tabBar, &ht);
             if (hit >= 0 && hit < (int)g_tabList.size() && hit != g_tabDrag && (size_t)g_tabDrag == g_tab) {
@@ -5492,7 +5732,17 @@ bool HandleGlobalKeys(const MSG& m) {
                 g_tabDrag = hit;
             }
         } else if (m.message == WM_LBUTTONUP) {
+            const int drag = g_tabDrag;
+            const bool out = g_tabOut;
             g_tabDrag = -1;
+            g_tabOut = false;
+            if (GetCapture() == g_tabBar) ReleaseCapture();
+            if (out && drag >= 0) {
+                POINT s{GET_X_LPARAM(m.lParam), GET_Y_LPARAM(m.lParam)};
+                ClientToScreen(g_tabBar, &s);
+                DetachTab((size_t)drag, s);
+                return true;
+            }
         }
         return false;
     }
@@ -5507,6 +5757,10 @@ bool HandleGlobalKeys(const MSG& m) {
             case VK_RIGHT: GoForward(); return true;
             case VK_UP: GoUp(); return true;
             case 'D': BeginAddressEdit(); return true;
+            case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
+                if (GetKeyState(VK_SHIFT) < 0) SetBookmark((int)(m.wParam - '0'));
+                else GoBookmark((int)(m.wParam - '0'));
+                return true;
             case 'P': TogglePane(GetKeyState(VK_SHIFT) < 0 ? PaneMode::Details : PaneMode::Preview); return true;
             case VK_RETURN:
                 if (focus == g_addr) return false;
@@ -5648,10 +5902,24 @@ bool HandleGlobalKeys(const MSG& m) {
 
 }  // namespace
 
-bool Ui_Create(HINSTANCE inst, int show, const std::wstring& start, const RECT* at) {
+bool Ui_Create(HINSTANCE inst, int show, const std::wstring& start, const RECT* at, bool restore) {
     g_inst = inst;
     g_prefs = ReadViewPrefs();  // avant la première lecture : elle filtre déjà les éléments cachés
-    Navigate(start, Nav::Normal);  // la lecture démarre pendant qu'on construit la fenêtre
+    std::wstring first = start;
+    if (SessionTabs s; restore && Session_RestoreEnabled() && Session_LoadLast(s) && !s.paths.empty()) {
+        g_tabList.clear();
+        for (const auto& p : s.paths) {
+            Tab t;
+            t.path = p;
+            g_tabList.push_back(std::move(t));
+        }
+        // Double panneau : l'onglet du panneau inactif s'affiche d'abord ; SetDual(true) passe ensuite à l'actif.
+        const bool dual = s.other >= 0 && RegDword(L"Software\\FastExplorer", L"Dual", 0) != 0;
+        g_tab = (size_t)(dual ? s.other : s.active);
+        if (dual) g_restoreOther = g_tabList[(size_t)s.active].id;
+        first = g_tabList[g_tab].path;
+    }
+    Navigate(first, Nav::Normal);  // la lecture démarre pendant qu'on construit la fenêtre
     WarmUpShell();
     INITCOMMONCONTROLSEX icc{sizeof icc, ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES};
     InitCommonControlsEx(&icc);

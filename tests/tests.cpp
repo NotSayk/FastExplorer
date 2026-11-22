@@ -22,6 +22,7 @@
 #include "panes.h"
 #include "pins.h"
 #include "places.h"
+#include "sessions.h"
 #include "net.h"
 #include <lm.h>
 #include "nt.h"
@@ -1077,6 +1078,72 @@ void TestPlaces() {
     CHECK(IsVirtualPath(kHomePath) && !IsVirtualPath(L"C:\\") && !IsVirtualPath(L""));
 }
 
+void TestSessions() {
+    {  // Forme enregistrée : Ce PC (chemin vide) compris
+        SessionTabs s;
+        s.paths = {L"C:\\Windows", L"", L"\\\\serveur\\partage", L"C:\\a,b"};
+        s.active = 2;
+        s.other = 0;
+        SessionTabs r;
+        CHECK(Session_Decode(Session_Encode(s), r));
+        CHECK(r.paths == s.paths && r.active == 2 && r.other == 0);
+        s.active = 9;  // hors limites : premier onglet ; autre = actif : aucun
+        s.other = 0;
+        CHECK(Session_Decode(Session_Encode(s), r) && r.active == 0 && r.other == -1);
+        CHECK(!Session_Decode(L"", r));
+        CHECK(!Session_Decode(std::wstring(L"0,-1\0", 5), r));  // aucun onglet
+        CHECK(!Session_Decode(std::wstring(L"0,-1\0C:\\\0", 9), r));  // ligne sans « > »
+        CHECK(!Session_Decode(std::wstring(L"x\0>C:\\\0", 8), r));
+    }
+    {  // Onglets de la dernière fenêtre (valeur de l'utilisateur sauvegardée puis remise)
+        SessionTabs saved;
+        const bool had = Session_LoadLast(saved);
+        SessionTabs s;
+        s.paths = {L"C:\\", L""};
+        s.active = 1;
+        CHECK(Session_SaveLast(s));
+        SessionTabs r;
+        CHECK(Session_LoadLast(r) && r.paths == s.paths && r.active == 1 && r.other == -1);
+        CHECK(!Session_SaveLast(SessionTabs{}));  // rien à mémoriser
+        if (had) Session_SaveLast(saved);
+        else RegDeleteKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"LastTabs");
+    }
+    {  // Sessions nommées
+        const std::wstring name = L"  fe-test session & co  ";
+        const std::wstring trimmed = L"fe-test session & co";
+        SessionTabs s;
+        s.paths = {L"C:\\Windows", L"C:\\"};
+        s.other = 1;
+        CHECK(Session_Save(name, s));
+        auto names = Session_Names();
+        CHECK(std::count(names.begin(), names.end(), trimmed) == 1);
+        SessionTabs r;
+        CHECK(Session_Load(trimmed, r) && r.paths == s.paths && r.other == 1);
+        s.paths = {L"D:\\"};
+        CHECK(Session_Save(trimmed, s));  // remplacée
+        CHECK(Session_Load(name, r) && r.paths.size() == 1 && r.paths[0] == L"D:\\");
+        CHECK(!Session_Save(L"   ", s));
+        CHECK(!Session_Save(L"vide", SessionTabs{}));
+        CHECK(Session_Delete(trimmed));
+        names = Session_Names();
+        CHECK(std::count(names.begin(), names.end(), trimmed) == 0);
+        CHECK(!Session_Load(trimmed, r));
+    }
+    {  // Signets (le 9 de l'utilisateur sauvegardé puis remis)
+        std::wstring saved;
+        const bool had = Bookmark_Get(9, saved);
+        CHECK(Bookmark_Set(9, L""));  // Ce PC
+        std::wstring p = L"x";
+        CHECK(Bookmark_Get(9, p) && p.empty());
+        CHECK(Bookmark_Set(9, L"C:\\Users"));
+        CHECK(Bookmark_Get(9, p) && p == L"C:\\Users");
+        CHECK(Bookmark_Clear(9) && !Bookmark_Get(9, p));
+        CHECK(Bookmark_Clear(9));  // déjà absent
+        CHECK(!Bookmark_Set(0, L"C:\\") && !Bookmark_Set(10, L"C:\\") && !Bookmark_Get(0, p));
+        if (had) Bookmark_Set(9, saved);
+    }
+}
+
 void TestShortcut() {
     const std::wstring dir = Join(g_root, L"Adir");
     const std::wstring lnk = Join(dir, L"vers zdir.lnk");
@@ -2074,6 +2141,7 @@ int wmain() {
     TestFastCopy();
     TestFileOps();
     TestPlaces();
+    TestSessions();
     TestNet();
     TestDeflate();
     TestArchive();

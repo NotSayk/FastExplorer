@@ -19,6 +19,7 @@
 //   crumbs.*   fil d'Ariane de la barre d'adresse
 //   foldersize.* taille des dossiers en arrière-plan
 //   index.*    recherche instantanée : service (table des fichiers NTFS + journal USN) et client
+//   sessions.* onglets rouverts au démarrage, sessions nommées, signets
 //   ui.*       fenêtre, ListView virtuelle, raccourcis
 
 #include "win.h"
@@ -129,7 +130,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     // menu Shell, et plus tard glisser-déposer.
     OleInitialize(nullptr);
     int rc = 1;
-    if (Ui_Create(inst, show, start, haveAt ? &at : nullptr)) rc = Ui_Run();
+    if (Ui_Create(inst, show, start, haveAt ? &at : nullptr, argc < 2)) rc = Ui_Run();
     OleUninitialize();
     return rc;
 }

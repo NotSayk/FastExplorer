@@ -102,10 +102,10 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Onglet suivant / précédent | Ctrl+Tab / Ctrl+Maj+Tab | ✅ P1 (+ Ctrl+Pg préc. / Pg suiv.) |
 | Aller à l'onglet N | Ctrl+1 … Ctrl+9 ⚠️ | ✅ P2 (Ctrl+9 : le dernier) |
 | Réorganiser | Glisser l'onglet dans la barre | ✅ P1 |
-| Détacher / fusionner | Glisser un onglet hors de la fenêtre = nouvelle fenêtre ; dans une autre = fusion | P2 |
+| Détacher / fusionner | Glisser un onglet hors de la fenêtre = nouvelle fenêtre ; dans une autre = fusion | ✅ P2 (bloc 26 : relâché hors de la barre, l'onglet part dans une nouvelle fenêtre sous le curseur ; sur une autre fenêtre FastExplorer, il la rejoint) |
 | Menu de l'onglet | Dupliquer, Fermer, Fermer les autres, Fermer à droite, Déplacer vers une nouvelle fenêtre | ✅ P2 (« ouvrir » dans une nouvelle fenêtre) |
-| Déposer des fichiers sur un onglet | Survoler un onglet pendant un glisser l'active, pour y déposer | P2 |
-| Restaurer à la réouverture | Option *Restaurer les fenêtres de dossiers précédentes à l'ouverture de session* | P2 |
+| Déposer des fichiers sur un onglet | Survoler un onglet pendant un glisser l'active, pour y déposer | ✅ P2 (bloc 26 : déposer sur un onglet copie / déplace dans son dossier ; survol de 0,7 s : il s'affiche) |
+| Restaurer à la réouverture | Option *Restaurer les fenêtres de dossiers précédentes à l'ouverture de session* | ✅ P2 (bloc 26 : lancé sans dossier, FastExplorer rouvre les onglets de la dernière fenêtre fermée, double panneau compris ; « ··· » ▸ Sessions ▸ Rouvrir les onglets au démarrage) |
 | Clic milieu dans la barre d'onglets vide | ⚠️ selon la version | P3 |
 
 ---
@@ -230,7 +230,7 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Copier en tant que chemin d'accès | Ctrl+Maj+C : chemin(s) entre guillemets | ✅ (bloc 10 : aussi dans le menu contextuel, sans Maj) |
 | Copier vers / Déplacer vers | Choix d'un dossier de destination | P2 |
 | **Glisser-déposer** | Même volume = déplacer ; autre volume = copier ; Ctrl = forcer la copie ; Maj = forcer le déplacement ; Alt ou Ctrl+Maj = créer un raccourci ; **clic droit + glisser** = menu au dépôt (Copier ici, Déplacer ici, Créer un raccourci ici). Interopérable avec les autres applications | ✅ P0 (dépôt confié à la cible du Shell : dossier affiché ou élément survolé — dossier, .zip, raccourci ; testé hors écran, pas encore à la souris) ⚙️ OLE `IDropTarget` / `IDropSource` / `IDataObject` |
-| Ouverture au survol pendant le glisser | Survoler un dossier ou un onglet ouvre celui-ci après un délai | P2 |
+| Ouverture au survol pendant le glisser | Survoler un dossier ou un onglet ouvre celui-ci après un délai | ✅ P2 (bloc 26 : 0,7 s ; on entre dans le dossier et l'on continue de glisser) |
 | Dupliquer sur place | Ctrl+C, Ctrl+V dans le même dossier : « fichier - Copie.txt » | P0 |
 | **Boîte de dialogue de copie** | Progression, débit, **graphique de vitesse** (« Plus de détails »), temps restant, pause, annulation ; plusieurs copies regroupées dans une seule fenêtre | ✅ P0 (fenêtre du Shell, interface jamais bloquée) |
 | **Conflits** | Remplacer, Ignorer, **Comparer** (choix fichier par fichier, avec dates et tailles), « Faire ceci pour les N conflits suivants » ; fusion des dossiers de même nom (option *Masquer les conflits de fusion de dossiers*) | ✅ P0 (dialogue du Shell) |
@@ -491,7 +491,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 |---|---|---|
 | Alt+← / Alt+→ / **Retour arrière** | Précédent / Suivant / Précédent | ✅ (⚠️ Retour arrière) |
 | Alt+↑ | Dossier parent | ✅ |
-| Alt+D, Ctrl+L, F4 | Barre d'adresse (F4 : avec la liste déroulante) | ✅ (F4 : sans liste déroulante, l'historique n'existe pas encore) |
+| Alt+D, Ctrl+L, F4 | Barre d'adresse (F4 : avec la liste déroulante) | ✅ (F4 : historique des chemins tapés, bloc 25) |
 | Ctrl+E, Ctrl+F, F3 | Recherche | ✅ P0 |
 | F5, Ctrl+R | Actualiser | ✅ |
 | F6, Tab | Passer d'un volet à l'autre | 🟡 (Tab : adresse ↔ liste) |
@@ -519,6 +519,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Ctrl+Maj+1 … 8 | Mode d'affichage (voir §4.1) | ✅ P1 |
 | Ctrl+molette | Zoom des icônes | ✅ P1 |
 | Alt+P / Alt+Maj+P | Volet d'aperçu / de détails | ✅ P1 |
+| Alt+1 … 9 / Alt+Maj+1 … 9 | Signets (FastExplorer) : y aller / y ranger le dossier affiché | ✅ P2 (bloc 26) |
 | Ctrl+pavé num. + | Ajuster toutes les colonnes | P2 |
 
 ---
@@ -560,8 +561,8 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | **Aperçu du code avec coloration** | Volet d'aperçu rapide pour le texte et le code | P2 ⭐ |
 | **Hash et vérification** | MD5/SHA-256 dans les propriétés ou le menu | P3 ⭐ |
 | **Comparaison de dossiers** | Différences entre deux dossiers, synchronisation | P3 ⭐ |
-| **Sessions / espaces de travail** | Ensembles d'onglets nommés, restaurés en un clic | P2 ⭐ |
-| **Signets** | Favoris de dossiers avec raccourcis clavier | P2 ⭐ |
+| **Sessions / espaces de travail** | Ensembles d'onglets nommés, restaurés en un clic | ✅ P2 ⭐ (bloc 26 : « ··· » ▸ Sessions : enregistrer les onglets sous un nom, rouvrir, supprimer) |
+| **Signets** | Favoris de dossiers avec raccourcis clavier | ✅ P2 ⭐ (bloc 26 : Alt+Maj+1…9 range le dossier, Alt+1…9 y va ; « ··· » ▸ Signets) |
 | **Fichiers verrouillés** | « Qui utilise ce fichier ? » + fermer l'application | P2 ⭐ |
 | **Intégration Git** | Dans un dépôt : branche courante affichée, **changer de branche** en un clic, état des fichiers (modifié, nouveau, ignoré) en colonne ou surimpression ; à faire une fois l'interface aboutie | P2 ⭐ |
 | **Onglet WSL** | Section dédiée aux distributions Linux (`\\wsl.localhost\<distro>`) : liste des distributions, ouverture directe, état (démarrée / arrêtée) | P2 ⭐ |
@@ -646,7 +647,7 @@ P2, en blocs (dans cet ordre) :
 
 25. ✅ **Navigation et barre d'adresse** : commandes `shell:`, chevron des emplacements racines, historique des
     chemins tapés (F4), déposer sur un segment du fil d'Ariane, Ctrl+Maj+E, F11, Alt+double-clic.
-26. **Onglets et sessions** : détacher / fusionner un onglet, ouverture au survol pendant un glisser, onglets
+26. ✅ **Onglets et sessions** : détacher / fusionner un onglet, ouverture au survol pendant un glisser, onglets
     restaurés à la réouverture, sessions nommées ⭐, signets ⭐.
 27. **Affichage** : regrouper par, filtres de colonne, cases à cocher, info-bulles, type de dossier et ses
     colonnes, Ctrl+pavé num. +.

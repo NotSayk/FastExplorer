@@ -52,7 +52,9 @@ bool FsPaths(IDataObject* data, std::vector<std::wstring>& out) {
 
 constexpr int kNoRow = -2;     // aucune cible choisie
 constexpr int kBlocked = -3;   // survol d'un élément glissé lui-même : interdit
+constexpr int kRefold = -4;    // dossier affiché changé : cible à rechoisir
 constexpr ULONGLONG kScrollEveryMs = 60;
+constexpr ULONGLONG kSpringMs = 700;  // survol avant d'ouvrir le dossier ou l'onglet
 
 class ListDropTarget : public IDropTarget {
 public:
@@ -80,6 +82,7 @@ public:
         data_ = data;
         right_ = (keys & MK_RBUTTON) != 0;
         row_ = kNoRow;
+        refold_ = false;
         folder_ = host_.folder ? host_.folder() : std::wstring();
         if (helper_) {
             POINT p{pt.x, pt.y};
@@ -93,6 +96,18 @@ public:
     IFACEMETHODIMP DragOver(DWORD keys, POINTL pt, DWORD* effect) override {
         if (!host_.fullPaths) AutoScroll(pt);
         Track(keys, pt, effect);
+        if (host_.spring && row_ >= 0 && !sprung_ && GetTickCount64() - since_ >= kSpringMs) {
+            sprung_ = true;  // une seule fois par ligne survolée
+            if (host_.spring(row_, hitName_)) {
+                if (target_) target_->DragLeave();
+                target_.Reset();
+                item_ = false;
+                host_.highlight(-1);
+                row_ = kNoRow;
+                refold_ = true;
+                *effect = DROPEFFECT_NONE;
+            }
+        }
         last_ = *effect;
         if (helper_) {
             POINT p{pt.x, pt.y};
@@ -163,6 +178,16 @@ private:
     // Choisit la cible sous le curseur et lui relaie le survol.
     void Track(DWORD keys, POINTL pt, DWORD* effect) {
         const DWORD allowed = *effect;
+        if (refold_ && host_.folder) {  // ouvert au survol : nouveau dossier affiché, une fois lu
+            std::wstring f = host_.folder();
+            if (f != folder_) {
+                folder_ = std::move(f);
+                if (target_) target_->DragLeave();
+                target_.Reset();
+                item_ = false;
+                row_ = kRefold;
+            }
+        }
         POINT c{pt.x, pt.y};
         ScreenToClient(list_, &c);
         std::wstring name;
@@ -176,6 +201,9 @@ private:
             item_ = false;
             host_.highlight(-1);
             row_ = row;
+            since_ = GetTickCount64();
+            sprung_ = false;
+            hitName_ = name;
             if (row >= 0 && host_.fullPaths) {  // chemin complet : la cible de cet élément dans son dossier parent
                 std::wstring parent, leaf;
                 if (!ParentOf(name, parent, leaf) || leaf.empty()) {  // lecteur : élément de Ce PC
@@ -224,11 +252,12 @@ private:
         else if (c.y > rc.bottom - zone && c.y <= rc.bottom) dy = rowH;
         if (!dy) return;
         lastScroll_ = now;
+        const int before = GetScrollPos(list_, SB_VERT);
         if (helper_) helper_->Show(FALSE);  // évite les traces de l'image glissée
         ListView_Scroll(list_, 0, dy);
         UpdateWindow(list_);
         if (helper_) helper_->Show(TRUE);
-        row_ = kNoRow;  // la ligne sous le curseur a changé
+        if (GetScrollPos(list_, SB_VERT) != before) row_ = kNoRow;  // la ligne sous le curseur a changé
     }
 
     void Reset() {
@@ -253,6 +282,10 @@ private:
     bool right_ = false;          // glisser du bouton droit : le menu du Shell décide
     DWORD last_ = DROPEFFECT_NONE;  // effet du dernier survol
     ULONGLONG lastScroll_ = 0;
+    ULONGLONG since_ = 0;         // survol de row_ depuis
+    bool sprung_ = false;         // row_ déjà ouverte au survol
+    bool refold_ = false;         // ouvert au survol : suivre le dossier affiché
+    std::wstring hitName_;        // nom (chemin) de row_
 };
 
 }  // namespace
