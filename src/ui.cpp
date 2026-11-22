@@ -3049,7 +3049,7 @@ void BeginRename() {
     }
     if (g_multiRename.size() > 1)
         SetStatus(L"Renommer " + std::to_wstring(g_multiRename.size()) +
-                  L" éléments : « nom (1) », « nom (2) »…   (chacun garde son extension)");
+                  L" éléments → « nom (1) », « nom (2) »…");
 }
 
 // Noms d'un renommage multiple : « base (1).jpg », « base (2).png »… (dossiers : sans extension).
