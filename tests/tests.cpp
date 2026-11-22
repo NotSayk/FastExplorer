@@ -25,6 +25,8 @@
 #include "sessions.h"
 #include "groups.h"
 #include "batchrename.h"
+#include "wsearch.h"
+#include <unordered_set>
 #include <thread>
 #include "net.h"
 #include <lm.h>
@@ -1578,6 +1580,157 @@ void TestSelectionText() {
     CHECK_STR(SelectionText(1, false, 0), std::wstring(L"1 élément sélectionné  ") + b);  // fichier vide
 }
 
+void TestAqs() {
+    SYSTEMTIME st{2026, 3, 0, 15, 12, 0, 0, 0};
+    FILETIME ft;
+    SystemTimeToFileTime(&st, &ft);
+    const int64_t now = (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+    auto m = [&](const wchar_t* q, const wchar_t* name, uint32_t attr = 0, uint64_t size = 10, int64_t mtime = 0) {
+        return SearchQuery(q, now).Match(name, (uint32_t)wcslen(name), attr, size, mtime);
+    };
+    // Mots : tous requis, comme avant.
+    CHECK(m(L"rap txt", L"Rapport.txt") && !m(L"rap doc", L"Rapport.txt"));
+    CHECK(m(L"rap AND txt", L"rapport.txt") && m(L"rap ET txt", L"rapport.txt"));
+    // OU, NON, « - », parenthèses.
+    CHECK(m(L"facture OR devis", L"devis 2026.pdf") && m(L"facture OU devis", L"facture.pdf"));
+    CHECK(!m(L"facture OR devis", L"contrat.pdf"));
+    CHECK(m(L"rapport NOT brouillon", L"rapport final.docx") && !m(L"rapport NOT brouillon", L"rapport brouillon.docx"));
+    CHECK(m(L"rapport -brouillon", L"rapport.docx") && !m(L"rapport -brouillon", L"brouillon rapport.docx"));
+    CHECK(m(L"(facture OR devis) ext:pdf", L"devis.pdf") && !m(L"(facture OR devis) ext:pdf", L"devis.docx"));
+    CHECK(m(L"or", L"Ordre.txt"));  // « or » en minuscules : un mot
+    // Guillemets : phrase exacte ; nom:.
+    CHECK(m(L"\"rapport final\"", L"le rapport final.txt") && !m(L"\"rapport final\"", L"final rapport.txt"));
+    CHECK(m(L"nom:\"rapport final\"", L"Rapport Final v2.txt"));
+    CHECK(m(L"nom:*.txt", L"a.txt") && !m(L"nom:*.txt", L"a.txt.bak"));
+    CHECK(m(L"\"OR\"", L"OR.txt"));  // opérateur entre guillemets : un mot
+    // Catégories et tailles nommées.
+    CHECK(m(L"type:image", L"vacances.JPG") && !m(L"type:image", L"notes.txt"));
+    CHECK(m(L"kind:music", L"a.flac") && m(L"type:vidéo", L"film.mkv") && m(L"type:document", L"cv.pdf"));
+    CHECK(m(L"type:dossier", L"x", FILE_ATTRIBUTE_DIRECTORY) && !m(L"type:dossier", L"x"));
+    CHECK(m(L"size:gigantic", L"iso", 0, 5ull << 30) && !m(L"taille:gigantesque", L"iso", 0, 3ull << 30));
+    CHECK(m(L"taille:vide", L"z", 0, 0) && !m(L"taille:vide", L"z", 0, 1));
+    CHECK(m(L"taille:petit", L"p", 0, 100 * 1024) && !m(L"taille:petit", L"p", 0, 2 << 20));
+    CHECK(m(L"-taille:minuscule", L"p", 0, 100 * 1024));
+    // Dates JJ/MM/AAAA.
+    SYSTEMTIME l{2026, 1, 0, 10, 12, 0, 0, 0}, u;
+    TzSpecificLocalTimeToSystemTime(nullptr, &l, &u);
+    SystemTimeToFileTime(&u, &ft);
+    const int64_t jan10 = (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+    CHECK(m(L"datemodified:01/01/2026..31/01/2026", L"a", 0, 1, jan10));
+    CHECK(!m(L"datemodified:01/02/2026..28/02/2026", L"a", 0, 1, jan10));
+    CHECK(m(L"date:10/01/2026", L"a", 0, 1, jan10));
+    // Chemin relatif : les mots portent sur le nom, l'extension sur la fin.
+    CHECK(!m(L"photos", L"photos\\a.txt") && m(L"ext:txt", L"photos\\a.txt"));
+    // Requête vide, demandes à l'index des noms.
+    CHECK(SearchQuery(L"  ", now).empty() && !SearchQuery(L"-x", now).empty());
+    auto asks = SearchQuery(L"facture OR devis ext:pdf", now).NameAsks();
+    CHECK(asks.size() == 2 && asks[0] == L"facture" && asks[1] == L"devis");
+    asks = SearchQuery(L"type:image", now).NameAsks();
+    CHECK(asks.size() == 1 && asks[0].rfind(L"*.jpg;*.", 0) == 0);  // une seule passe sur l'index
+    auto nm = [](const wchar_t* q, const wchar_t* n) { return NameMatches(q, n, (uint32_t)wcslen(n)); };
+    CHECK(nm(L"*.jpg;*.PNG", L"Vacances.png") && nm(L"*.jpg;*.png", L"a.JPG") && !nm(L"*.jpg;*.png", L"a.gif"));
+    CHECK(!nm(L"*.jpg", L"a.jpg.bak") && nm(L"*.jpg", L".jpg") && !nm(L"*.jpg", L"jpg"));
+    CHECK(nm(L"*.jpg;rap*", L"rapport.txt") && nm(L"été*.txt;*.zz", L"Été 2026.txt"));
+    CHECK(nm(L"*.jpg;*.png vac", L"vacances.png") && !nm(L"*.jpg;*.png vac", L"noel.png"));
+    CHECK(nm(L"*.é", L"x.é") && !nm(L"*.é", L"x.e"));
+    CHECK(SearchQuery(L"rapport OR taille:>1Go", now).NameAsks().empty());  // une branche sans nom : parcours
+    CHECK(SearchQuery(L"-tmp", now).NameAsks().empty());
+    CHECK(SearchQuery(L"taille:>1Mo", now).needsStat() && !SearchQuery(L"ext:pdf", now).needsStat());
+    // Contenu : tenu pour vrai sans fonction (filtre instantané), sinon demandé, et jamais pour un dossier.
+    SearchQuery c(L"rapport contenu:budget", now);
+    CHECK(c.hasContent() && c.contentWords().size() == 1 && c.contentWords()[0] == L"budget");
+    CHECK(c.Match(L"rapport.txt", 11, 0, 1, 0));
+    ContentFn yes = [](const std::wstring&) { return true; }, no = [](const std::wstring&) { return false; };
+    CHECK(c.Match(L"rapport.txt", 11, 0, 1, 0, &yes) && !c.Match(L"rapport.txt", 11, 0, 1, 0, &no));
+    CHECK(!c.Match(L"rapport", 7, FILE_ATTRIBUTE_DIRECTORY, 0, 0, &yes));
+    int asked = 0;
+    ContentFn count = [&](const std::wstring&) { ++asked; return true; };
+    c.Match(L"autre.txt", 9, 0, 1, 0, &count);
+    CHECK(asked == 0);  // le nom ne correspond pas : le fichier n'est pas lu
+
+    // Lecture du contenu (hors index) : UTF-8, UTF-16, ANSI ; binaire ignoré.
+    const std::wstring base = Join(g_root, L"aqs");
+    CreateDirectoryW(base.c_str(), nullptr);
+    CreateDirectoryW(Join(base, L"sous").c_str(), nullptr);
+    auto write = [](const std::wstring& p, const std::string& bytes) {
+        HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD w = 0;
+        WriteFile(h, bytes.data(), (DWORD)bytes.size(), &w, nullptr);
+        CloseHandle(h);
+    };
+    write(Join(base, L"utf8.txt"), "\xEF\xBB\xBFLe budget de l'\xC3\xA9t\xC3\xA9 2026");
+    write(Join(base, L"sous\\ansi.md"), "Prevision du BUDGET \xE9t\xE9");
+    write(Join(base, L"utf16.txt"), std::string("\xFF\xFE" "b\0u\0d\0g\0e\0t\0", 14));
+    write(Join(base, L"binaire.bin"), std::string("budget\0\0\0budget", 15));
+    write(Join(base, L"autre.txt"), "rien ici");
+    CHECK(FileContainsText(Join(base, L"utf8.txt"), L"ETE 2026"));  // sans casse ni accents
+    CHECK(FileContainsText(Join(base, L"sous\\ansi.md"), L"budget été"));
+    CHECK(FileContainsText(Join(base, L"utf16.txt"), L"budget"));
+    CHECK(!FileContainsText(Join(base, L"binaire.bin"), L"budget"));
+    CHECK(!FileContainsText(Join(base, L"autre.txt"), L"budget"));
+    DirData r;
+    r.path = base;
+    SearchTree(r, L"contenu:budget -utf16", {}, {});
+    std::vector<std::wstring> names;
+    for (const auto& e : r.entries) names.emplace_back(r.name(e), e.nameLen);
+    std::sort(names.begin(), names.end());
+    CHECK(names.size() == 2 && names[0] == L"sous\\ansi.md" && names[1] == L"utf8.txt");
+    DirData o;
+    o.path = base;
+    SearchTree(o, L"autre OR binaire", {}, {});
+    CHECK(o.entries.size() == 2);
+    RemoveTree(base);
+
+    // Windows Search : requête SQL, et l'index répond (ou se dit indisponible) sans planter.
+    const std::wstring sql = WSearch_Sql(L"C:\\Users\\a'b", L"fac\"ture", 50);
+    CHECK(sql.find(L"SCOPE='file:C:/Users/a''b'") != std::wstring::npos);
+    CHECK(sql.find(L"'\"facture*\"'") != std::wstring::npos && sql.find(L"TOP 50") != std::wstring::npos);
+    CHECK(WSearch_Sql(L"", L"deux mots", 10).find(L"'\"deux mots\"'") != std::wstring::npos);
+    CHECK_STR(WSearch_PathOfUrl(L"file:C:/Users/x/a b.txt"), L"C:\\Users\\x\\a b.txt");
+    CHECK_STR(WSearch_PathOfUrl(L"file:///C:/x"), L"C:\\x");
+    CHECK_STR(WSearch_PathOfUrl(L"file://srv/partage/y"), L"\\\\srv\\partage\\y");
+    CHECK(WSearch_PathOfUrl(L"mapi://x").empty());
+    // Un fichier des Documents, s'ils sont indexés, est retrouvé par son contenu, sous son vrai chemin.
+    wchar_t docs[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, 0, docs)) && WSearch_Indexed(docs) == 1) {
+        const std::wstring probe = Join(docs, L"fe_test_contenu.txt");
+        MakeFile(probe, 0);
+        HANDLE hf = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD wr = 0;
+        WriteFile(hf, "bloubiboulgaquantique", 21, &wr, nullptr);
+        CloseHandle(hf);
+        std::wstring low = probe;
+        CharLowerBuffW(low.data(), (DWORD)low.size());
+        bool found = false;
+        const double t0 = NowMs();
+        while (!found && NowMs() - t0 < 60000) {
+            std::unordered_set<std::wstring> set;
+            found = WSearch_Contains(docs, L"bloubiboulga", set, 50) && set.count(low);
+            if (!found) Sleep(1000);
+        }
+        printf("  Windows Search : fichier des Documents retrouve par son contenu en %.0f s\n", (NowMs() - t0) / 1000);
+        CHECK(found);
+        DeleteFileW(probe.c_str());
+    }
+    const int idx = WSearch_Indexed(g_root);
+    CHECK(idx >= -1 && idx <= 1);
+    if (WSearch_Indexed(L"") == 1) {
+        std::unordered_set<std::wstring> set;
+        const double t0 = NowMs();
+        CHECK(WSearch_Contains(L"", L"zzqqxxyyneverfound", set, 10));
+        printf("  Windows Search : requete de contenu en %.0f ms\n", NowMs() - t0);
+        CHECK(set.empty());
+    }
+
+    // Recherches récentes : la plus récente d'abord, sans doublon, limitée.
+    auto h = HistoryPush({L"b", L"a"}, L"  A ");
+    CHECK(h.size() == 2 && h[0] == L"A" && h[1] == L"b");
+    CHECK(HistoryPush(h, L"   ").size() == 2);
+    std::vector<std::wstring> many;
+    for (int i = 0; i < 40; ++i) many = HistoryPush(many, L"q" + std::to_wstring(i));
+    CHECK(many.size() == kSearchHistoryMax && many[0] == L"q39");
+}
+
 void TestSearch() {
     auto m = [](const wchar_t* q, const wchar_t* n) { return NameMatches(q, n, (uint32_t)wcslen(n)); };
     CHECK(m(L"rap", L"Rapport.txt"));
@@ -2440,6 +2593,7 @@ int wmain() {
     TestViewPrefs();
     TestSelectionText();
     TestSearch();
+    TestAqs();
     TestFastCopy();
     TestFileOps();
     TestBatchRename();

@@ -153,6 +153,52 @@ bool Bookmark_Clear(int n) {
     return r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND;
 }
 
+// ───────────────────────────── Recherches récentes ─────────────────────────────
+
+std::vector<std::wstring> HistoryPush(std::vector<std::wstring> list, const std::wstring& query, size_t max) {
+    const std::wstring q = Trim(query);
+    if (q.empty()) return list;
+    std::erase_if(list, [&](const std::wstring& s) { return _wcsicmp(s.c_str(), q.c_str()) == 0; });
+    list.insert(list.begin(), q);
+    if (list.size() > max) list.resize(max);
+    return list;
+}
+
+namespace {
+void WriteHistory(const std::vector<std::wstring>& v) {
+    if (v.empty()) {
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, kAppKey, L"SearchHistory");
+        return;
+    }
+    std::wstring multi;
+    for (const auto& s : v) multi += s + L'\0';
+    WriteMulti(kAppKey, L"SearchHistory", multi);
+}
+}  // namespace
+
+std::vector<std::wstring> SearchHistory_Get() {
+    std::vector<std::wstring> v;
+    std::wstring m;
+    if (!ReadValue(kAppKey, L"SearchHistory", REG_MULTI_SZ, m)) return v;
+    for (size_t a = 0; a < m.size();) {
+        size_t b = m.find(L'\0', a);
+        if (b == std::wstring::npos) b = m.size();
+        if (b > a) v.emplace_back(m, a, b - a);
+        a = b + 1;
+    }
+    return v;
+}
+
+void SearchHistory_Add(const std::wstring& query) { WriteHistory(HistoryPush(SearchHistory_Get(), query)); }
+
+void SearchHistory_Remove(const std::wstring& query) {
+    auto v = SearchHistory_Get();
+    std::erase_if(v, [&](const std::wstring& s) { return _wcsicmp(s.c_str(), query.c_str()) == 0; });
+    WriteHistory(v);
+}
+
+void SearchHistory_Clear() { WriteHistory({}); }
+
 // ───────────────────────────── Boîte de saisie ─────────────────────────────
 
 namespace {

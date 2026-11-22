@@ -291,14 +291,14 @@ comme arrière-plan, Pivoter (images), Monter (ISO/VHD), Graver…
 | Fonction | Détail | Prio |
 |---|---|---|
 | Barre de recherche | Ctrl+E, Ctrl+F, F3 ; cherche dans le dossier courant et ses sous-dossiers | ✅ **P0** (sans index : parcours parallèle, résultats au fil de l'eau ; mots sans casse ni accents, motifs * ?, dossiers cachés selon le réglage, jonctions non suivies ; « Ouvrir l'emplacement du fichier » ; Échap pour sortir. C:\Windows entier : ~3 s). Depuis le bloc 11 : la frappe filtre aussitôt, **Entrée** lance la recherche dans les sous-dossiers |
-| Résultats en direct | Au fil de la frappe, nom et contenu des fichiers indexés | ✅🟡 P1 (noms au fil de l'eau ; contenu : avec l'index) |
-| Index Windows Search | Rapide dans les emplacements indexés, lent (parcours disque) ailleurs ; options *Ne pas utiliser l'index*, *Inclure les fichiers système*, *Fichiers compressés*, *Correspondances partielles* | P2 ⚙️ requêtes OLE DB / `ISearchQueryHelper` sur `SystemIndex` |
-| **Syntaxe AQS** | `nom:`, `ext:.pdf`, `type:image`, `kind:music`, `taille:>100Mo`, `size:gigantic`, `date:aujourd'hui`, `datemodified:01/01/2026..31/01/2026`, `auteur:`, opérateurs `AND`, `OR`, `NOT`, `-`, guillemets, joker `*` | P2 |
+| Résultats en direct | Au fil de la frappe, nom et contenu des fichiers indexés | ✅ P1 (noms au fil de l'eau ; contenu : `contenu:`, par l'index de Windows Search dans les emplacements indexés, bloc 29) |
+| Index Windows Search | Rapide dans les emplacements indexés, lent (parcours disque) ailleurs ; options *Ne pas utiliser l'index*, *Inclure les fichiers système*, *Fichiers compressés*, *Correspondances partielles* | ✅🟡 P2 (bloc 29 : `contenu:` interroge `SystemIndex` par OLE DB quand le dossier est indexé (`ISearchCrawlScopeManager`), ~1 s pour Documents ; les noms passent par notre propre index, bien plus rapide ; pas d'options de l'index) ⚙️ `Search.CollatorDSO`, `System.ItemUrl` (`ItemPathDisplay` est traduit) |
+| **Syntaxe AQS** | `nom:`, `ext:.pdf`, `type:image`, `kind:music`, `taille:>100Mo`, `size:gigantic`, `date:aujourd'hui`, `datemodified:01/01/2026..31/01/2026`, `auteur:`, opérateurs `AND`, `OR`, `NOT`, `-`, guillemets, joker `*` | ✅🟡 P2 (bloc 29 : `OR`/`OU`/`|`, `AND`/`ET`, `NOT`, `-mot`, parenthèses, `"phrase exacte"`, `nom:`, `contenu:`, `type:`/`kind:` image, musique, vidéo, document, archive, programme, raccourci, dossier ; tailles nommées `vide` … `gigantesque` ; `datemodified:` et dates JJ/MM/AAAA ; dans la recherche comme dans le filtre instantané. `type:image` : une seule passe sur l'index (`*.jpg;*.png;…`, fin du nom comparée sans `PathMatchSpecW`), 33 ms. Pas de propriétés de document comme `auteur:`) |
 | Filtres du ruban de recherche | Date de modification, Type, Taille, Autres propriétés ; emplacement (dossier courant / tous les sous-dossiers) | ✅ P1 (dans la zone de recherche et le filtre instantané : `ext:pdf;docx`, `type:dossier`, `taille:>10Mo` / `1Mo..50Mo`, `date:semaine` / `hier` / `>2026-01-01` / `2026-01-01..2026-03-31` ; noms anglais acceptés) |
-| Recherches récentes | Historique des recherches | P2 |
+| Recherches récentes | Historique des recherches | ✅ P2 (bloc 29 : 25 dernières, proposées dans la zone de recherche (flèche bas, saisie semi-automatique) et dans ··· ▸ Recherches récentes ; effaçables) |
 | Enregistrer la recherche | Fichier `.search-ms` (dossier virtuel) | P3 |
 | Ouvrir l'emplacement du fichier | Depuis un résultat | ✅ (bloc 9) |
-| Recherche dans le contenu | Via l'index ; filtres IFilter par type (PDF, Office, texte) | P2 |
+| Recherche dans le contenu | Via l'index ; filtres IFilter par type (PDF, Office, texte) | ✅ P2 (bloc 29 : `contenu:mot` ; dossier indexé : Windows Search, donc PDF et Office par leurs IFilter ; ailleurs : lecture des fichiers texte (UTF-8, UTF-16, ANSI, ≤ 32 Mo, binaires ignorés), seulement si le reste de la requête correspond) |
 | Lenteur notoire | Hors index : parcours séquentiel, parfois très lent | ⭐ opportunité (§20) |
 
 ---
@@ -655,7 +655,7 @@ P2, en blocs (dans cet ordre) :
 28. ✅ **Opérations** : copier vers / déplacer vers, coller en tant que raccourci, renommage par lot avancé ⭐,
     « qui utilise ce fichier ? » ⭐, reprise après erreur et vérification des copies, perte de propriétés,
     raccourci dont la cible a disparu.
-29. **Recherche** : syntaxe AQS, recherches récentes, contenu des fichiers (index Windows Search).
+29. ✅ **Recherche** : syntaxe AQS, recherches récentes, contenu des fichiers (index Windows Search).
 30. **Cloud et lecteurs** : états de synchronisation, Toujours conserver / Libérer de l'espace, monter
     ISO / VHD, formater, renommer un volume, appareils MTP, propriétés de la Corbeille.
 31. **Productivité** ⭐ : palette de commandes, raccourcis personnalisables, terminal intégré, aperçu du code

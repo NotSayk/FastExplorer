@@ -53,6 +53,7 @@ struct DirData {
     bool truncated = false;  // trop de résultats : recherche arrêtée
     size_t scanned = 0;      // dossiers parcourus
     bool fromIndex = false;  // résultats de l'index (service de recherche instantanée)
+    bool contentIndexed = false;  // contenu: cherché par l'index de Windows Search (sinon fichiers lus)
     // Emplacements virtuels (Corbeille « ::bin », Accueil « ::home ») : les noms du pool sont
     // ceux affichés ; target = chemin réel de chaque entrée, origin = emplacement d'origine / dossier.
     std::vector<std::wstring> target, origin;
@@ -113,7 +114,7 @@ struct ViewPrefs;
 
 // Le nom correspond-il à la recherche ? Mots séparés par des espaces, tous
 // présents (sans tenir compte de la casse ni des accents) ; un mot avec * ou ?
-// est un motif sur le nom entier (« *.txt »).
+// est un motif sur le nom entier (« *.txt ») ; « *.jpg;*.png » : l'un ou l'autre.
 bool NameMatches(const std::wstring& query, const wchar_t* name, uint32_t n);
 
 // Même règle, préparée une fois pour comparer beaucoup de noms (thread-safe en lecture).
@@ -121,6 +122,10 @@ struct NameMatcher {
     std::vector<std::wstring> terms;
     std::vector<bool> wild;
     std::vector<std::string> ascii;  // mot en ASCII minuscule ("" : pas d'ASCII pur)
+    // Motifs (wild) : leurs variantes séparées par « ; » ; « *.ext » en ASCII est comparé
+    // directement à la fin du nom (".ext" en minuscules), sans PathMatchSpecW.
+    std::vector<std::vector<std::wstring>> alts;
+    std::vector<std::vector<std::string>> suffix;
     explicit NameMatcher(const std::wstring& q);
     bool operator()(const wchar_t* name, uint32_t n) const;
     static int AsciiFind(const wchar_t* name, uint32_t n, const std::string& term);
@@ -148,6 +153,39 @@ struct SearchSpec {
 // now : FILETIME UTC de référence (0 : maintenant).
 SearchSpec ParseSearch(const std::wstring& q, int64_t now = 0);
 
+// Requête complète, syntaxe AQS de l'Explorateur :
+//   mots séparés par des espaces : tous requis (AND / ET facultatifs) ; OR / OU entre deux termes ;
+//   NOT ou « - » devant un terme : sans lui ; parenthèses ; « "phrase exacte" » entre guillemets ;
+//   nom:mot (ou name:) ; contenu:mot (content:) : texte du fichier ;
+//   type: / kind: dossier, fichier, image, musique, vidéo, document, archive, programme, raccourci ;
+//   taille: / size: comme plus haut, ou vide, minuscule, petit, moyen, grand, énorme, gigantesque
+//   (empty, tiny, small, medium, large, huge, gigantic) ; date: / modifié: / datemodified: comme plus
+//   haut, ou JJ/MM/AAAA et JJ/MM/AAAA..JJ/MM/AAAA. Les filtres de ParseSearch gardent leur sens.
+struct SearchNode;
+// Contenu du fichier en cours d'examen : contient-il ce texte ?
+using ContentFn = std::function<bool(const std::wstring& word)>;
+class SearchQuery {
+public:
+    explicit SearchQuery(const std::wstring& q, int64_t now = 0);
+    bool empty() const { return empty_; }
+    bool needsStat() const { return stat_; }  // un terme porte sur la taille ou la date
+    bool hasContent() const { return !content_.empty(); }
+    const std::vector<std::wstring>& contentWords() const { return content_; }
+    // name : nom, ou chemin relatif (les mots portent sur le dernier élément, l'extension sur la fin).
+    // content nullptr : les termes de contenu sont tenus pour vrais (filtre instantané).
+    bool Match(const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime,
+               const ContentFn* content = nullptr) const;
+    // Demandes à l'index des noms (une par branche OU : mots du nom, sinon « *.ext ») ; vide : il ne sait pas.
+    std::vector<std::wstring> NameAsks() const;
+
+private:
+    std::shared_ptr<const SearchNode> root_;
+    bool empty_ = true, stat_ = false;
+    std::vector<std::wstring> content_;
+};
+
+// Le fichier contient-il ce texte (sans casse ni accents) ? Texte seulement (UTF-8, UTF-16 LE, ANSI), 32 Mo au plus.
+bool FileContainsText(const std::wstring& path, const std::wstring& word);
 // Construction de résultats hors Enumerate / SearchTree (index de recherche).
 void DirData_Add(DirData& d, const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime,
                  int64_t ctime = 0, int64_t atime = 0);

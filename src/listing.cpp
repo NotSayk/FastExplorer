@@ -3,6 +3,7 @@
 #include "nt.h"
 #include "paths.h"
 #include "util.h"
+#include "wsearch.h"
 
 #include <shellapi.h>
 #include <shlobj.h>
@@ -23,6 +24,7 @@
 #include <thread>
 #include <deque>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -236,6 +238,31 @@ NameMatcher::NameMatcher(const std::wstring& q) {
                     a += (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
                 }
                 ascii.push_back(std::move(a));
+                std::vector<std::wstring> al;
+                std::vector<std::string> sf;
+                if (wild.back()) {
+                    const std::wstring& w = terms.back();
+                    for (size_t b = 0; b <= w.size();) {
+                        size_t e = w.find(L';', b);
+                        if (e == std::wstring::npos) e = w.size();
+                        if (e > b) {
+                            std::wstring alt = w.substr(b, e - b);
+                            std::string s;  // « *.ext » sans autre joker, en ASCII : ".ext"
+                            if (alt.size() > 2 && alt[0] == L'*' && alt[1] == L'.' &&
+                                alt.find_first_of(L"*?", 1) == std::wstring::npos)
+                                for (size_t k = 1; k < alt.size(); ++k) {
+                                    const wchar_t c = alt[k];
+                                    if (c >= 0x80) { s.clear(); break; }
+                                    s += (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
+                                }
+                            al.push_back(std::move(alt));
+                            sf.push_back(std::move(s));
+                        }
+                        b = e + 1;
+                    }
+                }
+                alts.push_back(std::move(al));
+                suffix.push_back(std::move(sf));
             }
             i = j;
         }
@@ -271,8 +298,25 @@ bool NameMatcher::operator()(const wchar_t* name, uint32_t n) const {
                 if (r == 1) continue;
             }
             if (wild[t]) {
-                if (z.empty()) z.assign(name, n);
-                if (!PathMatchSpecW(z.c_str(), terms[t].c_str())) return false;
+                bool any = false;
+                for (size_t a = 0; a < alts[t].size() && !any; ++a) {
+                    const std::string& s = suffix[t][a];
+                    if (!s.empty()) {
+                        if (s.size() > n) continue;
+                        const wchar_t* p = name + n - s.size();
+                        size_t k = 0;
+                        for (; k < s.size(); ++k) {
+                            wchar_t c = p[k];
+                            if (c >= 'A' && c <= 'Z') c += 32;
+                            if (c != (wchar_t)(unsigned char)s[k]) break;
+                        }
+                        any = k == s.size();
+                    } else {
+                        if (z.empty()) z.assign(name, n);
+                        any = PathMatchSpecW(z.c_str(), alts[t][a].c_str()) != FALSE;
+                    }
+                }
+                if (!any) return false;
             } else if (FindNLSStringEx(LOCALE_NAME_USER_DEFAULT,
                                        FIND_FROMSTART | LINGUISTIC_IGNORECASE | LINGUISTIC_IGNOREDIACRITIC, name, (int)n,
                                        terms[t].c_str(), (int)terms[t].size(), nullptr, nullptr, nullptr, 0) < 0) {
@@ -324,7 +368,12 @@ constexpr int64_t kDay = 864000000000ll;  // en unités de 100 ns
 bool ParseDay(const std::wstring& s, int64_t& out) {
     SYSTEMTIME st{};
     int y = 0, m = 0, d = 0;
-    if (swscanf_s(s.c_str(), L"%d-%d-%d", &y, &m, &d) != 3 || y < 1601 || m < 1 || m > 12 || d < 1 || d > 31) return false;
+    if (s.find(L'/') != std::wstring::npos) {  // JJ/MM/AAAA (Explorateur en français)
+        if (swscanf_s(s.c_str(), L"%d/%d/%d", &d, &m, &y) != 3) return false;
+    } else if (swscanf_s(s.c_str(), L"%d-%d-%d", &y, &m, &d) != 3) {
+        return false;
+    }
+    if (y < 1601 || m < 1 || m > 12 || d < 1 || d > 31) return false;
     st.wYear = (WORD)y;
     st.wMonth = (WORD)m;
     st.wDay = (WORD)d;
@@ -387,26 +436,56 @@ bool ParseSizeFilter(const std::wstring& v, SearchSpec& spec) {
     spec.minSize = a;
     return true;
 }
-}  // namespace
+int64_t NowFt() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    return (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+}
 
-SearchSpec ParseSearch(const std::wstring& q, int64_t now) {
-    if (!now) {
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
-        now = (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
-    }
-    SearchSpec spec;
-    size_t i = 0;
-    while (i < q.size()) {
-        while (i < q.size() && iswspace(q[i])) ++i;
-        size_t j = i;
-        while (j < q.size() && !iswspace(q[j])) ++j;
-        if (j == i) break;
-        const std::wstring tok = q.substr(i, j - i);
-        i = j;
+// Catégories de type:/kind: (comme l'Explorateur), en extensions.
+const wchar_t* KindExts(const std::wstring& v) {
+    static const struct { const wchar_t* names; const wchar_t* exts; } kKinds[] = {
+        {L"|image|images|picture|pictures|photo|photos|", L"jpg;jpeg;png;gif;bmp;webp;heic;heif;tif;tiff;raw;cr2;nef;arw;dng;avif;jxl;ico;svg"},
+        {L"|musique|music|audio|son|", L"mp3;flac;wav;m4a;aac;ogg;oga;wma;opus;aiff;alac;ape;mid;midi"},
+        {L"|vidéo|vidéos|video|videos|film|films|movie|", L"mp4;mkv;avi;mov;wmv;webm;m4v;mpg;mpeg;flv;ts;m2ts;3gp"},
+        {L"|document|documents|doc|", L"doc;docx;xls;xlsx;ppt;pptx;pdf;txt;odt;ods;odp;rtf;md;csv;epub"},
+        {L"|archive|archives|compressé|compresse|compressed|zip|", L"zip;7z;rar;tar;gz;tgz;bz2;xz;cab;iso"},
+        {L"|programme|programmes|program|programs|application|applications|app|", L"exe;msi;bat;cmd;ps1;com;appx;msix"},
+        {L"|raccourci|raccourcis|link|shortcut|", L"lnk;url"},
+    };
+    const std::wstring key = L"|" + v + L"|";
+    for (const auto& k : kKinds)
+        if (wcsstr(k.names, key.c_str())) return k.exts;
+    return nullptr;
+}
+
+// Tailles nommées de l'Explorateur (size:gigantic) : [min, max].
+bool NamedSize(const std::wstring& v, SearchSpec& spec) {
+    constexpr uint64_t K = 1024, M = K * K, G = M * K;
+    static const struct { const wchar_t* names; uint64_t lo, hi; } kSizes[] = {
+        {L"|vide|empty|", 0, 0},
+        {L"|minuscule|tiny|", 1, 16 * K - 1},
+        {L"|petit|petite|small|", 16 * K, M - 1},
+        {L"|moyen|moyenne|medium|", M, 128 * M - 1},
+        {L"|grand|grande|large|", 128 * M, G - 1},
+        {L"|énorme|enorme|trèsgrand|tresgrand|huge|", G, 4 * G - 1},
+        {L"|gigantesque|gigantic|", 4 * G, UINT64_MAX},
+    };
+    const std::wstring key = L"|" + v + L"|";
+    for (const auto& s : kSizes)
+        if (wcsstr(s.names, key.c_str())) {
+            spec.minSize = s.lo;
+            spec.maxSize = s.hi;
+            return true;
+        }
+    return false;
+}
+
+// Un filtre (« ext:pdf », « taille:>1Mo »…) ajouté à spec ; false : ce n'en est pas un (ou illisible).
+bool ParseFilterToken(const std::wstring& tok, int64_t now, SearchSpec& spec) {
         std::wstring v;
         bool ok = false;
-        if (PrefixI(tok, L"ext:", v)) {
+        if (PrefixI(tok, L"ext:", v) || PrefixI(tok, L"extension:", v) || PrefixI(tok, L"fileext:", v)) {
             for (size_t a = 0; a <= v.size();) {
                 size_t b = v.find_first_of(L";,|", a);
                 if (b == std::wstring::npos) b = v.size();
@@ -417,17 +496,46 @@ SearchSpec ParseSearch(const std::wstring& q, int64_t now) {
                 a = b + 1;
             }
             ok = !spec.exts.empty();
-        } else if (PrefixI(tok, L"type:", v)) {
+        } else if (PrefixI(tok, L"type:", v) || PrefixI(tok, L"kind:", v) || PrefixI(tok, L"genre:", v)) {
             for (auto& c : v) c = towlower(c);
             if (v == L"dossier" || v == L"dossiers" || v == L"folder" || v == L"d") { spec.kind = 1; ok = true; }
             if (v == L"fichier" || v == L"fichiers" || v == L"file" || v == L"f") { spec.kind = 2; ok = true; }
+            if (!ok)
+                if (const wchar_t* list = KindExts(v)) {
+                    for (const wchar_t* a = list; *a;) {
+                        const wchar_t* b = wcschr(a, L';');
+                        const size_t len = b ? (size_t)(b - a) : wcslen(a);
+                        spec.exts.emplace_back(a, len);
+                        a += len + (b ? 1 : 0);
+                    }
+                    ok = true;
+                }
         } else if (PrefixI(tok, L"taille:", v) || PrefixI(tok, L"size:", v)) {
-            ok = ParseSizeFilter(v, spec);
+            std::wstring low = v;
+            for (auto& c : low) c = towlower(c);
+            ok = NamedSize(low, spec) || ParseSizeFilter(v, spec);
         } else if (PrefixI(tok, L"date:", v) || PrefixI(tok, L"modifié:", v) || PrefixI(tok, L"modifie:", v) ||
-                   PrefixI(tok, L"modified:", v)) {
+                   PrefixI(tok, L"modified:", v) || PrefixI(tok, L"datemodified:", v) ||
+                   PrefixI(tok, L"datemodification:", v)) {
             ok = ParseDate(v, now, spec);
         }
-        if (!ok) {
+        return ok;
+}
+
+}  // namespace
+
+SearchSpec ParseSearch(const std::wstring& q, int64_t now) {
+    if (!now) now = NowFt();
+    SearchSpec spec;
+    size_t i = 0;
+    while (i < q.size()) {
+        while (i < q.size() && iswspace(q[i])) ++i;
+        size_t j = i;
+        while (j < q.size() && !iswspace(q[j])) ++j;
+        if (j == i) break;
+        const std::wstring tok = q.substr(i, j - i);
+        i = j;
+        if (!ParseFilterToken(tok, now, spec)) {
             if (!spec.names.empty()) spec.names += L' ';
             spec.names += tok;
         }
@@ -460,6 +568,293 @@ bool SearchSpec::Accept(const wchar_t* name, uint32_t n, uint32_t attr, uint64_t
 
 bool NameMatches(const std::wstring& query, const wchar_t* name, uint32_t n) { return Matcher(query)(name, n); }
 
+// ───────────────────────────── Requêtes AQS ─────────────────────────────
+
+struct SearchNode {
+    enum Kind { And, Or, Not, Word, Filter, Content } kind = And;
+    std::vector<SearchNode> kids;
+    std::wstring text;  // Word : mot ou phrase ; Content : texte cherché
+    bool phrase = false;
+    std::shared_ptr<NameMatcher> matcher;  // Word sans espace
+    SearchSpec spec;                       // Filter
+};
+
+namespace {
+
+struct QToken {
+    std::wstring text;
+    bool quoted = false;  // entièrement entre guillemets (« "OR" » reste un mot)
+    bool hasQuote = false;
+};
+
+std::vector<QToken> Tokenize(const std::wstring& q) {
+    std::vector<QToken> out;
+    size_t i = 0;
+    while (i < q.size()) {
+        if (iswspace(q[i])) { ++i; continue; }
+        if (q[i] == L'(' || q[i] == L')') {
+            out.push_back({std::wstring(1, q[i]), false, false});
+            ++i;
+            continue;
+        }
+        QToken t;
+        const bool startQuote = q[i] == L'"';
+        while (i < q.size() && !iswspace(q[i]) && q[i] != L'(' && q[i] != L')') {
+            if (q[i] == L'"') {  // jusqu'au guillemet fermant (espaces compris)
+                const size_t end = q.find(L'"', i + 1);
+                const size_t stop = end == std::wstring::npos ? q.size() : end;
+                t.text.append(q, i + 1, stop - i - 1);
+                t.hasQuote = true;
+                i = end == std::wstring::npos ? q.size() : end + 1;
+                continue;
+            }
+            t.text += q[i++];
+        }
+        t.quoted = startQuote && (i >= q.size() || iswspace(q[i]) || q[i] == L'(' || q[i] == L')');
+        if (!t.text.empty() || t.hasQuote) out.push_back(std::move(t));
+    }
+    return out;
+}
+
+class QParser {
+public:
+    QParser(std::vector<QToken> toks, int64_t now) : t_(std::move(toks)), now_(now) {}
+    SearchNode Parse() {
+        SearchNode n = ParseOr();
+        while (pos_ < t_.size()) {  // « ) » en trop : ignorée, la suite est lue aussi
+            ++pos_;
+            SearchNode more = ParseOr();
+            SearchNode all;
+            all.kind = SearchNode::And;
+            all.kids = {std::move(n), std::move(more)};
+            n = std::move(all);
+        }
+        return n;
+    }
+
+private:
+    bool Is(const wchar_t* op) const {
+        return pos_ < t_.size() && !t_[pos_].quoted && !t_[pos_].hasQuote && t_[pos_].text == op;
+    }
+    SearchNode ParseOr() {
+        SearchNode first = ParseAnd();
+        if (!Is(L"OR") && !Is(L"OU") && !Is(L"|")) return first;
+        SearchNode n;
+        n.kind = SearchNode::Or;
+        n.kids.push_back(std::move(first));
+        while (Is(L"OR") || Is(L"OU") || Is(L"|")) {
+            ++pos_;
+            n.kids.push_back(ParseAnd());
+        }
+        return n;
+    }
+    SearchNode ParseAnd() {
+        SearchNode n;
+        n.kind = SearchNode::And;
+        while (pos_ < t_.size() && !Is(L")") && !Is(L"OR") && !Is(L"OU") && !Is(L"|")) {
+            if (Is(L"AND") || Is(L"ET")) {
+                ++pos_;
+                continue;
+            }
+            n.kids.push_back(ParseUnary());
+        }
+        // Termes de contenu en dernier : ils lisent les fichiers, on ne le fait que si le reste correspond.
+        std::stable_partition(n.kids.begin(), n.kids.end(), [](const SearchNode& k) { return k.kind != SearchNode::Content; });
+        if (n.kids.size() == 1) return std::move(n.kids[0]);
+        return n;
+    }
+    SearchNode ParseUnary() {
+        if (Is(L"NOT")) {
+            ++pos_;
+            SearchNode n;
+            n.kind = SearchNode::Not;
+            if (pos_ < t_.size()) n.kids.push_back(ParseUnary());
+            return n;
+        }
+        if (Is(L"(")) {
+            ++pos_;
+            SearchNode inner = ParseOr();
+            if (Is(L")")) ++pos_;
+            return inner;
+        }
+        QToken tok = t_[pos_++];
+        if (!tok.quoted && tok.text.size() > 1 && tok.text[0] == L'-') {  // « -mot » : sans ce mot
+            tok.text.erase(0, 1);
+            SearchNode n;
+            n.kind = SearchNode::Not;
+            n.kids.push_back(Atom(tok));
+            return n;
+        }
+        return Atom(tok);
+    }
+    SearchNode Atom(const QToken& tok) {
+        SearchNode n;
+        std::wstring v;
+        if (!tok.quoted) {
+            if (PrefixI(tok.text, L"contenu:", v) || PrefixI(tok.text, L"content:", v) ||
+                PrefixI(tok.text, L"contient:", v) || PrefixI(tok.text, L"contains:", v)) {
+                n.kind = SearchNode::Content;
+                n.text = v;
+                return n;
+            }
+            if (PrefixI(tok.text, L"nom:", v) || PrefixI(tok.text, L"name:", v) || PrefixI(tok.text, L"filename:", v))
+                return WordNode(v, tok.hasQuote);
+            SearchSpec s;
+            if (ParseFilterToken(tok.text, now_, s)) {
+                n.kind = SearchNode::Filter;
+                n.spec = std::move(s);
+                return n;
+            }
+        }
+        return WordNode(tok.text, tok.hasQuote);
+    }
+    static SearchNode WordNode(const std::wstring& w, bool quoted) {
+        SearchNode n;
+        n.kind = SearchNode::Word;
+        n.text = w;
+        n.phrase = quoted && w.find_first_of(L" \t") != std::wstring::npos;
+        if (!n.phrase) n.matcher = std::make_shared<NameMatcher>(w);
+        return n;
+    }
+
+    std::vector<QToken> t_;
+    size_t pos_ = 0;
+    int64_t now_;
+};
+
+void Walk(const SearchNode& n, bool& stat, std::vector<std::wstring>& content) {
+    if (n.kind == SearchNode::Filter && (n.spec.sized() || n.spec.dated())) stat = true;
+    if (n.kind == SearchNode::Content && !n.text.empty() &&
+        std::find(content.begin(), content.end(), n.text) == content.end())
+        content.push_back(n.text);
+    for (const auto& k : n.kids) Walk(k, stat, content);
+}
+
+bool Eval(const SearchNode& n, const wchar_t* name, uint32_t len, uint32_t leaf, uint32_t attr, uint64_t size,
+          int64_t mtime, const ContentFn* content) {
+    switch (n.kind) {
+        case SearchNode::And:
+            for (const auto& k : n.kids)
+                if (!Eval(k, name, len, leaf, attr, size, mtime, content)) return false;
+            return true;
+        case SearchNode::Or:
+            for (const auto& k : n.kids)
+                if (Eval(k, name, len, leaf, attr, size, mtime, content)) return true;
+            return false;
+        case SearchNode::Not:
+            return n.kids.empty() || !Eval(n.kids[0], name, len, leaf, attr, size, mtime, content);
+        case SearchNode::Word:
+            if (n.text.empty()) return true;
+            if (n.matcher) return n.matcher->terms.empty() || (*n.matcher)(name + leaf, len - leaf);
+            return FindNLSStringEx(LOCALE_NAME_USER_DEFAULT, FIND_FROMSTART | LINGUISTIC_IGNORECASE | LINGUISTIC_IGNOREDIACRITIC,
+                                   name + leaf, (int)(len - leaf), n.text.c_str(), (int)n.text.size(), nullptr, nullptr,
+                                   nullptr, 0) >= 0;
+        case SearchNode::Filter:
+            return n.spec.Accept(name, len, attr, size, mtime);
+        case SearchNode::Content:
+            if (attr & FILE_ATTRIBUTE_DIRECTORY) return false;
+            return !content || n.text.empty() || (*content)(n.text);
+    }
+    return false;
+}
+
+// Branches OU de premier niveau, chacune réduite à ce que l'index des noms sait chercher.
+bool BranchAsks(const SearchNode& b, std::vector<std::wstring>& out) {
+    std::wstring words;
+    std::vector<std::wstring> exts;
+    auto take = [&](const SearchNode& k) {
+        if (k.kind == SearchNode::Word && !k.text.empty()) words += (words.empty() ? L"" : L" ") + k.text;
+        if (k.kind == SearchNode::Filter && !k.spec.exts.empty() && exts.empty()) exts = k.spec.exts;
+    };
+    if (b.kind == SearchNode::And)
+        for (const auto& k : b.kids) take(k);
+    else
+        take(b);
+    if (!words.empty()) {
+        out.push_back(words);
+        return true;
+    }
+    if (exts.empty()) return false;
+    std::wstring ask;  // « *.jpg;*.png;… » : une seule passe sur l'index
+    for (const auto& e : exts) {
+        if (ask.size() + e.size() + 3 > 1000) {
+            out.push_back(std::move(ask));
+            ask.clear();
+        }
+        ask += (ask.empty() ? L"*." : L";*.") + e;
+    }
+    if (!ask.empty()) out.push_back(std::move(ask));
+    return true;
+}
+
+}  // namespace
+
+SearchQuery::SearchQuery(const std::wstring& q, int64_t now) {
+    auto root = std::make_shared<SearchNode>(QParser(Tokenize(q), now ? now : NowFt()).Parse());
+    empty_ = root->kind == SearchNode::And && root->kids.empty();
+    Walk(*root, stat_, content_);
+    root_ = std::move(root);
+}
+
+bool SearchQuery::Match(const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime,
+                        const ContentFn* content) const {
+    if (empty_) return true;
+    uint32_t leaf = n;
+    while (leaf > 0 && name[leaf - 1] != L'\\') --leaf;
+    return Eval(*root_, name, n, leaf, attr, size, mtime, content);
+}
+
+std::vector<std::wstring> SearchQuery::NameAsks() const {
+    std::vector<std::wstring> out;
+    if (empty_) return out;
+    if (root_->kind == SearchNode::Or) {
+        for (const auto& b : root_->kids)
+            if (!BranchAsks(b, out)) return {};
+        return out;
+    }
+    if (!BranchAsks(*root_, out)) return {};
+    return out;
+}
+
+bool FileContainsText(const std::wstring& path, const std::wstring& word) {
+    if (word.empty()) return true;
+    HANDLE h = CreateFileW(ToNtPath(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (32ll << 20)) {
+        CloseHandle(h);
+        return false;
+    }
+    std::string bytes((size_t)sz.QuadPart, '\0');
+    DWORD got = 0;
+    const bool ok = ReadFile(h, bytes.data(), (DWORD)bytes.size(), &got, nullptr);
+    CloseHandle(h);
+    if (!ok) return false;
+    bytes.resize(got);
+    std::wstring text;
+    if (bytes.size() >= 2 && (uint8_t)bytes[0] == 0xFF && (uint8_t)bytes[1] == 0xFE) {  // UTF-16 LE
+        text.assign((const wchar_t*)(bytes.data() + 2), (bytes.size() - 2) / 2);
+    } else {
+        // Binaire (NUL dans les premiers Ko) : pas du texte.
+        if (memchr(bytes.data(), 0, std::min<size_t>(bytes.size(), 4096))) return false;
+        size_t off = bytes.size() >= 3 && (uint8_t)bytes[0] == 0xEF && (uint8_t)bytes[1] == 0xBB && (uint8_t)bytes[2] == 0xBF ? 3 : 0;
+        const char* src = bytes.data() + off;
+        const int n = (int)(bytes.size() - off);
+        UINT cp = CP_UTF8;
+        int wn = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, src, n, nullptr, 0);
+        if (wn <= 0) {
+            cp = CP_ACP;
+            wn = MultiByteToWideChar(cp, 0, src, n, nullptr, 0);
+        }
+        if (wn <= 0) return false;
+        text.resize(wn);
+        MultiByteToWideChar(cp, cp == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0, src, n, text.data(), wn);
+    }
+    return FindNLSStringEx(LOCALE_NAME_USER_DEFAULT, FIND_FROMSTART | LINGUISTIC_IGNORECASE | LINGUISTIC_IGNOREDIACRITIC,
+                           text.c_str(), (int)text.size(), word.c_str(), (int)word.size(), nullptr, nullptr, nullptr, 0) >= 0;
+}
+
 void DirData_Add(DirData& d, const wchar_t* name, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime, int64_t ctime,
                  int64_t atime) {
     AddEntry(d, name, n, attr, size, mtime, ctime, atime);
@@ -479,14 +874,37 @@ void SearchTree(DirData& d, const std::wstring& query, const ViewPrefs& prefs, c
         if (h == INVALID_HANDLE_VALUE) { d.error = GetLastError(); return; }
         CloseHandle(h);
     }
-    const SearchSpec spec = ParseSearch(query);
-    const Matcher nameMatch(spec.names);
-    const bool anyName = nameMatch.terms.empty();  // filtres seuls (« ext:pdf ») : tous les noms
-    auto match = [&](const wchar_t* fn, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime) {
-        return (anyName || nameMatch(fn, n)) && spec.Accept(fn, n, attr, size, mtime);
-    };
-    if (anyName && !spec.filtered()) { d.error = ERROR_INVALID_PARAMETER; return; }
+    const SearchQuery sq(query);
+    if (sq.empty()) { d.error = ERROR_INVALID_PARAMETER; return; }
     const std::wstring root = d.path;
+    // contenu: : l'index de Windows Search s'il couvre le dossier, sinon lecture des fichiers texte.
+    std::unordered_map<std::wstring, std::unordered_set<std::wstring>> indexed;
+    if (sq.hasContent()) {
+        d.contentIndexed = WSearch_Indexed(root) == 1;
+        if (d.contentIndexed)
+            for (const auto& w : sq.contentWords()) {
+                std::unordered_set<std::wstring> set;
+                if (WSearch_Contains(root, w, set)) indexed.emplace(w, std::move(set));
+                else d.contentIndexed = false;
+            }
+    }
+    auto match = [&](const std::wstring& rel, const wchar_t* fn, uint32_t n, uint32_t attr, uint64_t size, int64_t mtime) {
+        if (!sq.hasContent()) return sq.Match(fn, n, attr, size, mtime);
+        if (!sq.Match(fn, n, attr, size, mtime)) return false;  // contenu tenu pour vrai : le reste d'abord
+        const std::wstring full = Join(rel.empty() ? root : Join(root, rel.c_str()), std::wstring(fn, n).c_str());
+        std::wstring low;
+        const ContentFn cf = [&](const std::wstring& w) {
+            if (auto it = indexed.find(w); it != indexed.end()) {
+                if (low.empty()) {
+                    low = full;
+                    CharLowerBuffW(low.data(), (DWORD)low.size());
+                }
+                return it->second.count(low) > 0;
+            }
+            return FileContainsText(full, w);
+        };
+        return sq.Match(fn, n, attr, size, mtime, &cf);
+    };
     // Disque réseau : moins de requêtes en parallèle (le serveur sert aussi les autres).
     const bool remote = (root.size() > 1 && root[0] == L'\\') ||
                         (root.size() >= 2 && root[1] == L':' && GetDriveTypeW(root.substr(0, 3).c_str()) == DRIVE_REMOTE);
@@ -540,7 +958,7 @@ void SearchTree(DirData& d, const std::wstring& query, const ViewPrefs& prefs, c
                         if (!dot && IsShown(attr, prefs)) {
                             // Pas de jonction ni de lien : pas de boucle, pas de doublon.
                             const bool descend = (attr & FILE_ATTRIBUTE_DIRECTORY) && !(attr & FILE_ATTRIBUTE_REPARSE_POINT);
-                            const bool hit = match(fn, n, attr, (uint64_t)di->EndOfFile.QuadPart, di->LastWriteTime.QuadPart);
+                            const bool hit = match(rel, fn, n, attr, (uint64_t)di->EndOfFile.QuadPart, di->LastWriteTime.QuadPart);
                             if (hit || descend) {  // chemin construit seulement si utile
                                 std::wstring child = rel.empty() ? std::wstring(fn, n) : rel + L"\\" + std::wstring(fn, n);
                                 if (hit)
@@ -723,13 +1141,12 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewP
     std::vector<uint32_t> order;
     order.reserve(n);
     const bool filter = !d.isRoot();
-    const SearchSpec spec = ParseSearch(nameFilter);  // le filtre instantané comprend aussi ext:, taille:…
-    const Matcher match(spec.names);
-    const bool byName = !match.terms.empty(), byFilter = spec.filtered();
+    const SearchQuery query(nameFilter);  // le filtre instantané comprend aussi ext:, taille:, OR, NOT…
+    const bool byQuery = !query.empty();
     auto keep = [&](uint32_t i) {
         const Entry& e = d.entries[i];
-        return (!filter || IsShown(e.attr, prefs)) && (!byName || match(d.name(e), e.nameLen)) &&
-               (!byFilter || spec.Accept(d.name(e), e.nameLen, e.attr, e.size, e.mtime));
+        return (!filter || IsShown(e.attr, prefs)) &&
+               (!byQuery || query.Match(d.name(e), e.nameLen, e.attr, e.size, e.mtime));
     };
     for (uint32_t i = 0; i < n; ++i)
         if (d.entries[i].isDir() && keep(i)) order.push_back(i);

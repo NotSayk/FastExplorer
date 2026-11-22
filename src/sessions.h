@@ -30,6 +30,14 @@ bool Session_Save(const std::wstring& name, const SessionTabs& s);
 bool Session_Load(const std::wstring& name, SessionTabs& s);
 bool Session_Delete(const std::wstring& name);
 
+// Recherches récentes (HKCU SearchHistory, REG_MULTI_SZ) : la plus récente d'abord, sans doublon (casse ignorée).
+constexpr size_t kSearchHistoryMax = 25;
+std::vector<std::wstring> HistoryPush(std::vector<std::wstring> list, const std::wstring& query, size_t max = kSearchHistoryMax);
+std::vector<std::wstring> SearchHistory_Get();
+void SearchHistory_Add(const std::wstring& query);
+void SearchHistory_Remove(const std::wstring& query);
+void SearchHistory_Clear();
+
 constexpr int kBookmarks = 9;
 bool Bookmark_Get(int n, std::wstring& path);  // n = 1…9 ; false : aucun signet
 bool Bookmark_Set(int n, const std::wstring& path);

@@ -333,7 +333,8 @@ void ShowSummary() {
                    d.path.empty() ? L" dans tout le PC" : L"",
                    d.searchDone ? (d.truncated ? L"   •   arrêtée : trop de résultats" : L"")
                                 : L"   •   recherche en cours…",
-                   d.fromIndex ? L"   •   index instantané" : L"");
+                   d.fromIndex ? L"   •   index instantané"
+                               : (d.contentIndexed ? L"   •   contenu : index de Windows Search" : L""));
         if (!d.searchDone) {
             const size_t k = wcslen(s);
             swprintf_s(s + k, _countof(s) - k, L" (%zu dossiers parcourus)", d.scanned);
@@ -1836,11 +1837,10 @@ bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, co
     const double t0 = NowMs();
     // Le service ne connaît que les noms : on lui envoie les mots du nom (ou
     // « *.ext » par extension demandée) ; les autres filtres s'appliquent ici.
-    const SearchSpec spec = ParseSearch(q);
-    std::vector<std::wstring> asks;
-    if (!NameMatcher(spec.names).terms.empty()) asks.push_back(spec.names);
-    else for (const auto& e : spec.exts) asks.push_back(L"*." + e);
-    if (asks.empty()) return false;  // « taille:>1Go » seul : tous les fichiers, le parcours des dossiers convient mieux
+    const SearchQuery sq(q);
+    if (sq.hasContent()) return false;  // contenu : l'index des noms ne sait pas, le parcours (et Windows Search) oui
+    const std::vector<std::wstring> asks = sq.NameAsks();
+    if (asks.empty()) return false;  // « taille:>1Go » ou « -tmp » seuls : tous les fichiers, le parcours convient mieux
     IndexQuery iq;
     iq.scope = d.path;
     iq.showHidden = prefs.showHidden;
@@ -1856,14 +1856,16 @@ bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, co
         truncated |= t;
         for (auto& h : part) hits.push_back(std::move(h));
     }
-    // Filtres sans le disque (type, extension) d'abord : moins de fichiers à lire.
-    if (spec.filtered()) {
-        SearchSpec byName = spec;
-        byName.minSize = 0, byName.maxSize = UINT64_MAX, byName.minTime = INT64_MIN, byName.maxTime = INT64_MAX;
-        std::erase_if(hits, [&](const IndexHit& h) {
-            return !byName.Accept(h.path.c_str(), (uint32_t)h.path.size(), h.attr, 0, 0);
-        });
+    // Plusieurs demandes (OU) : un même élément peut revenir plusieurs fois.
+    if (asks.size() > 1) {
+        std::unordered_set<std::wstring> seen;
+        std::erase_if(hits, [&](const IndexHit& h) { return !seen.insert(h.path).second; });
     }
+    // Sans taille ni date dans la requête : tout se décide sans le disque, avant de lire quoi que ce soit.
+    if (!sq.needsStat())
+        std::erase_if(hits, [&](const IndexHit& h) {
+            return !sq.Match(h.path.c_str(), (uint32_t)h.path.size(), h.attr, 0, 0);
+        });
     // L'index ne garde que les noms : taille et date lues sur le disque, pour
     // les premiers résultats (au-delà, la liste reste utilisable sans elles).
     struct Info {
@@ -1874,7 +1876,7 @@ bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, co
     };
     std::vector<Info> info(hits.size());
     // Taille ou date demandée : il faut les lire toutes.
-    const size_t statN = spec.sized() || spec.dated() ? hits.size() : std::min<size_t>(hits.size(), 5000);
+    const size_t statN = sq.needsStat() ? hits.size() : std::min<size_t>(hits.size(), 5000);
     const unsigned T = statN > 64 ? 8u : 1u;
     auto work = [&](unsigned t) {
         for (size_t i = statN * t / T; i < statN * (t + 1) / T && !ct.cancelled(); ++i) {
@@ -1895,8 +1897,8 @@ bool SearchIndexed(DirData& d, const std::wstring& q, const ViewPrefs& prefs, co
     for (size_t i = 0; i < hits.size(); ++i) {
         const Info& x = info[i];
         const uint32_t attr = x.ok ? x.attr : hits[i].attr;
-        if ((spec.sized() || spec.dated()) &&
-            (!x.ok || !spec.Accept(hits[i].path.c_str(), (uint32_t)hits[i].path.size(), attr, x.size, x.mtime)))
+        if (sq.needsStat() &&
+            (!x.ok || !sq.Match(hits[i].path.c_str(), (uint32_t)hits[i].path.size(), attr, x.size, x.mtime)))
             continue;
         DirData_Add(d, hits[i].path.c_str(), (uint32_t)hits[i].path.size(), attr, x.size, x.mtime, x.ctime, x.atime);
     }
@@ -2152,10 +2154,75 @@ void ApplyFilter() {
     SortView();
 }
 
+// ── Recherches récentes : liste déroulante sous la zone de recherche (comme l'Explorateur) ──
+
+class HistoryEnum : public IEnumString {
+public:
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IEnumString) {
+            *ppv = static_cast<IEnumString*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return ++ref_; }
+    IFACEMETHODIMP_(ULONG) Release() override {
+        const ULONG r = --ref_;
+        if (!r) delete this;
+        return r;
+    }
+    IFACEMETHODIMP Next(ULONG celt, LPOLESTR* out, ULONG* fetched) override {
+        ULONG n = 0;
+        for (; n < celt && pos_ < items_.size(); ++n, ++pos_) {
+            const std::wstring& s = items_[pos_];
+            out[n] = (LPOLESTR)CoTaskMemAlloc((s.size() + 1) * sizeof(wchar_t));
+            if (!out[n]) break;
+            wcscpy_s(out[n], s.size() + 1, s.c_str());
+        }
+        if (fetched) *fetched = n;
+        return n == celt ? S_OK : S_FALSE;
+    }
+    IFACEMETHODIMP Skip(ULONG celt) override {
+        pos_ = std::min(items_.size(), pos_ + celt);
+        return pos_ < items_.size() ? S_OK : S_FALSE;
+    }
+    IFACEMETHODIMP Reset() override {  // relu à chaque ouverture de la liste
+        items_ = SearchHistory_Get();
+        pos_ = 0;
+        return S_OK;
+    }
+    IFACEMETHODIMP Clone(IEnumString**) override { return E_NOTIMPL; }
+
+private:
+    std::atomic<ULONG> ref_{1};
+    std::vector<std::wstring> items_;
+    size_t pos_ = 0;
+};
+
+void AttachSearchHistory() {
+    IAutoComplete2* ac = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_AutoComplete, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&ac)))) return;
+    auto* e = new HistoryEnum;
+    e->Reset();
+    if (SUCCEEDED(ac->Init(g_searchBox, e, nullptr, nullptr)))
+        ac->SetOptions(ACO_AUTOSUGGEST | ACO_UPDOWNKEYDROPSLIST);  // ↓ : toute la liste
+    e->Release();
+    ac->Release();  // la zone de saisie garde l'objet
+}
+
+void SearchFor(const std::wstring& q) {
+    SetWindowTextW(g_searchBox, q.c_str());
+    g_filter.clear();
+    if (HasView()) Navigate(g_path, Nav::Refresh, {}, {}, {}, false, &q);
+}
+
 // Entrée dans la zone : recherche dans les sous-dossiers (texte vide : on en sort).
 void RunSearch() {
     if (!HasView()) return;
     const std::wstring q = SearchText();
+    if (!q.empty()) SearchHistory_Add(q);
     const std::wstring current = g_pending.active ? g_pending.query : g_query;
     if (q == current) return;
     g_filter.clear();  // les résultats correspondent déjà au texte
@@ -5155,6 +5222,19 @@ std::vector<MenuExtra> MoreItems() {
     v.push_back({});
     v.push_back({L"Signets", nullptr, false, false, BookmarkItems()});
     v.push_back({L"Sessions", nullptr, false, false, SessionItems()});
+    {
+        std::vector<MenuExtra> rec;
+        for (const auto& q : SearchHistory_Get()) rec.push_back({MenuText(q), [q] { SearchFor(q); }});
+        if (rec.empty()) rec.push_back({L"Aucune recherche récente", nullptr, false, false, {}, true});
+        else {
+            rec.push_back({});
+            rec.push_back({L"Effacer l'historique des recherches", [] {
+                               SearchHistory_Clear();
+                               Flash(L"Historique des recherches effacé");
+                           }});
+        }
+        v.push_back({L"Recherches récentes", nullptr, false, false, std::move(rec)});
+    }
     v.push_back({});
     v.push_back({L"Menu contextuel complet par défaut", [] { SetFullMenu(!g_fullMenu); }, false, g_fullMenu});
     v.push_back({L"Vérifier les copies (relire et comparer)", [] { SetVerifyCopies(!FileOps_Verify()); }, false,
@@ -6193,6 +6273,7 @@ void CreateChildren(HWND hwnd) {
     g_searchBox = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0,
                                   0, 0, hwnd, (HMENU)ID_SEARCH, g_inst, nullptr);
     Edit_SetCueBannerTextFocused(g_searchBox, L"Filtrer, Entrée : rechercher (Ctrl+F)", TRUE);
+    AttachSearchHistory();
 
     for (int k = 0; k < 2; ++k) {  // la seconde ne sert qu'en double panneau
         HWND lv = CreateWindowExW(0, WC_LISTVIEWW, L"",
