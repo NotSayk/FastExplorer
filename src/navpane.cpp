@@ -1,5 +1,7 @@
 #include "navpane.h"
 
+#include "net.h"
+
 #include "listing.h"
 #include "paths.h"
 #include "pins.h"
@@ -113,7 +115,7 @@ UINT g_msg = 0;
 NavHost g_host;
 std::unordered_map<uintptr_t, Node> g_nodes;
 uintptr_t g_nextId = 1;
-HTREEITEM g_quick = nullptr, g_pc = nullptr, g_home = nullptr, g_bin = nullptr;
+HTREEITEM g_quick = nullptr, g_pc = nullptr, g_home = nullptr, g_bin = nullptr, g_net = nullptr;
 int g_folderIcon = 0;
 bool g_syncing = false;  // sélection faite par le programme : pas de navigation
 ULONGLONG g_pinnedAt = 0;
@@ -124,7 +126,7 @@ struct Result {
     uintptr_t id = 0;  // Children : nœud visé
     std::vector<NavFolder> folders;
     int rootIcon = -1;  // icône du nœud racine (Accès rapide, Ce PC)
-    int homeIcon = -1, binIcon = -1;  // Pinned : icônes de l'Accueil et de la Corbeille
+    int homeIcon = -1, binIcon = -1, netIcon = -1;  // Pinned : icônes de l'Accueil, de la Corbeille, de Réseau
     bool unpinFailed = false;
 };
 std::wstring g_unpinQueued;  // désépinglage demandé pendant une lecture
@@ -267,9 +269,17 @@ HTREEITEM FindByPath(const std::wstring& path) {
 std::vector<NavFolder> NavPane_ReadChildren(const std::wstring& path) {
     DirData d;
     d.path = path;
-    Enumerate(d);
+    if (path == kNetPath) {  // serveurs connus
+        Net_EnumServers(d);
+        std::vector<NavFolder> out;
+        for (uint32_t i : SortedDirs(d)) out.push_back({d.name(d.entries[i]), d.target[i], -1, true});
+        return out;
+    }
+    const bool server = Net_IsServerPath(path);
+    if (server) Net_EnumShares(d);
+    else Enumerate(d);
     if (d.error) return {};
-    return FoldersOf(d, true);
+    return FoldersOf(d, !server);  // partages : pas de lecture de chacun
 }
 
 namespace {
@@ -418,6 +428,8 @@ HWND NavPane_Create(HWND parent, UINT id, UINT msg, NavHost host) {
     NavFolder pc{L"Ce PC", L"", -1, true};
     g_pc = Insert(TVI_ROOT, TVI_LAST, pc, Kind::Pc);
     if (Node* n = NodeOf(g_pc)) n->expandWhenLoaded = true;  // ouvert d'emblée, comme l'Explorateur
+    NavFolder net{L"Réseau", L"::net", -1, false};
+    g_net = Insert(TVI_ROOT, TVI_LAST, net, Kind::Place);
     NavFolder bin{L"Corbeille", L"::bin", -1, false};
     g_bin = Insert(TVI_ROOT, TVI_LAST, bin, Kind::Place);
     StartLoad(IdOf(g_pc));
@@ -487,7 +499,8 @@ void StartPinnedRead(const std::wstring& unpinFirst) {
             CoTaskMemFree(p);
         }
         for (auto [icon, place] : {std::pair{&r->homeIcon, L"shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}"},
-                                   std::pair{&r->binIcon, L"shell:::{645FF040-5081-101B-9F08-00AA002F954E}"}}) {
+                                   std::pair{&r->binIcon, L"shell:::{645FF040-5081-101B-9F08-00AA002F954E}"},
+                                   std::pair{&r->netIcon, L"shell:::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}"}}) {
             PIDLIST_ABSOLUTE q = nullptr;
             if (SUCCEEDED(SHParseDisplayName(place, nullptr, &q, 0, nullptr))) {
                 SHFILEINFOW sfi{};
@@ -589,6 +602,7 @@ void NavPane_OnResult(LPARAM lp) {
         SetIcon(g_quick, r->rootIcon);
         SetIcon(g_home, r->homeIcon);
         SetIcon(g_bin, r->binIcon);
+        SetIcon(g_net, r->netIcon);
         SetChildrenFlag(g_quick, !r->folders.empty());
         if (first && !r->folders.empty()) TreeView_Expand(g_tree, g_quick, TVE_EXPAND);
         return;
@@ -611,6 +625,7 @@ void NavPane_OnResult(LPARAM lp) {
 void NavPane_ShowPath(const std::wstring& path) {
     if (!g_tree) return;
     HTREEITEM h = path.empty() ? g_pc : FindByPath(path);
+    if (!h && (Net_IsServerPath(path) || path == kNetPath)) h = g_net;
     if (h == TreeView_GetSelection(g_tree)) return;
     g_syncing = true;
     TreeView_SelectItem(g_tree, h);  // nullptr : plus rien de sélectionné

@@ -58,10 +58,14 @@ struct DirData {
     std::vector<std::wstring> target, origin;
     // Dossier d'une archive ZIP (archive.h) : le fichier .zip ("" sinon). path = archive + chemin intérieur.
     std::wstring archive;
+    // Partages d'un serveur (« \\serveur », net.h) : origin = commentaire de chaque partage.
+    bool server = false;
 
     bool isRoot() const { return path.empty() && query.empty(); }  // Ce PC (pas une recherche dans tout le PC)
     bool isVirtual() const { return path.size() > 2 && path[0] == L':' && path[1] == L':'; }
     bool inArchive() const { return !archive.empty(); }
+    // Liste sans vrais fichiers derrière (archive, partages d'un serveur) : ni écriture, ni Shell, ni surveillance.
+    bool listOnly() const { return inArchive() || server; }
     const wchar_t* name(const Entry& e) const { return pool.data() + e.nameOff; }
 };
 

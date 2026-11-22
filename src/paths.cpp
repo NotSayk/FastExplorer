@@ -25,13 +25,18 @@ bool ParentOf(const std::wstring& p, std::wstring& parent, std::wstring& child) 
     std::wstring s = p;
     if (s.size() == 3 && s[1] == L':') { parent.clear(); child = s; return true; }
     while (s.size() > 1 && s.back() == L'\\') s.pop_back();
+    // « \\serveur » : son parent est Réseau (« ::net », net.h).
+    if (s.size() > 2 && s[0] == L'\\' && s[1] == L'\\' && s[2] != L'?' && s[2] != L'.' &&
+        s.find(L'\\', 2) == std::wstring::npos) {
+        parent = L"::net";
+        child = s.substr(2);
+        return true;
+    }
     const size_t k = s.find_last_of(L'\\');
     if (k == std::wstring::npos) { parent.clear(); child = s; return true; }
     child = s.substr(k + 1);
     parent = s.substr(0, k);
     if (parent.size() == 2 && parent[1] == L':') parent += L'\\';
-    // "\\serveur" seul n'est pas énumérable : on remonte à Ce PC.
-    if (parent.rfind(L"\\\\", 0) == 0 && parent.find(L'\\', 2) == std::wstring::npos) parent.clear();
     if (parent == L"\\" || parent == L"\\\\") parent.clear();
     return true;
 }

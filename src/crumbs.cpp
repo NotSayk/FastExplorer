@@ -16,6 +16,7 @@ std::vector<Crumb> Crumbs_Split(const std::wstring& path,
     if (p.empty()) return {{L"Ce PC", L""}};
     if (p == L"::bin") return {{L"Corbeille", p}};  // emplacements virtuels (places.h)
     if (p == L"::home") return {{L"Accueil", p}};
+    if (p == L"::net") return {{L"Réseau", p}};
 
     std::wstring cur, rest;
     if (p.size() >= 2 && p[1] == L':') {  // C:\…
@@ -29,10 +30,10 @@ std::vector<Crumb> Crumbs_Split(const std::wstring& path,
         rest = p.size() > 3 ? p.substr(3) : std::wstring();
     } else if (p.size() > 2 && p[0] == L'\\' && p[1] == L'\\') {  // \\serveur\partage\…
         const size_t server = p.find(L'\\', 2);
-        const size_t share = server == std::wstring::npos ? server : p.find(L'\\', server + 1);
-        cur = p.substr(0, share);
-        out.push_back({cur, cur});
-        rest = share == std::wstring::npos ? std::wstring() : p.substr(share + 1);
+        cur = p.substr(0, server);
+        out.push_back({L"Réseau", L"::net"});
+        out.push_back({cur.substr(2), cur});
+        rest = server == std::wstring::npos ? std::wstring() : p.substr(server + 1);
     } else {
         return {{p, p}};
     }

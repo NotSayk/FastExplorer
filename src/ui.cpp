@@ -22,6 +22,7 @@
 #include "paths.h"
 #include "places.h"
 #include "archive.h"
+#include "net.h"
 #include "shellmenu.h"
 #include "util.h"
 #include "watch.h"
@@ -124,6 +125,7 @@ struct Pending {
     std::wstring command;           // barre d'adresse : si ce n'est pas un dossier, lancer ceci (« cmd », « wt »…)
     int top = -1;                   // retour sur un onglet : première ligne visible à rétablir
     std::optional<FolderView> view; // autre dossier : son affichage mémorisé, appliqué avec le résultat
+    bool credsAsked = false;        // identifiants réseau déjà demandés pour cette navigation
 };
 
 enum IconState : uint8_t { ICON_NONE, ICON_GENERIC, ICON_PENDING, ICON_OWN };
@@ -765,7 +767,7 @@ int BigImage(int idx, int sysIcon) {
         const Entry& e = E(idx);
         th = THUMB_NONE;
         // Dossier : aperçu de ses premiers fichiers, lisible à partir de 48 px.
-        if (!g_view.data->isRoot() && !g_view.data->inArchive() && Thumbs_Wanted(e.attr, e.size) &&
+        if (!g_view.data->isRoot() && !g_view.data->listOnly() && Thumbs_Wanted(e.attr, e.size) &&
             !(e.isDir() && g_bigPx < S(48))) {
             th = THUMB_PENDING;
             Thumbs_Request(g_view.serial, (uint32_t)idx, FullPath(idx), g_bigPx);
@@ -961,7 +963,7 @@ void RequestRowProps(int idx, bool urgent) {
 void RequestSortProps() {
     g_propWaiting = 0;
     g_propSortWait.clear();
-    if (g_sort.key != COL_PROP || !HasView() || g_view.data->isRoot() || g_view.data->inArchive()) return;
+    if (g_sort.key != COL_PROP || !HasView() || g_view.data->isRoot() || g_view.data->listOnly()) return;
     PropValues* pv = PropsOf(g_sort.pk);
     const size_t n = g_view.data->entries.size();
     g_propSortWait.assign(n, 0);
@@ -1000,7 +1002,7 @@ void FillDispInfo(LVITEMW& it) {
             // Icône du type tout de suite ; l'icône propre (exe, lnk…) suit en tâche de fond.
             g_view.icons[idx] = IconFor(idx);
             st = ICON_GENERIC;
-            if (!g_view.data->isRoot() && !g_view.data->inArchive() && NeedsOwnIcon(e.attr, NameOf(idx) + e.extOff, e.nameLen - e.extOff)) {
+            if (!g_view.data->isRoot() && !g_view.data->listOnly() && NeedsOwnIcon(e.attr, NameOf(idx) + e.extOff, e.nameLen - e.extOff)) {
                 st = ICON_PENDING;
                 Icons_Request(g_view.serial, (uint32_t)idx, FullPath(idx));
             }
@@ -1068,7 +1070,12 @@ void FillDispInfo(LVITEMW& it) {
             break;
         case COL_TYPE:
             if (root) wcsncpy_s(out, cch, DriveTypeText(e.extra), _TRUNCATE);
-            else if (e.isDir()) wcsncpy_s(out, cch, L"Dossier de fichiers", _TRUNCATE);
+            else if (e.isDir())
+                wcsncpy_s(out, cch,
+                          g_view.data->server            ? L"Partage réseau"
+                          : g_view.data->path == kNetPath ? L"Ordinateur"
+                                                          : L"Dossier de fichiers",
+                          _TRUNCATE);
             else if (e.extOff + 1 < e.nameLen) {
                 swprintf_s(out, cch, L"Fichier %s", NameOf(idx) + e.extOff + 1);
                 CharUpperBuffW(out + 8, (DWORD)wcslen(out + 8));
@@ -1117,10 +1124,22 @@ std::vector<ColSpec> VirtualColumns(const std::wstring& path) {
     v[0].width96 = 300;
     if (path == kBinPath) {
         v[2].title = L"Date de suppression";
+    } else if (path == kNetPath) {  // serveurs connus
+        v = {v[0], v[1], v[2], v[4]};
+        v[1].title = L"Lecteurs réseau";
+        v[2].title = L"Dernière visite";
     } else {
         v[1].title = L"Emplacement";
         v[2].title = L"Utilisé le";
     }
+    return v;
+}
+
+// Serveur : ses partages et leur commentaire.
+std::vector<ColSpec> ServerColumns() {
+    std::vector<ColSpec> v = {Columns_Builtin(COL_NAME), Columns_Builtin(COL_TYPE), Columns_Builtin(COL_ORIGIN)};
+    v[0].width96 = 260;
+    v[2].title = L"Commentaire";
     return v;
 }
 
@@ -1131,7 +1150,7 @@ std::vector<ColSpec> ArchiveColumns() {
 
 // Colonnes imposées (Ce PC, Corbeille, Accueil, archives) : ni mémorisées ni appliquées aux dossiers.
 bool FixedColumns() {
-    return HasView() && (g_view.data->isRoot() || g_view.data->isVirtual() || g_view.data->inArchive());
+    return HasView() && (g_view.data->isRoot() || g_view.data->isVirtual() || g_view.data->listOnly());
 }
 
 bool g_applyingCols = false;  // colonnes reconstruites par le programme : rien à mémoriser
@@ -1204,6 +1223,7 @@ void UpdateColumnsForView() {
     const std::vector<ColSpec> want = root                               ? RootColumns()
                                       : InVirtual()                        ? VirtualColumns(g_view.data->path)
                                       : HasView() && g_view.data->inArchive() ? ArchiveColumns()
+                                      : HasView() && g_view.data->server      ? ServerColumns()
                                                                            : g_folderCols;
     if (ColumnsKey(want) != ColumnsKey(CurrentColumns())) ApplyColumns(want);
 }
@@ -1645,6 +1665,10 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
             Recycle_Enumerate(*d, ct);
         } else if (path == kHomePath) {
             Home_Enumerate(*d, pins, ct);
+        } else if (path == kNetPath) {
+            Net_EnumServers(*d, ct);
+        } else if (Net_IsServerPath(path)) {
+            Net_EnumShares(*d, ct);  // « \\serveur » : ses partages
         } else if (std::wstring arc, inner; Archive_Split(path, arc, inner)) {
             Archive_Enumerate(*d, ct);  // ZIP : parcouru comme un dossier (pas de recherche dedans)
         } else if (!q.empty()) {
@@ -1666,6 +1690,7 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
         } else if (climb) EnumerateNearest(*d, ct);
         else Enumerate(*d, ct);
         if (ct.cancelled()) return;
+        if (!d->error && q.empty() && !Net_ServerOf(path).empty()) Net_Remember(path);  // serveur visité : dans Réseau
         auto* r = new Result{ct.gen, JobKind::Navigate};
         if (!d->error) {
             const double t = NowMs();
@@ -1764,7 +1789,7 @@ void UpdatePane() {
     if (Pane_Mode() == PaneMode::None) return;
     std::vector<PaneItem> items;
     std::wstring title, text;
-    if (HasView() && !g_view.data->isRoot() && !g_view.data->inArchive()) {
+    if (HasView() && !g_view.data->isRoot() && !g_view.data->listOnly()) {
         for (int r = -1; (r = ListView_GetNextItem(g_list, r, LVNI_SELECTED)) >= 0 && items.size() < 100;) {
             const int e = EntryAt(r);
             if (e < 0) continue;
@@ -1916,6 +1941,7 @@ void OnResult(Result* raw) {
     if (!d.query.empty() && !d.error && (d.entries.size() <= kSyncSortMax || !g_filter.empty()))
         r->order = SortOrder(d, g_sort.key, g_sortAsc, g_prefs, g_filter, nullptr, SortProps());
 
+    std::wstring d_errorNote;
     if (d.error) {
         SetWindowTextW(g_addr, g_path.c_str());
         Crumbs_SetPath(g_path);
@@ -1929,8 +1955,19 @@ void OnResult(Result* raw) {
             RunCommand(p.command, g_path);
             return;
         }
+        // Partage ou serveur protégé : Windows demande les identifiants, puis on réessaie.
+        if (!Net_ServerOf(d.path).empty() && Net_IsAuthError(d.error) && !p.credsAsked) {
+            const DWORD c = Net_Connect(g_hwnd, d.path);
+            if (c == NO_ERROR) {
+                Navigate(p.path, p.nav, p.focus, p.selected);
+                g_pending.credsAsked = true;
+                return;
+            }
+            if (c != ERROR_CANCELLED) d_errorNote = Net_ErrorText(c);
+        }
         SetStatus(L"Impossible d'ouvrir « " + PlaceText(d.path) + L" » : " +
-                  ErrorText(d.error));
+                  (Net_ServerOf(d.path).empty() ? ErrorText(d.error) : Net_ErrorText(d.error)) +
+                  (d_errorNote.empty() ? L"" : L" (" + d_errorNote + L")"));
         if (!HasView()) Navigate(L"", Nav::Normal);  // démarrage raté → Ce PC
         return;
     }
@@ -2045,7 +2082,7 @@ void OnResult(Result* raw) {
     }
 
     // Surveillance du dossier (pas de « Ce PC » : les lecteurs viendront avec le bloc 4).
-    if (g_path.empty() || IsVirtualPath(g_path) || d.inArchive()) {
+    if (g_path.empty() || IsVirtualPath(g_path) || d.listOnly()) {
         Watch_Stop();
         g_watchPath.clear();
         g_watchFailed.clear();
@@ -2081,7 +2118,7 @@ void OnResult(Result* raw) {
     if (!d.vanished.empty()) g_goneNote = L"« " + d.vanished + L" » n'est plus accessible";
     else if (p.nav != Nav::Refresh) g_goneNote.clear();
     ShowSummary();
-    if (!g_path.empty() && !d.isVirtual() && !d.inArchive()) WarmUpMenus(d);
+    if (!g_path.empty() && !d.isVirtual() && !d.listOnly()) WarmUpMenus(d);
     RegisterShellNotify();
 
     // Nouvel élément créé par une commande du fond du dossier : renommage direct.
@@ -2412,7 +2449,7 @@ std::vector<std::wstring> NamesOf(const std::vector<int>& entries) {
 // ───────────────────────────── Opérations sur les fichiers ─────────────────────────────
 
 bool CanModify() {
-    return HasView() && !g_view.data->isRoot() && !g_view.data->isVirtual() && !g_view.data->inArchive();
+    return HasView() && !g_view.data->isRoot() && !g_view.data->isVirtual() && !g_view.data->listOnly();
 }
 
 void StartOp(FileOp op) {
@@ -2833,6 +2870,7 @@ void BinEmpty() {
 }
 
 void CopyNames(const std::vector<std::wstring>& names, bool cut) {
+    if (HasView() && (g_view.data->path == kNetPath || g_view.data->server)) return;  // serveurs, partages : rien à copier
     if (InArchive()) {  // extraits dans le dossier temporaire, puis mis dans le presse-papiers
         if (cut) Flash(L"Archive en lecture seule : copiez (Ctrl+C) puis collez ailleurs");
         else ExtractEntries(ArchivePicks(), ThenDo::Clipboard);
@@ -2914,10 +2952,16 @@ void Paste(const std::wstring& dest) {
     StartOp(std::move(op));
 }
 
+void NetForget(const std::vector<int>& sel);
+
 // Supprime ; la cible passe ensuite à l'élément suivant (ou précédent), comme dans l'Explorateur.
 void DeleteNames(const std::vector<std::wstring>& names, bool permanent) {
     if (InBin()) {  // dans la Corbeille, supprimer = définitivement
         BinPurge();
+        return;
+    }
+    if (HasView() && g_view.data->path == kNetPath) {  // Réseau : retirer de la liste
+        NetForget(SelectedEntries());
         return;
     }
     if (!CanModify() || names.empty() || !ConfirmDelete(g_hwnd, names, permanent)) return;
@@ -3096,7 +3140,7 @@ void ReclaimForeground() {
 // ───────────────────────────── Glisser-déposer ─────────────────────────────
 
 void StartDrag(POINT client) {
-    if (!HasView()) return;
+    if (!HasView() || g_view.data->path == kNetPath || g_view.data->server) return;  // serveurs, partages entiers
     if (InArchive()) {  // extraction immédiate dans le dossier temporaire, puis glisser de ces fichiers
         const auto sel = SelectedEntries();
         if (sel.empty()) return;
@@ -3155,13 +3199,13 @@ void RegisterDropOn(int k) {
     h.folder = [k] {
         const std::wstring& p = k == g_side ? g_path : g_passive.path;
         const View& v = k == g_side ? g_view : g_passive.view;
-        if (v.data && v.data->inArchive()) return std::wstring();  // archive : lecture seule
+        if (v.data && v.data->listOnly()) return std::wstring();  // archive, serveur : lecture seule
         return IsVirtualPath(p) ? std::wstring() : p;  // Corbeille, Accueil : pas de dépôt
     };
     h.hit = [k](POINT c, std::wstring& name) {
         if (k != g_side) {
             const View& v = g_passive.view;
-            if (!g_dual || !v.data || !g_passive.query.empty() || v.data->isVirtual() || v.data->inArchive()) return -1;
+            if (!g_dual || !v.data || !g_passive.query.empty() || v.data->isVirtual() || v.data->listOnly()) return -1;
             LVHITTESTINFO hit{};
             hit.pt = c;
             const int row = ListView_HitTest(g_lists[k], &hit);
@@ -3471,6 +3515,8 @@ void ReloadPassive() {
         d->path = path;
         if (path == kBinPath) Recycle_Enumerate(*d);
         else if (path == kHomePath) Home_Enumerate(*d, pins);
+        else if (path == kNetPath) Net_EnumServers(*d);
+        else if (Net_IsServerPath(path)) Net_EnumShares(*d);
         else if (std::wstring arc, inner; Archive_Split(path, arc, inner)) Archive_Enumerate(*d);
         else Enumerate(*d);
         if (!PostMessageW(hwnd, WM_APP_PASSIVE, 0, (LPARAM)d)) delete d;
@@ -3558,14 +3604,18 @@ void SetDual(bool on) {
 // F5 / F6 en double panneau : copier / déplacer la sélection vers l'autre panneau.
 void TransferToOther(bool move) {
     if (!g_dual || !HasView() || g_view.data->isRoot() || InBin()) return;  // Corbeille : restaurer d'abord
+    if (g_view.data->path == kNetPath || g_view.data->server) {
+        Flash(L"Ouvrez un partage pour copier ses fichiers");
+        return;
+    }
     if (move && InVirtual()) move = false;  // Accueil : on copie (les originaux restent où ils sont)
     const std::wstring dest = g_passive.path;
     if (dest.empty() || IsVirtualPath(dest) || !g_passive.query.empty()) {
         Flash(L"L'autre panneau ne montre pas un dossier");
         return;
     }
-    if (g_passive.view.data && g_passive.view.data->inArchive()) {
-        Flash(L"L'autre panneau montre une archive (lecture seule)");
+    if (g_passive.view.data && g_passive.view.data->listOnly()) {
+        Flash(L"L'autre panneau ne montre pas un dossier modifiable");
         return;
     }
     if (InArchive()) {  // F5 / F6 depuis une archive : extraction vers l'autre panneau
@@ -3700,10 +3750,72 @@ std::vector<MenuExtra> PinExtras(const std::wstring& path, bool withOpen) {
     return x;
 }
 
+// « Connecter un lecteur réseau » de Windows, partage proposé.
+void MapDriveDialog(const std::wstring& share) {
+    NETRESOURCEW nr{};
+    nr.dwType = RESOURCETYPE_DISK;
+    std::wstring remote = share;
+    nr.lpRemoteName = remote.empty() ? nullptr : remote.data();
+    CONNECTDLGSTRUCTW c{};
+    c.cbStructure = sizeof c;
+    c.hwndOwner = g_hwnd;
+    c.lpConnRes = &nr;
+    c.dwFlags = CONNDLG_USE_MRU | (remote.empty() ? 0 : CONNDLG_RO_PATH);
+    const DWORD r = WNetConnectionDialog1W(&c);
+    if (r == NO_ERROR && c.dwDevNum != (DWORD)-1 && c.dwDevNum > 0)
+        Flash(L"Lecteur " + std::wstring(1, (wchar_t)(L'A' + c.dwDevNum - 1)) + L": connecté à " + share);
+    else if (r != NO_ERROR && r != (DWORD)-1 && r != ERROR_CANCELLED)
+        SetStatus(L"Connexion impossible : " + Net_ErrorText(r));
+}
+
+// Réseau : serveurs connus.
+void NetForget(const std::vector<int>& sel) {
+    if (!HasView() || g_view.data->path != kNetPath) return;
+    for (int e : sel) Net_Forget(FullPath(e));
+    Refresh();
+}
+
+void ShowNetMenu(POINT pt, const std::vector<int>& sel) {
+    enum : UINT { kOpen = 1, kTab, kPaths, kForget, kGo, kMap, kRefresh };
+    HMENU m = CreatePopupMenu();
+    if (!sel.empty()) {
+        AppendMenuW(m, MF_STRING, kOpen, L"Ouvrir");
+        if (sel.size() == 1) AppendMenuW(m, MF_STRING, kTab, L"Ouvrir dans un nouvel onglet");
+        AppendMenuW(m, MF_STRING, kPaths, L"Copier en tant que chemin d'accès\tCtrl+Maj+C");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, kForget, L"Retirer de la liste\tSuppr");
+        SetMenuDefaultItem(m, kOpen, FALSE);
+    } else {
+        AppendMenuW(m, MF_STRING, kGo, L"Ouvrir un serveur (\\\\nom)…");
+        AppendMenuW(m, MF_STRING, kMap, L"Connecter un lecteur réseau…");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, kRefresh, L"Actualiser\tF5");
+    }
+    const UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, g_hwnd, nullptr);
+    DestroyMenu(m);
+    switch (cmd) {
+        case kOpen: if (!sel.empty()) ActivateEntry(sel[0]); break;
+        case kTab: NewTab(FullPath(sel[0]), true); break;
+        case kPaths: CopyPaths({}); break;
+        case kForget: NetForget(sel); break;
+        case kGo:
+            BeginAddressEdit();
+            SetWindowTextW(g_addr, L"\\\\");
+            Edit_SetSel(g_addr, 2, 2);
+            break;
+        case kMap: MapDriveDialog(L""); break;
+        case kRefresh: Refresh(); break;
+    }
+}
+
 // Corbeille, Accueil : nos propres commandes ; un élément de l'Accueil (ou des éléments
 // d'un même dossier) garde le menu du Shell de son vrai dossier.
 void ShowVirtualMenu(POINT pt, const std::vector<int>& sel) {
     const DirData& d = *g_view.data;
+    if (d.path == kNetPath) {
+        ShowNetMenu(pt, sel);
+        return;
+    }
     const bool bin = d.path == kBinPath;
     if (!bin && !sel.empty()) {
         std::wstring parent;
@@ -3861,7 +3973,11 @@ void ShowContextMenu(LPARAM lp) {
         extras.push_back({L"Afficher les éléments masqués", ToggleHidden, false, g_prefs.showHidden});
         extras.push_back({L"Afficher les extensions de noms de fichiers", ToggleExtensions, false, g_prefs.showExtensions});
     }
-    if (!names.empty() && !g_path.empty() && !g_view.data->isVirtual()) {  // archives : extraire, compresser
+    if (g_view.data->server && names.size() == 1) {  // partage : en faire un lecteur
+        const std::wstring share = Join(g_path, names[0].c_str());
+        extras.push_back({L"Connecter un lecteur réseau…", [share] { MapDriveDialog(share); }});
+    }
+    if (!names.empty() && !g_path.empty() && !g_view.data->isVirtual() && !g_view.data->listOnly()) {  // archives
         if (names.size() == 1 && !E(sel[0]).isDir() && Archive_IsArchive(names[0])) {
             const std::wstring arc = Join(g_path, names[0].c_str()), here = g_path;
             extras.push_back({L"Extraire tout", [arc, here] { ExtractArchive(arc, here, true, ThenDo::Nothing); }});

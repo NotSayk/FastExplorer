@@ -22,6 +22,8 @@
 #include "panes.h"
 #include "pins.h"
 #include "places.h"
+#include "net.h"
+#include <lm.h>
 #include "nt.h"
 #include "shellmenu.h"
 #include "watch.h"
@@ -90,7 +92,9 @@ void TestParentOf() {
     CHECK(ParentOf(L"C:\\a", p, c)); CHECK_STR(p, L"C:\\"); CHECK_STR(c, L"a");
     CHECK(ParentOf(L"C:\\a\\b", p, c)); CHECK_STR(p, L"C:\\a"); CHECK_STR(c, L"b");
     CHECK(ParentOf(L"C:\\a\\", p, c)); CHECK_STR(p, L"C:\\"); CHECK_STR(c, L"a");
-    CHECK(ParentOf(L"\\\\srv\\share", p, c)); CHECK_STR(p, L""); CHECK_STR(c, L"share");
+    CHECK(ParentOf(L"\\\\srv\\share", p, c)); CHECK_STR(p, L"\\\\srv"); CHECK_STR(c, L"share");
+    CHECK(ParentOf(L"\\\\srv", p, c)); CHECK_STR(p, L"::net"); CHECK_STR(c, L"srv");
+    CHECK(ParentOf(L"\\\\srv\\", p, c)); CHECK_STR(p, L"::net"); CHECK_STR(c, L"srv");
     CHECK(ParentOf(L"\\\\srv\\share\\x", p, c)); CHECK_STR(p, L"\\\\srv\\share"); CHECK_STR(c, L"x");
 }
 
@@ -860,6 +864,68 @@ void MakeLnk(const std::wstring& lnk, const std::wstring& target) {
     sl->Release();
 }
 
+void TestNet() {
+    CHECK(Net_IsServerPath(L"\\\\nas"));
+    CHECK(!Net_IsServerPath(L"\\\\nas\\films"));
+    CHECK(!Net_IsServerPath(L"\\\\?\\C:\\x"));
+    CHECK(!Net_IsServerPath(L"C:\\x"));
+    CHECK_STR(Net_ServerOf(L"\\\\nas\\films\\a.mkv"), L"\\\\nas");
+    CHECK_STR(Net_ServerOf(L"\\\\nas"), L"\\\\nas");
+    CHECK_STR(Net_ServerOf(L"C:\\x"), L"");
+    CHECK_STR(Net_ServerOf(L"\\\\.\\pipe\\x"), L"");
+    CHECK_STR(Places_FromAlias(L"Réseau"), L"::net");
+    CHECK_STR(Places_Title(L"::net"), L"Réseau");
+    CHECK(Net_IsAuthError(ERROR_ACCESS_DENIED) && Net_IsAuthError(ERROR_LOGON_FAILURE) && !Net_IsAuthError(ERROR_BAD_NETPATH));
+    CHECK(Net_ErrorText(NERR_NetNameNotFound).find(L"partage") != std::wstring::npos);
+
+    // Partages de cette machine (service Serveur) : C$ est un partage d'administration, donc caché.
+    {
+        DirData d;
+        d.path = L"\\\\localhost";
+        const double t0 = NowMs();
+        Net_EnumShares(d);
+        CHECK(d.server);
+        if (d.error) {
+            std::printf("  partages de \\\\localhost : erreur %lu (service Serveur arrêté ?)\n", d.error);
+        } else {
+            bool c = false;
+            for (const Entry& e : d.entries)
+                if (_wcsicmp(d.name(e), L"C$") == 0) c = (e.attr & FILE_ATTRIBUTE_HIDDEN) && e.isDir();
+            CHECK(c);
+            CHECK(d.origin.size() == d.entries.size());
+            std::printf("  partages de \\\\localhost : %zu en %.1f ms\n", d.entries.size(), NowMs() - t0);
+        }
+        DirData bad;
+        bad.path = L"\\\\fe-serveur-inexistant-23";
+        Net_EnumShares(bad);
+        CHECK(bad.error != 0 && bad.entries.empty());
+    }
+
+    // Serveurs mémorisés : ajout, casse, retrait.
+    {
+        const std::wstring srv = L"\\\\FE-Test-Srv-23";
+        Net_Forget(srv);
+        Net_Remember(srv + L"\\partage\\dossier");
+        Net_Remember(L"\\\\fe-test-srv-23\\autre");  // même serveur, autre casse : une seule entrée
+        DirData d;
+        Net_EnumServers(d);
+        CHECK_STR(d.path, L"::net");
+        int found = 0;
+        for (size_t i = 0; i < d.entries.size(); ++i)
+            if (_wcsicmp(d.name(d.entries[i]), L"FE-Test-Srv-23") == 0) {
+                ++found;
+                CHECK_STR(d.target[i], srv);
+                CHECK(d.entries[i].isDir() && d.entries[i].mtime > 0);
+            }
+        CHECK(found == 1);
+        Net_Forget(L"\\\\fe-test-srv-23");
+        DirData after;
+        Net_EnumServers(after);
+        for (const Entry& e : after.entries) CHECK(_wcsicmp(after.name(e), L"FE-Test-Srv-23") != 0);
+        std::printf("  Réseau : %zu serveur(s) connu(s)\n", after.entries.size());
+    }
+}
+
 void TestPlaces() {
     const std::wstring base = Join(g_root, L"places");
     CreateDirectoryW(base.c_str(), nullptr);
@@ -1248,8 +1314,10 @@ void TestCrumbs() {
     });
     CHECK_STR(texts(named), L"Ce PC|;Données (D:)|D:\\;a|D:\\a;");
     CHECK_STR(texts(Crumbs_Split(L"\\\\srv\\partage\\x\\y")),
-              L"\\\\srv\\partage|\\\\srv\\partage;x|\\\\srv\\partage\\x;y|\\\\srv\\partage\\x\\y;");
-    CHECK_STR(texts(Crumbs_Split(L"\\\\srv\\partage")), L"\\\\srv\\partage|\\\\srv\\partage;");
+              L"Réseau|::net;srv|\\\\srv;partage|\\\\srv\\partage;x|\\\\srv\\partage\\x;y|\\\\srv\\partage\\x\\y;");
+    CHECK_STR(texts(Crumbs_Split(L"\\\\srv\\partage")), L"Réseau|::net;srv|\\\\srv;partage|\\\\srv\\partage;");
+    CHECK_STR(texts(Crumbs_Split(L"\\\\srv")), L"Réseau|::net;srv|\\\\srv;");
+    CHECK_STR(texts(Crumbs_Split(L"::net")), L"Réseau|::net;");
     CHECK_STR(texts(Crumbs_Split(L"C:\\a\\\\b")), L"Ce PC|;C:|C:\\;a|C:\\a;b|C:\\a\\b;");  // séparateur doublé
 }
 
@@ -1905,6 +1973,7 @@ int wmain() {
     TestFastCopy();
     TestFileOps();
     TestPlaces();
+    TestNet();
     TestDeflate();
     TestArchive();
     TestCopyQueue();  // après TestFileOps : classe de fenêtre FeTestSink

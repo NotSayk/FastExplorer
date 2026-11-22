@@ -215,6 +215,7 @@ void Home_Enumerate(DirData& d, const std::vector<NavFolder>& pins, const Cancel
 const wchar_t* Places_Title(const std::wstring& path) {
     if (path == kBinPath) return L"Corbeille";
     if (path == kHomePath) return L"Accueil";
+    if (path == L"::net") return L"Réseau";
     return L"";
 }
 
@@ -226,5 +227,8 @@ std::wstring Places_FromAlias(const std::wstring& text) {
     if (t == L"::home" || t == L"accueil" || t == L"home" || t == L"shell:home" || t == L"accès rapide" ||
         t == L"shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}")
         return kHomePath;
+    if (t == L"::net" || t == L"réseau" || t == L"network" || t == L"shell:networkplacesfolder" ||
+        t == L"shell:::{f02c1a0d-be21-4350-88b0-7367fc96ef3c}")
+        return L"::net";
     return L"";
 }

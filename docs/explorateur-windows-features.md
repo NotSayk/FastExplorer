@@ -28,7 +28,7 @@ De haut en bas :
 | **Barre d'onglets** (barre de titre) | Onglets, bouton « + », boutons fenêtre | ✅ P1 (barre sous la barre de titre) |
 | **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅ (bouton Actualiser : bloc 10) |
 | **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | P1 |
-| **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accueil, Accès rapide épinglé, arborescence de Ce PC, Corbeille ; Galerie, Réseau, Linux à venir) |
+| **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accueil, Accès rapide épinglé, arborescence de Ce PC, Réseau, Corbeille ; Galerie, Linux à venir) |
 | **Zone de contenu** | La liste des éléments | ✅ P0 |
 | **Volet d'aperçu / de détails** (droite) | Aperçu du fichier, ou métadonnées | ✅ P1 |
 | **Barre d'état** (bas) | Nombre d'éléments, nombre et taille de la sélection, boutons Détails / Grandes icônes | ✅🟡 P0 (trois zones : contenu du dossier, sélection, temps de lecture ; boutons d'affichage à venir avec les autres vues) |
@@ -389,11 +389,11 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| Partages SMB | `\\serveur\partage`, authentification, mémorisation des identifiants | ✅ (UNC) / P1 (identifiants : déléguer à Windows) |
-| Lister les partages d'un serveur | Taper `\\serveur` | P1 ⚙️ `NetShareEnum` / `WNetEnumResource` |
-| Connecter un lecteur réseau | Ce PC ▸ « … » ▸ Connecter un lecteur réseau ; reconnexion à l'ouverture de session | P2 ⚙️ `WNetAddConnection2` |
+| Partages SMB | `\\serveur\partage`, authentification, mémorisation des identifiants | ✅ (UNC ; accès refusé : Windows demande les identifiants — `WNetAddConnection3`, case « Mémoriser » comprise — puis le dossier est relu) |
+| Lister les partages d'un serveur | Taper `\\serveur` | ✅ P1 (bloc 23 : `NetShareEnum` sur le thread de navigation, abandonné si l'on va ailleurs ; partages d'administration « C$ » cachés ; colonnes Nom, Type, Commentaire ; fil d'Ariane Réseau ▸ serveur ▸ partage ; remonter d'un partage → son serveur → Réseau) |
+| Connecter un lecteur réseau | Ce PC ▸ « … » ▸ Connecter un lecteur réseau ; reconnexion à l'ouverture de session | ✅ P2 (fenêtre de Windows : clic droit sur un partage, partage proposé ; fond de Réseau) |
 | Ajouter un emplacement réseau | Raccourci FTP / WebDAV dans Ce PC | P3 |
-| Découverte réseau | Machines, imprimantes, serveurs multimédia (DLNA) | P3 |
+| Découverte réseau | Machines, imprimantes, serveurs multimédia (DLNA) | 🟡 P3 (Réseau liste les serveurs déjà visités et ceux des lecteurs réseau, sans attente ; Suppr les retire ; découverte automatique à venir) |
 | Fichiers hors connexion | Centre de synchronisation (éditions Pro) | P3 |
 | Robustesse | Un partage lent ou absent ne doit pas figer la fenêtre | ✅ (annulation `CancelSynchronousIo`) |
 
@@ -638,7 +638,7 @@ dossiers avant l'index…) :
 20. ✅ **Double panneau** ⭐ (à la Total Commander), sur la base des onglets.
 21. ✅ **Corbeille et Accueil** : parcourir, restaurer, vider ; page d'Accueil (Accès rapide, récents).
 22. ✅ **Archives** : parcourir un ZIP comme un dossier, extraire tout, compresser.
-23. **Réseau** : lister les partages d'un serveur (`\\serveur`).
+23. ✅ **Réseau** : lister les partages d'un serveur (`\\serveur`).
 24. **Barre de commandes et menu rapide** : nos commandes courantes en un clic, accès au menu du Shell,
     renommage multiple.
 
