@@ -226,9 +226,9 @@ Options du volet (clic droit sur une zone vide) : *Afficher les bibliothèques*,
 | Fonction | Détail | Prio |
 |---|---|---|
 | Copier / Couper / Coller | Ctrl+C / Ctrl+X / Ctrl+V ; interopérable avec les autres applications via le presse-papiers | ✅ P0 (dans les deux sens, CF_HDROP seul compris) ⚙️ formats `CF_HDROP`, `Shell IDList Array`, `Preferred DropEffect` |
-| Coller en tant que raccourci | Menu contextuel classique | ✅ P2 (bloc 28 : menu du fond du dossier ; « nom - Raccourci.lnk », numéroté si pris ; aussi pour les éléments sans chemin ; annulable) |
-| Copier en tant que chemin d'accès | Ctrl+Maj+C : chemin(s) entre guillemets | ✅ (bloc 10 : aussi dans le menu contextuel, sans Maj) |
-| Copier vers / Déplacer vers | Choix d'un dossier de destination | ✅ P2 (bloc 28 : menu de la sélection ; sélecteur de dossier ouvert sur le dernier choisi ; passe par la file des copies) |
+| Coller en tant que raccourci | Menu contextuel classique | ✅ P2 (bloc 28 : « ··· » ▸ Coller en tant que raccourci ; « nom - Raccourci.lnk », numéroté si pris ; aussi pour les éléments sans chemin ; annulable) |
+| Copier en tant que chemin d'accès | Ctrl+Maj+C : chemin(s) entre guillemets | ✅ (bloc 10 : aussi dans « ··· » et dans le menu de Windows) |
+| Copier vers / Déplacer vers | Choix d'un dossier de destination | ✅ P2 (bloc 28 : « ··· » ▸ Copier vers / Déplacer vers ; sélecteur de dossier ouvert sur le dernier choisi ; passe par la file des copies) |
 | **Glisser-déposer** | Même volume = déplacer ; autre volume = copier ; Ctrl = forcer la copie ; Maj = forcer le déplacement ; Alt ou Ctrl+Maj = créer un raccourci ; **clic droit + glisser** = menu au dépôt (Copier ici, Déplacer ici, Créer un raccourci ici). Interopérable avec les autres applications | ✅ P0 (dépôt confié à la cible du Shell : dossier affiché ou élément survolé — dossier, .zip, raccourci ; testé hors écran, pas encore à la souris) ⚙️ OLE `IDropTarget` / `IDropSource` / `IDataObject` |
 | Ouverture au survol pendant le glisser | Survoler un dossier ou un onglet ouvre celui-ci après un délai | ✅ P2 (bloc 26 : 0,7 s ; on entre dans le dossier et l'on continue de glisser) |
 | Dupliquer sur place | Ctrl+C, Ctrl+V dans le même dossier : « fichier - Copie.txt » | P0 |
@@ -282,7 +282,7 @@ comme arrière-plan, Pivoter (images), Monter (ISO/VHD), Graver…
 | Menu sur plusieurs éléments | Commandes communes | ✅ P0 |
 | Menu sur un lecteur | Formater, Éjecter, BitLocker, Propriétés | ✅ (menu du Shell) |
 | Touche Menu / Maj+F10 au clavier | P0 |
-| Notre propre menu rapide (commandes internes) + accès au menu Shell | ✅ P1 (bloc 24 : affiché en ~20 ms sans gestionnaires du Shell ; « Afficher plus d'options », Maj+clic droit ou Maj+F10 : menu complet, préparé pendant l'ouverture du menu rapide ; « Menu contextuel complet par défaut » dans « ··· ») |
+| Pas de menu à nous | Le clic droit ouvre le menu de Windows, Ouvrir avec, archives, extensions comprises ; il est préparé dès que le bouton droit s'enfonce. Seuls quelques ajouts que le Shell n'a pas sont placés en tête : épingler, annuler / rétablir et options d'affichage sur le fond, connecter un lecteur réseau, ouvrir l'emplacement d'un résultat de recherche | ✅ (décision du 2026-11-23 : le menu rapide du bloc 24 est retiré, aucun ajout prévu) |
 
 ---
 
@@ -365,8 +365,8 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | Fonction | Détail | Prio |
 |---|---|---|
 | Parcourir un ZIP comme un dossier | Double-clic : naviguer, glisser des fichiers dehors, ouvrir (extraction temporaire) | ✅ P1 (bloc 22 : notre propre lecteur ZIP — ZIP64, noms UTF-8 / OEM, dates NTFS —, chemin « a.zip\sous-dossier », lecture seule ; ouvrir, Ctrl+C et glisser extraient dans un dossier temporaire par archive ; ZIP dans un ZIP parcouru aussi ; F5 / F6 en double panneau = extraction vers l'autre panneau) |
-| Extraire tout | Assistant avec choix de destination | ✅ P1 (« Extraire tout » dans un dossier au nom de l'archive, « Extraire vers… » avec choix du dossier ; depuis la vue de l'archive : on entre dans le dossier extrait ; jamais d'écrasement : « nom (2) ») |
-| Compresser | ZIP (historique) ; **7z et TAR** (23H2+) avec options : format, niveau de compression, méthode | ✅🟡 P1 (ZIP : « Compresser dans un fichier ZIP », nommé d'après le premier élément, renommage proposé aussitôt ; 7z / TAR et options à venir) |
+| Extraire tout | Assistant avec choix de destination | ✅ P1 (sur le fichier : le « Extraire tout » de Windows, dans son menu ; dans un ZIP ouvert comme un dossier, clic droit : « Extraire tout » dans un dossier au nom de l'archive ou « Extraire vers… », par notre moteur ; jamais d'écrasement : « nom (2) ») |
+| Compresser | ZIP (historique) ; **7z et TAR** (23H2+) avec options : format, niveau de compression, méthode | ✅ (par le menu de Windows : Envoyer vers ▸ Dossier compressé, 7-Zip… ; rien de plus prévu chez nous) |
 | Lecture native | RAR, 7z, TAR, GZ, BZ2, XZ, ZSTD… (via libarchive, 23H2+), formats étendus en 26H2 | ✅🟡 P1 (extraction de 7z, RAR, TAR, GZ, BZ2, XZ, ZSTD, CAB par le tar.exe de Windows ; seul le ZIP se parcourt) |
 | Performances | Extraction ZIP native réputée lente (améliorée en 2024–2025) | ✅ ⭐ (DEFLATE à nous : extraction sur 8 threads, compression par blocs de 1 Mo en parallèle, fichiers déjà compressés stockés tels quels, progression et annulation dans la file des copies) |
 
@@ -377,7 +377,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | Fonction | Détail | Prio |
 |---|---|---|
 | États de synchro | Nuage (en ligne uniquement), coche verte creuse (disponible localement), coche pleine (toujours conserver), flèches (synchro en cours), croix rouge (erreur) | P2 ⚙️ attributs `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` / `PINNED` / `UNPINNED` + Cloud Files API |
-| Toujours conserver / Libérer de l'espace | Menu contextuel | P2 |
+| Toujours conserver / Libérer de l'espace | Menu contextuel | ✅ (par le menu de Windows : l'entrée du fournisseur, OneDrive par exemple) |
 | **Ne pas déclencher de téléchargement** | Lire les métadonnées d'un fichier « en ligne uniquement » ne doit **jamais** le télécharger (miniatures et aperçus compris) | **P0** (piège de performance majeur) |
 | Partager | Partage proche (Nearby Share), envoi par mail ou application | P3 |
 | Fournisseurs | Dropbox, Google Drive, iCloud, Box : mêmes mécanismes (Cloud Files API) | P2 |
@@ -554,7 +554,7 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | **Double panneau** (à la Total Commander) | Deux listes côte à côte, F5/F6 copier/déplacer vers l'autre panneau | ✅ P1 ⭐ (F9 ; chaque panneau est un onglet ; Tab ou clic pour changer de panneau, chemin du panneau actif en surbrillance ; glisser-déposer vers l'autre panneau ; l'autre panneau est relu après une copie vers lui ; mémorisé) |
 | **File d'attente de copies** | Copies mises en file (pas en parallèle sur le même disque), pause/reprise, reprise après erreur, vérification | ✅ P1 ⭐ (file par disque physique ou serveur, en parallèle sur des disques différents ; fenêtre « File d'attente des copies » : suspendre / reprendre, démarrer maintenant, annuler ; s'ouvre seule quand une copie attend son tour) ; ✅ P2 (bloc 28) : reprise après erreur (erreur réseau réessayée à 1, 2 et 4 s, fichier ouvert un instant réessayé, gros fichiers réseau repris là où ils s'étaient arrêtés ; ce qui est copié reste, seuls les fichiers en échec passent au Shell) et vérification (« ··· » ▸ Vérifier les copies : chaque copie relue sans le cache et comparée octet par octet, refaite une fois si elle diffère) |
 | **Renommage par lot avancé** | Motifs, expressions régulières, compteur, casse, aperçu avant/après | ✅ P2 ⭐ (bloc 28 : Ctrl+Maj+F2 ou menu ; rechercher / remplacer, texte ou expression régulière, avec ou sans la casse et l'extension ; modèle {nom} {n} {n:3} {ext} {date} {dossier} ; 4 casses ; aperçu en direct avec noms refusés et doublons ; une seule étape d'annulation) |
-| **Qui utilise ce fichier ?** | Applications qui gardent un fichier (ou les fichiers d'un dossier) ouvert | ✅ P2 ⭐ (bloc 28 : menu de la sélection ; Gestionnaire de redémarrage de Windows ; basculer vers l'application ou lui demander de se fermer) |
+| **Qui utilise ce fichier ?** | Applications qui gardent un fichier (ou les fichiers d'un dossier) ouvert | ✅ P2 ⭐ (bloc 28 : « ··· » ▸ Qui utilise ces éléments ? ; Gestionnaire de redémarrage de Windows ; basculer vers l'application ou lui demander de se fermer) |
 | **Filtre instantané** du dossier courant | Taper pour filtrer la liste (sans lancer de recherche) | ✅ ⭐ (bloc 11 : zone de recherche, à chaque frappe, sans lire le disque ; filtre aussi des résultats de recherche ; mêmes règles que la recherche) |
 | **Raccourcis personnalisables** | Table de raccourcis éditable | P2 ⭐ |
 | **Palette de commandes** | Ctrl+Maj+P : toutes les actions accessibles au clavier | P2 ⭐ |
@@ -639,10 +639,10 @@ dossiers avant l'index…) :
     pause / reprise, liste visible.
 20. ✅ **Double panneau** ⭐ (à la Total Commander), sur la base des onglets.
 21. ✅ **Corbeille et Accueil** : parcourir, restaurer, vider ; page d'Accueil (Accès rapide, récents).
-22. ✅ **Archives** : parcourir un ZIP comme un dossier, extraire tout, compresser.
+22. ✅ **Archives** : parcourir un ZIP comme un dossier, en extraire (compresser : par le menu de Windows).
 23. ✅ **Réseau** : lister les partages d'un serveur (`\\serveur`).
-24. ✅ **Barre de commandes et menu rapide** : nos commandes courantes en un clic, accès au menu du Shell,
-    renommage multiple.
+24. ✅ **Barre de commandes** : nos commandes courantes en un clic, renommage multiple (le menu rapide à nous a été
+    retiré le 2026-11-23 : le clic droit reste le menu de Windows).
 
 P2, en blocs (dans cet ordre) :
 
@@ -656,7 +656,7 @@ P2, en blocs (dans cet ordre) :
     « qui utilise ce fichier ? » ⭐, reprise après erreur et vérification des copies, perte de propriétés,
     raccourci dont la cible a disparu.
 29. ✅ **Recherche** : syntaxe AQS, recherches récentes, contenu des fichiers (index Windows Search).
-30. **Cloud et lecteurs** : états de synchronisation, Toujours conserver / Libérer de l'espace, monter
+30. **Cloud et lecteurs** : états de synchronisation, monter
     ISO / VHD, formater, renommer un volume, appareils MTP, propriétés de la Corbeille.
 31. **Productivité** ⭐ : palette de commandes, raccourcis personnalisables, terminal intégré, aperçu du code
     coloré, panneau rapide (empreintes).

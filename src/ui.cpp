@@ -188,7 +188,6 @@ HWND g_paneHdr[2];             // chemin au-dessus de chaque liste
 int g_side = 0;                // panneau actif : 0 gauche, 1 droite
 bool g_dual = false;
 HWND g_cmdBar;                 // barre de commandes (Nouveau, Couper, Copier…)
-bool g_fullMenu = false;
 void FillCommandBar();       // clic droit : menu complet du Shell plutôt que le menu rapide
 bool g_dualAtStart = false;    // rétabli au premier dossier affiché
 HFONT g_font;
@@ -2830,22 +2829,6 @@ std::wstring PickFolder(const std::wstring& initial, const wchar_t* title) {
     return out;
 }
 
-// « Compresser dans un fichier ZIP » : à côté des éléments, nommé d'après le premier.
-void CompressEntries(const std::vector<int>& entries) {
-    if (entries.empty() || !HasView() || g_view.data->isRoot() || g_view.data->isVirtual() || g_view.data->inArchive())
-        return;
-    FileOp op;
-    op.kind = FileOpKind::Compress;
-    op.folder = g_path;
-    for (int e : entries) op.paths.push_back(Join(g_path, NameOf(e)));
-    std::wstring stem = NameOf(entries[0]);
-    if (!E(entries[0]).isDir())
-        if (const size_t dot = stem.rfind(L'.'); dot != std::wstring::npos && dot > 0) stem.resize(dot);
-    op.newName = stem + L".zip";
-    StartOp(std::move(op));
-    Flash(L"Compression dans « " + stem + L".zip »…");
-}
-
 bool BrokenShortcut(const std::wstring& lnk, const std::wstring& target);
 
 void ActivateEntry(int idx) {
@@ -4736,8 +4719,6 @@ void ShowArchiveMenu(POINT pt, const std::vector<int>& sel) {
     }
 }
 
-bool QuickMenuApplies(bool shift);
-void ShowQuickMenu(POINT pt, const std::vector<int>& sel);
 void ShowFullMenu(POINT pt, std::vector<int> sel);
 
 void ShowContextMenu(LPARAM lp) {
@@ -4765,14 +4746,11 @@ void ShowContextMenu(LPARAM lp) {
         ShowArchiveMenu(pt, sel);
         return;
     }
-    if (QuickMenuApplies(GetKeyState(VK_SHIFT) < 0)) {
-        ShowQuickMenu(pt, sel);
-        return;
-    }
     ShowFullMenu(pt, sel);
+
 }
 
-// Menu complet du Shell (extensions comprises), précédé de nos commandes.
+// Menu du Shell (extensions comprises), précédé de quelques commandes à nous qu'il n'a pas.
 void ShowFullMenu(POINT pt, std::vector<int> sel) {
     // Les noms (et non des index) : la vue peut être rafraîchie pendant que le menu est ouvert.
     const std::vector<std::wstring> names = NamesOf(sel);
@@ -4791,19 +4769,6 @@ void ShowFullMenu(POINT pt, std::vector<int> sel) {
         const std::wstring share = Join(g_path, names[0].c_str());
         extras.push_back({L"Connecter un lecteur réseau…", [share] { MapDriveDialog(share); }});
     }
-    if (!names.empty() && !g_path.empty() && !g_view.data->isVirtual() && !g_view.data->listOnly()) {  // archives
-        if (names.size() == 1 && !E(sel[0]).isDir() && Archive_IsArchive(names[0])) {
-            const std::wstring arc = Join(g_path, names[0].c_str()), here = g_path;
-            extras.push_back({L"Extraire tout", [arc, here] { ExtractArchive(arc, here, true, ThenDo::Nothing); }});
-            extras.push_back({L"Extraire vers…", [arc, here] {
-                                  const std::wstring to = PickFolder(here, L"Extraire vers");
-                                  if (!to.empty()) ExtractArchive(arc, to, false, ThenDo::Nothing);
-                              }});
-        }
-        extras.push_back({L"Compresser dans un fichier ZIP", [names] { CompressEntries(FindEntriesByNames(names)); }});
-    }
-    if ((!names.empty() || !g_path.empty()) && GetKeyState(VK_SHIFT) >= 0)  // Maj : le Shell la propose déjà
-        extras.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C", [names] { CopyPaths(names); }});
     if (!g_query.empty() && names.size() == 1) {  // résultat de recherche : son dossier, élément sélectionné
         std::wstring parent, leaf;
         if (ParentOf(Join(g_path, names[0].c_str()), parent, leaf))
@@ -4925,11 +4890,9 @@ void ShowProperties() {
     if (!ShellMenu_Invoke(g_hwnd, folder, names, "properties")) SetStatus(L"Propriétés indisponibles.");
 }
 
-// ───────────────────────────── Barre de commandes, menu rapide ─────────────────────────────
+// ───────────────────────────── Barre de commandes ─────────────────────────────
 // Les commandes courantes en un clic, comme la barre de l'Explorateur de
-// Windows 11. Le menu contextuel « rapide » ne contient que nos commandes :
-// il s'affiche sans attendre les gestionnaires du Shell ; « Afficher plus
-// d'options » (ou Maj+clic droit, Maj+F10) ouvre le menu complet du Shell.
+// Windows 11. Le clic droit, lui, ouvre le menu du Shell (ShowFullMenu).
 
 // Menu de nos seules commandes. Séparateur : texte vide.
 void ShowOwnMenu(const std::vector<MenuExtra>& items, POINT pt, UINT flags = TPM_RIGHTBUTTON) {
@@ -4992,13 +4955,6 @@ void InvertSelection() {
 }
 
 void SetVerifyCopies(bool on);
-
-void SetFullMenu(bool on) {
-    g_fullMenu = on;
-    const DWORD v = on ? 1 : 0;
-    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FastExplorer", L"FullMenu", REG_DWORD, &v, sizeof v);
-    ShellMenu_Discard();
-}
 
 MenuExtra NewMenu() {
     const bool can = CanModify();
@@ -5200,8 +5156,14 @@ std::vector<MenuExtra> DisplayItems() {
     return v;
 }
 
+void CopyMoveTo(const std::vector<int>& entries, bool move);
+void PasteShortcut(const std::wstring& dest);
+void WhoUses(const std::vector<int>& entries);
+
 std::vector<MenuExtra> MoreItems() {
     const bool view = HasView();
+    const bool real = view && !g_path.empty() && !InVirtual() && !InArchive() && !g_view.data->listOnly();
+    const bool any = real && !SelectedEntries().empty(), mod = real && CanModify();
     std::vector<MenuExtra> v;
     v.push_back({L"Tout sélectionner\tCtrl+A", [] { ListView_SetItemState(g_list, -1, LVIS_SELECTED, LVIS_SELECTED); },
                  false, false, {}, !view});
@@ -5216,6 +5178,12 @@ std::vector<MenuExtra> MoreItems() {
     v.push_back({});
     v.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C",
                  [] { CopyPaths(NamesOf(SelectedEntries())); }, false, false, {}, !view || g_path.empty()});
+    // Ce que le menu du Shell n'a pas (le clic droit reste celui de Windows).
+    v.push_back({L"Copier vers…", [] { CopyMoveTo(SelectedEntries(), false); }, false, false, {}, !any});
+    v.push_back({L"Déplacer vers…", [] { CopyMoveTo(SelectedEntries(), true); }, false, false, {}, !any || !mod});
+    v.push_back({L"Coller en tant que raccourci", [] { PasteShortcut(g_path); }, false, false, {},
+                 !mod || !ClipboardHasFiles()});
+    v.push_back({L"Qui utilise ces éléments ?", [] { WhoUses(SelectedEntries()); }, false, false, {}, !any});
     v.push_back({L"Ouvrir dans le Terminal", [] { OpenTerminal(g_path); }, false, false, {},
                  !view || g_path.empty() || InVirtual() || InNet()});
     v.push_back({L"Propriétés\tAlt+Entrée", ShowProperties, false, false, {}, !view});
@@ -5236,7 +5204,6 @@ std::vector<MenuExtra> MoreItems() {
         v.push_back({L"Recherches récentes", nullptr, false, false, std::move(rec)});
     }
     v.push_back({});
-    v.push_back({L"Menu contextuel complet par défaut", [] { SetFullMenu(!g_fullMenu); }, false, g_fullMenu});
     v.push_back({L"Vérifier les copies (relire et comparer)", [] { SetVerifyCopies(!FileOps_Verify()); }, false,
                  FileOps_Verify()});
     return v;
@@ -5817,94 +5784,6 @@ void SetVerifyCopies(bool on) {
     Flash(on ? L"Les copies seront relues et comparées à l'original" : L"Copies non vérifiées (plus rapide)");
 }
 
-bool QuickMenuApplies(bool shift) {
-    return !shift && !g_fullMenu && HasView() && !g_path.empty() && !g_view.data->isRoot() && !InVirtual() &&
-           !g_view.data->listOnly() && g_query.empty();
-}
-
-void ShowQuickMenu(POINT pt, const std::vector<int>& sel) {
-    const std::vector<std::wstring> names = NamesOf(sel);
-    const bool mod = CanModify(), clip = ClipboardHasFiles();
-    std::vector<MenuExtra> v;
-    auto more = [names, pt] { ShowFullMenu(pt, FindEntriesByNames(names)); };
-    if (sel.empty()) {  // fond du dossier
-        MenuExtra view = ViewMenu();
-        view.text = L"Affichage";
-        v.push_back(view);
-        v.push_back(SortMenu());
-    v.push_back(GroupMenu());
-        v.push_back({L"Actualiser\tF5", [] { g_forceSizes = true; Refresh(); }});
-        v.push_back({});
-        v.push_back({L"Coller\tCtrl+V", [] { Paste(g_path); }, false, false, {}, !mod || !clip});
-        v.push_back({L"Coller en tant que raccourci", [] { PasteShortcut(g_path); }, false, false, {}, !mod || !clip});
-        if (!g_undo.empty()) v.push_back({L"Annuler " + StepText(g_undo.back()) + L"\tCtrl+Z", Undo});
-        if (!g_redo.empty()) v.push_back({L"Rétablir " + StepText(g_redo.back()) + L"\tCtrl+Y", Redo});
-        v.push_back(NewMenu());
-        v.push_back({});
-        v.push_back({L"Ouvrir dans le Terminal", [] { OpenTerminal(g_path); }});
-        v.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C", [] { CopyPaths({}); }});
-        for (auto& x : PinExtras(g_path, false)) v.push_back(std::move(x));
-        v.push_back({L"Propriétés\tAlt+Entrée", ShowProperties});
-    } else {
-        const int single = sel.size() == 1 ? sel[0] : -1;
-        const bool dir = single >= 0 && E(single).isDir();
-        v.push_back({L"Ouvrir", [names] {
-                         const auto es = FindEntriesByNames(names);
-                         if (es.size() == 1) ActivateEntry(es[0]);
-                         else
-                             for (int e : es)
-                                 if (!E(e).isDir()) OpenWithShell(FullPath(e));
-                     }, false, false, {}, false, true});
-        if (dir) {
-            const std::wstring path = FullPath(single);
-            v.push_back({L"Ouvrir dans un nouvel onglet", [path] { NewTab(path, true); }});
-            v.push_back({L"Ouvrir dans une nouvelle fenêtre", [path] { NewWindow(path); }});
-            v.push_back({L"Ouvrir dans le Terminal", [path] { OpenTerminal(path); }});
-        } else if (single >= 0) {
-            const std::wstring here = g_path, name = names[0];
-            v.push_back({L"Ouvrir avec…", [here, name] {
-                             if (!ShellMenu_Invoke(g_hwnd, here, {name}, "openas")) SetStatus(L"« Ouvrir avec » indisponible.");
-                         }});
-        }
-        v.push_back({});
-        v.push_back({L"Couper\tCtrl+X", [names] { CopyNames(names, true); }, false, false, {}, !mod});
-        v.push_back({L"Copier\tCtrl+C", [names] { CopyNames(names, false); }});
-        v.push_back({L"Copier vers…", [names] { CopyMoveTo(FindEntriesByNames(names), false); }});
-        v.push_back({L"Déplacer vers…", [names] { CopyMoveTo(FindEntriesByNames(names), true); }, false, false, {}, !mod});
-        if (dir) {
-            const std::wstring path = FullPath(single);
-            v.push_back({L"Coller dans ce dossier", [path] { Paste(path); }, false, false, {}, !mod || !clip});
-        }
-        v.push_back({names.size() > 1 ? L"Renommer tout\tF2" : L"Renommer\tF2", [] { BeginRename(); }, false, false, {},
-                     !mod});
-        v.push_back({L"Renommer par lot…\tCtrl+Maj+F2", BatchRename, false, false, {}, !mod});
-        v.push_back({L"Supprimer\tSuppr", [names] { DeleteNames(names, GetKeyState(VK_SHIFT) < 0); }, false, false, {},
-                     !mod});
-        v.push_back({});
-        v.push_back({L"Copier en tant que chemin d'accès\tCtrl+Maj+C", [names] { CopyPaths(names); }});
-        v.push_back({names.size() == 1 && !dir ? L"Qui utilise ce fichier ?" : L"Qui utilise ces éléments ?",
-                     [names] { WhoUses(FindEntriesByNames(names)); }});
-        if (single >= 0 && !dir && Archive_IsArchive(names[0])) {
-            const std::wstring arc = FullPath(single), here = g_path;
-            v.push_back({L"Extraire tout", [arc, here] { ExtractArchive(arc, here, true, ThenDo::Nothing); }});
-            v.push_back({L"Extraire vers…", [arc, here] {
-                             const std::wstring to = PickFolder(here, L"Extraire vers");
-                             if (!to.empty()) ExtractArchive(arc, to, false, ThenDo::Nothing);
-                         }});
-        }
-        v.push_back({L"Compresser dans un fichier ZIP", [names] { CompressEntries(FindEntriesByNames(names)); }, false,
-                     false, {}, !mod});
-        if (dir)
-            for (auto& x : PinExtras(FullPath(single), false)) v.push_back(std::move(x));
-        v.push_back({L"Propriétés\tAlt+Entrée", ShowProperties});
-    }
-    v.push_back({});
-    v.push_back({L"Afficher plus d'options\tMaj+F10", more});
-    ShellMenu_Prepare(g_hwnd, g_path, names, false);  // « Afficher plus d'options » : prêt d'avance
-    ShowOwnMenu(v, pt);
-    SetTimer(g_hwnd, TIMER_PINNED, 800, nullptr);
-}
-
 void OnIcon(IconResult* raw) {
     std::unique_ptr<IconResult> r(raw);
     if (!HasView() || r->serial != g_view.serial || r->idx >= g_view.icons.size()) return;
@@ -6235,7 +6114,6 @@ void CreateChildren(HWND hwnd) {
     g_btnUp = btn(L"↑", ID_UP);
     g_btnRefresh = btn(L"↻", ID_REFRESH);
     CreateCommandBar(hwnd);
-    g_fullMenu = RegDword(L"Software\\FastExplorer", L"FullMenu", 0) != 0;
     FileOps_SetVerify(RegDword(L"Software\\FastExplorer", L"VerifyCopies", 0) != 0);
 
     // Zone de saisie cachée : le fil d'Ariane occupe sa place, sauf pendant la saisie.
