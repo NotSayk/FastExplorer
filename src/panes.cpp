@@ -1,6 +1,9 @@
 #include "panes.h"
 
+#include "syntax.h"
+
 #include <propsys.h>
+#include <richedit.h>
 #include <commctrl.h>
 #include <propkey.h>
 #include <propvarutil.h>
@@ -50,6 +53,7 @@ struct Result {
     Kind kind = K_NONE;
     HBITMAP image = nullptr;
     std::wstring title, subtitle, message, text;
+    std::string rtf;  // code coloré (K_TEXT) : affiché par le RichEdit
     std::vector<Row> rows;
     ~Result() {
         if (image) DeleteObject(image);
@@ -71,7 +75,7 @@ std::atomic<uint64_t> g_seq{0};  // dernière demande : les plus anciennes sont 
 DWORD g_workerTid = 0;
 HANDLE g_worker = nullptr;
 
-HWND g_pane, g_props, g_text, g_host, g_editor;
+HWND g_pane, g_props, g_text, g_code, g_host, g_editor;  // g_code : RichEdit du code coloré
 PaneMode g_mode = PaneMode::None;
 HFONT g_font = nullptr, g_bold = nullptr, g_mono = nullptr;
 std::function<void(const std::wstring&)> g_status;
@@ -246,6 +250,8 @@ void Preview(const Request& r, Result& out) {
         out.kind = K_TEXT;
         out.text = Pane_ReadText(it.path, 512 * 1024, truncated);
         if (truncated) out.text += L"\r\n…";
+        if (g_code && Syntax_Known(ext) && out.text.size() <= 400000)  // code : coloré
+            out.rtf = Syntax_Rtf(out.text, Syntax_Spans(out.text, ext));
         return;
     }
     if (LoadHandler(r, it.path)) {
@@ -509,7 +515,9 @@ void Arrange() {
         else ShowWindow(h, SW_HIDE);
     };
     place(g_props, k == K_DETAILS, a.body);
-    place(g_text, k == K_TEXT, a.body);
+    const bool code = k == K_TEXT && !g_shown->rtf.empty();
+    place(g_text, k == K_TEXT && !code, a.body);
+    if (g_code) place(g_code, code, a.body);
     place(g_host, k == K_HANDLER, a.body);
     if (k == K_HANDLER) {
         RECT hr;
@@ -528,12 +536,45 @@ void Arrange() {
 
 void EndEdit(bool commit);
 
+// Code coloré : RTF lu par le RichEdit, puis la police monospace de l'aperçu (taille comprise).
+void ShowCode(const std::string& rtf) {
+    struct Src {
+        const std::string* s;
+        size_t at;
+    } src{&rtf, 0};
+    EDITSTREAM es{};
+    es.dwCookie = (DWORD_PTR)&src;
+    es.pfnCallback = [](DWORD_PTR cookie, LPBYTE buf, LONG cb, LONG* got) -> DWORD {
+        auto* s = (Src*)cookie;
+        const size_t n = std::min<size_t>((size_t)cb, s->s->size() - s->at);
+        memcpy(buf, s->s->data() + s->at, n);
+        s->at += n;
+        *got = (LONG)n;
+        return 0;
+    };
+    SendMessageW(g_code, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(g_code, EM_STREAMIN, SF_RTF, (LPARAM)&es);
+    LOGFONTW lf{};
+    if (g_mono && GetObjectW(g_mono, sizeof lf, &lf)) {
+        CHARFORMAT2W cf{};
+        cf.cbSize = sizeof cf;
+        cf.dwMask = CFM_FACE | CFM_SIZE;
+        wcscpy_s(cf.szFaceName, lf.lfFaceName);
+        cf.yHeight = MulDiv(std::abs(lf.lfHeight), 1440, (int)GetDpiForWindow(g_code));  // twips
+        SendMessageW(g_code, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+    }
+    SendMessageW(g_code, EM_SETSEL, 0, 0);
+    SendMessageW(g_code, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_code, nullptr, TRUE);
+}
+
 void ShowResult(Result* raw) {
     std::unique_ptr<Result> r(raw);
     if (r->seq != g_seq.load()) return;
     EndEdit(false);
     g_shown = std::move(r);
-    if (g_shown->kind == K_TEXT) SetWindowTextW(g_text, g_shown->text.c_str());
+    if (g_shown->kind == K_TEXT && g_shown->rtf.empty()) SetWindowTextW(g_text, g_shown->text.c_str());
+    if (g_shown->kind == K_TEXT && !g_shown->rtf.empty()) ShowCode(g_shown->rtf);
     if (g_shown->kind == K_DETAILS) {
         SendMessageW(g_props, WM_SETREDRAW, FALSE, 0);
         ListView_DeleteAllItems(g_props);
@@ -792,6 +833,15 @@ HWND Pane_Create(HWND parent, int id, std::function<void(const std::wstring&)> s
                              0, 0, 0, 0, g_pane, nullptr, inst, nullptr);
     SendMessageW(g_text, EM_SETLIMITTEXT, 0, 0);
     SendMessageW(g_text, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(6, 6));
+    if (LoadLibraryW(L"Msftedit.dll")) {  // code coloré
+        g_code = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
+                                 WS_CHILD | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL |
+                                     ES_AUTOHSCROLL | ES_NOHIDESEL,
+                                 0, 0, 0, 0, g_pane, nullptr, inst, nullptr);
+        SendMessageW(g_code, EM_EXLIMITTEXT, 0, 16 << 20);
+        SendMessageW(g_code, EM_SETTARGETDEVICE, 0, 1);  // pas de retour à la ligne
+        SendMessageW(g_code, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(6, 6));
+    }
     g_host = CreateWindowExW(0, L"FastExplorerPreviewHost", L"", WS_CHILD | WS_CLIPCHILDREN, 0, 0, 0, 0, g_pane, nullptr,
                              inst, nullptr);
     return g_pane;

@@ -41,6 +41,10 @@
 #include "paths.h"
 #include "shellns.h"
 #include "vdisk.h"
+#include "hashes.h"
+#include "palette.h"
+#include "syntax.h"
+#include "term.h"
 #include "util.h"
 
 #include <cstdio>
@@ -1582,6 +1586,81 @@ void TestSelectionText() {
     CHECK_STR(SelectionText(1, false, 0), std::wstring(L"1 élément sélectionné  ") + b);  // fichier vide
 }
 
+// Bloc 31 : palette, raccourcis, terminal, empreintes, coloration du code.
+void TestProductivity() {
+    // Pertinence : tous les mots, sans casse ni accents, début de mot d'abord.
+    CHECK(Palette_Score(L"", L"Afficher ▸ Détails") == 0);
+    CHECK(Palette_Score(L"det", L"Afficher ▸ Détails") >= 0);
+    CHECK(Palette_Score(L"AFF DÉT", L"Afficher ▸ Détails") >= 0);
+    CHECK(Palette_Score(L"aff zzz", L"Afficher ▸ Détails") < 0);
+    CHECK(Palette_Score(L"tail", L"Afficher ▸ Détails") > Palette_Score(L"det", L"Afficher ▸ Détails"));
+    CHECK(Palette_Score(L"copier", L"Copier") < Palette_Score(L"copier", L"Aller ▸ Copier vers"));
+    // Combinaisons.
+    const KeyChord c = Chord_Make('K', true, true, false);
+    CHECK_STR(Chord_Text(c), L"Ctrl+Maj+K");
+    CHECK_STR(Chord_Text(Chord_Make(VK_F3, false, false, true)), L"Alt+F3");
+    CHECK_STR(Chord_Text(Chord_Make(VK_DELETE, false, true, false)), L"Maj+Suppr");
+    CHECK(Chord_Text(0).empty() && Chord_Make(0, true, false, false) == 0);
+    CHECK(Chord_FromKey(VK_CONTROL) == 0);
+    // Raccourcis enregistrés (ceux de l'utilisateur sont remis ensuite).
+    {
+        const auto mine = Keys_Load();
+        std::map<std::wstring, KeyChord> k{{L"Afficher ▸ Détails", c}, {L"Aller ▸ Bureau", Chord_Make(VK_F7, false, false, false)}};
+        Keys_Save(k);
+        const auto back = Keys_Load();
+        CHECK(back.size() == 2 && back.at(L"Afficher ▸ Détails") == c);
+        Keys_Save(mine);
+        CHECK(Keys_Load().size() == mine.size());
+    }
+    // Terminal : commande de dossier et script encodé.
+    CHECK_STR(Term_CdCommand(L"C:\\a'b"), L"Set-Location -LiteralPath 'C:\\a''b'");
+    CHECK_STR(Term_Base64(L"A"), L"QQA=");
+    CHECK_STR(Term_Base64(L"ab"), L"YQBiAA==");
+    CHECK_STR(Term_Base64(L""), L"");
+    // Empreintes (vecteurs connus pour « abc »).
+    const FileHashes h = Hash_Bytes("abc", 3);
+    CHECK_STR(h.md5, L"900150983cd24fb0d6963f7d28e17f72");
+    CHECK_STR(h.sha1, L"a9993e364706816aba3e25717850c26c9cd0d89d");
+    CHECK_STR(h.sha256, L"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    {
+        const std::wstring f = Join(g_root, L"hash.bin");
+        std::string big(3 << 20, 'x');  // plus d'un bloc de lecture
+        HANDLE fh = CreateFileW(f.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD w = 0;
+        WriteFile(fh, big.data(), (DWORD)big.size(), &w, nullptr);
+        CloseHandle(fh);
+        uint64_t seen = 0;
+        const FileHashes fhh = Hash_File(f, nullptr, [&](uint64_t n) { seen = n; });
+        const FileHashes mem = Hash_Bytes(big.data(), big.size());
+        CHECK(fhh.error == 0 && fhh.sha256 == mem.sha256 && fhh.md5 == mem.md5 && seen == big.size());
+        std::atomic<bool> stop{true};
+        CHECK(Hash_File(f, &stop).error == ERROR_CANCELLED);
+        CHECK(Hash_File(Join(g_root, L"absent.bin")).error == ERROR_FILE_NOT_FOUND);
+    }
+    CHECK_STR(Hash_Normalize(L" BA:78-16 bf\t"), L"ba7816bf");
+    // Coloration.
+    CHECK(Syntax_Known(L".CPP") && Syntax_Known(L".py") && Syntax_Known(L".json") && !Syntax_Known(L".txt") &&
+          !Syntax_Known(L""));
+    auto kinds = [](const std::wstring& t, const wchar_t* ext) {
+        std::wstring s;
+        for (const auto& sp : Syntax_Spans(t, ext)) s += t.substr(sp.start, sp.len) + L"=" + std::to_wstring(sp.kind) + L";";
+        return s;
+    };
+    CHECK_STR(kinds(L"#include <x>\nint a = 42; // fin\nreturn \"s\\\"t\";", L".cpp"),
+              L"#include <x>=5;int=1;42=4;// fin=3;return=1;\"s\\\"t\"=2;");
+    CHECK_STR(kinds(L"def f():\n    '''doc\nx''' # c\n", L".py"), L"def=1;'''doc\nx'''=2;# c=3;");
+    CHECK_STR(kinds(L"<a href=\"x\"><!-- c --></a>", L".xml"), L"<a=6;href=5;\"x\"=2;>=6;<!-- c -->=3;</a=6;>=6;");
+    CHECK_STR(kinds(L"SELECT 1 -- c", L".sql"), L"SELECT=1;1=4;-- c=3;");
+    CHECK_STR(kinds(L"rem x\n:etiq\necho a", L".bat"), L"rem x=3;:etiq=5;echo=1;");
+    CHECK_STR(kinds(L"[s]\nk=v ; c", L".ini"), L"[s]=1;k=5;; c=3;");
+    CHECK_STR(kinds(L"@@ -1 +1 @@\n-a\n+b", L".diff"), L"@@ -1 +1 @@=1;-a=2;+b=4;");
+    const std::string rtf = Syntax_Rtf(L"a{b}\\é\n\tx", {});
+    CHECK(rtf.find("a\\{b\\}\\\\\\u233?\\par\n\\tab x") != std::string::npos);
+    const std::wstring code = L"int x;";
+    const std::string colored = Syntax_Rtf(code, Syntax_Spans(code, L".c"));
+    CHECK(colored.find("\\cf2 int\\cf1 ") != std::string::npos);
+}
+
 void TestDevices() {
     // Disponibilité des fichiers cloud : d'après les attributs seulement.
     CHECK(SyncState(FILE_ATTRIBUTE_ARCHIVE, false) == 0 && SyncState(FILE_ATTRIBUTE_ARCHIVE, true) == 2);
@@ -2671,6 +2750,7 @@ int wmain() {
     TestSearch();
     TestAqs();
     TestDevices();
+    TestProductivity();
     TestFastCopy();
     TestFileOps();
     TestBatchRename();

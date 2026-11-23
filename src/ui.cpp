@@ -12,6 +12,7 @@
 #include "fileops.h"
 #include "foldersize.h"
 #include "groups.h"
+#include "hashes.h"
 #include "icons.h"
 #include "index.h"
 #include "thumbs.h"
@@ -21,9 +22,11 @@
 #include "navpane.h"
 #include "panes.h"
 #include "paths.h"
+#include "palette.h"
 #include "places.h"
 #include "sessions.h"
 #include "shellns.h"
+#include "term.h"
 #include "vdisk.h"
 #include "archive.h"
 #include "batchrename.h"
@@ -100,7 +103,7 @@ constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-
 // d'événements (copie de milliers de fichiers) et s'espace sur les gros dossiers.
 constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
-enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH, ID_TABS, ID_PANE, ID_LIST2, ID_HDR0, ID_HDR1, ID_CMDBAR,
+enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH, ID_TABS, ID_PANE, ID_LIST2, ID_HDR0, ID_HDR1, ID_CMDBAR, ID_TERM,
        CMD_NEW = 300, CMD_CUT, CMD_COPY, CMD_PASTE, CMD_RENAME, CMD_DELETE, CMD_SORT, CMD_VIEW, CMD_MORE };
 enum class Nav { Normal, Back, Forward, Refresh };
 enum class JobKind { Navigate, Sort };
@@ -182,6 +185,7 @@ int g_navW96 = 240;            // largeur du volet de navigation (à 96 ppp)
 bool g_splitDrag = false;      // séparateur volet / liste en cours de déplacement
 RECT g_split{};                // zone du séparateur (coordonnées client)
 HWND g_pane;                   // volet de droite : aperçu ou détails
+HWND g_term = nullptr;            // terminal intégré (Ctrl+ù), en bas
 int g_paneW96 = 320;           // sa largeur (à 96 ppp)
 bool g_paneDrag = false;
 RECT g_paneSplit{};            // séparateur liste / volet
@@ -2472,6 +2476,7 @@ void OnResult(Result* raw) {
     RebuildRowOf();
     g_path = d.path;
     g_query = d.query;
+    Term_SetDir(g_path);  // le terminal intégré suit le dossier
     if (g_query.empty() && g_filter.empty() && GetWindowTextLengthW(g_searchBox) &&
         (GetFocus() != g_searchBox || p.nav != Nav::Refresh)) {
         g_searchSync = true;  // sorti de la recherche (autre dossier) : zone vidée
@@ -5393,6 +5398,11 @@ std::vector<MenuExtra> DisplayItems() {
 void CopyMoveTo(const std::vector<int>& entries, bool move);
 void PasteShortcut(const std::wstring& dest);
 void WhoUses(const std::vector<int>& entries);
+void ToggleTerminal();
+bool TerminalShown();
+void ShowHashes();
+void ShowPalette();
+void EditKeys();
 
 std::vector<MenuExtra> MoreItems() {
     const bool view = HasView();
@@ -5421,6 +5431,12 @@ std::vector<MenuExtra> MoreItems() {
     v.push_back({L"Ouvrir dans le Terminal", [] { OpenTerminal(g_path); }, false, false, {},
                  !view || g_path.empty() || InVirtual() || InNet()});
     v.push_back({L"Propriétés\tAlt+Entrée", ShowProperties, false, false, {}, !view});
+    v.push_back({L"Empreintes des fichiers (MD5, SHA)…", ShowHashes, false, false, {}, !any});
+    v.push_back({});
+    v.push_back({L"Palette de commandes\tCtrl+Maj+P", ShowPalette});
+    v.push_back({L"Terminal intégré\t" + Chord_Text(Chord_Make(VK_OEM_3, true, false, false)), ToggleTerminal, false,
+                 TerminalShown()});
+    v.push_back({L"Raccourcis clavier…", EditKeys});
     v.push_back({});
     v.push_back({L"Signets", nullptr, false, false, BookmarkItems()});
     v.push_back({L"Sessions", nullptr, false, false, SessionItems()});
@@ -5441,6 +5457,141 @@ std::vector<MenuExtra> MoreItems() {
     v.push_back({L"Vérifier les copies (relire et comparer)", [] { SetVerifyCopies(!FileOps_Verify()); }, false,
                  FileOps_Verify()});
     return v;
+}
+
+// ───────────────────────────── Palette de commandes ─────────────────────────────
+
+void BatchRename();
+std::map<std::wstring, KeyChord> g_userKeys;  // raccourcis de l'utilisateur (HKCU\Software\FastExplorer\Keys)
+
+// Ajoute les éléments d'un menu à la palette : « Préfixe ▸ Texte », le raccourci après la tabulation.
+void FlattenMenu(std::vector<PaletteItem>& out, const std::wstring& prefix, const std::vector<MenuExtra>& items) {
+    for (const MenuExtra& m : items) {
+        if (m.text.empty()) continue;
+        std::wstring name = m.text, keys;
+        if (const size_t tab = name.find(L'\t'); tab != std::wstring::npos) {
+            keys = name.substr(tab + 1);
+            name.resize(tab);
+        }
+        // « Annuler Copie de 3 éléments » : l'identifiant ne doit pas changer avec l'historique.
+        for (const wchar_t* fixed : {L"Annuler", L"Rétablir"})
+            if (name.rfind(std::wstring(fixed) + L" ", 0) == 0) name = fixed;
+        if (!m.sub.empty()) FlattenMenu(out, prefix + name + L" ▸ ", m.sub);
+        else if (m.run) out.push_back({prefix + name, keys, m.run, m.disabled, m.checked});
+    }
+}
+
+std::vector<PaletteItem> Commands() {
+    std::vector<PaletteItem> v;
+    const bool view = HasView(), sel = view && !SelectedEntries().empty();
+    auto add = [&](const wchar_t* id, const wchar_t* keys, std::function<void()> run, bool disabled = false) {
+        v.push_back({id, keys, std::move(run), disabled});
+    };
+    add(L"Aller ▸ Précédent", L"Alt+←", GoBack);
+    add(L"Aller ▸ Suivant", L"Alt+→", GoForward);
+    add(L"Aller ▸ Dossier parent", L"Alt+↑", GoUp);
+    add(L"Aller ▸ Accueil", L"", [] { Navigate(kHomePath, Nav::Normal); });
+    add(L"Aller ▸ Ce PC", L"", [] { Navigate(L"", Nav::Normal); });
+    add(L"Aller ▸ Réseau", L"", [] { Navigate(kNetPath, Nav::Normal); });
+    add(L"Aller ▸ Corbeille", L"", [] { Navigate(kBinPath, Nav::Normal); });
+    const std::pair<const KNOWNFOLDERID*, const wchar_t*> known[] = {{&FOLDERID_Desktop, L"Aller ▸ Bureau"},
+                                                                     {&FOLDERID_Downloads, L"Aller ▸ Téléchargements"},
+                                                                     {&FOLDERID_Documents, L"Aller ▸ Documents"},
+                                                                     {&FOLDERID_Pictures, L"Aller ▸ Images"}};
+    for (const auto& [id, text] : known) {
+        const KNOWNFOLDERID kf = *id;
+        add(text, L"", [kf] {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(kf, KF_FLAG_DONT_VERIFY, nullptr, &p)) && p) Navigate(p, Nav::Normal);
+            if (p) CoTaskMemFree(p);
+        });
+    }
+    add(L"Actualiser", L"F5", Refresh);
+    add(L"Modifier l'adresse", L"Ctrl+L", BeginAddressEdit);
+    add(L"Historique des adresses", L"F4", ShowTypedHistory);
+    add(L"Rechercher", L"Ctrl+F", FocusSearch);
+    add(L"Nouvel onglet", L"Ctrl+T", [] { NewTab(L"", true); });
+    add(L"Fermer l'onglet", L"Ctrl+W", [] { CloseTab(g_tab); });
+    add(L"Nouvelle fenêtre", L"Ctrl+N", [] { NewWindow(g_path); });
+    add(L"Plein écran", L"F11", ToggleFullscreen);
+    add(L"Couper", L"Ctrl+X", [] { CopyNames(NamesOf(SelectedEntries()), true); }, !sel);
+    add(L"Copier", L"Ctrl+C", [] { CopyNames(NamesOf(SelectedEntries()), false); }, !sel);
+    add(L"Coller", L"Ctrl+V", [] { Paste(g_path); }, !view);
+    add(L"Renommer", L"F2", BeginRename, !sel);
+    add(L"Renommer en série…", L"Ctrl+Maj+F2", BatchRename, !sel);
+    add(L"Supprimer", L"Suppr", [] { DeleteNames(NamesOf(SelectedEntries()), false); }, !sel);
+    add(L"Supprimer définitivement", L"Maj+Suppr", [] { DeleteNames(NamesOf(SelectedEntries()), true); }, !sel);
+    FlattenMenu(v, L"Nouveau ▸ ", NewMenu().sub);
+    FlattenMenu(v, L"Afficher ▸ ", DisplayItems());
+    FlattenMenu(v, L"Trier par ▸ ", SortMenu().sub);
+    FlattenMenu(v, L"Regrouper par ▸ ", GroupMenu().sub);
+    // « Plus » : sans préfixe, sans ce qui est déjà au-dessus.
+    std::vector<PaletteItem> more;
+    FlattenMenu(more, L"", MoreItems());
+    for (auto& m : more)
+        if (std::none_of(v.begin(), v.end(), [&](const PaletteItem& x) { return x.id == m.id; })) v.push_back(std::move(m));
+    return v;
+}
+
+void ShowPalette() {
+    RECT r, w;
+    GetWindowRect(IsWindowVisible(g_addr) ? g_addr : g_crumbs, &r);
+    GetWindowRect(g_hwnd, &w);
+    r.left = w.left;
+    r.right = w.right;
+    Palette_Show(g_hwnd, r, g_font, Commands(), g_userKeys);
+}
+
+void EditKeys() { Keys_Edit(g_hwnd, g_font, Commands(), g_userKeys); }
+
+// Ctrl+ù : affiche le terminal (et lui donne le clavier) ; s'il a déjà le clavier, le masque.
+void ToggleTerminal() {
+    if (!g_term) return;
+    if (Term_Shown() && Term_Owns(GetFocus())) {
+        Term_Show(false, L"");
+        Layout();
+        SetFocus(g_list);
+        return;
+    }
+    Term_Show(true, g_path);
+    Layout();
+    Term_Focus();
+}
+
+bool TerminalShown() { return g_term && Term_Shown(); }
+
+// Empreintes des fichiers sélectionnés (les dossiers sont ignorés).
+void ShowHashes() {
+    if (!HasView() || g_path.empty() || InVirtual() || InArchive()) return;
+    std::vector<std::wstring> files;
+    for (int e : SelectedEntries())
+        if (!E(e).isDir()) files.push_back(FullPath(e));
+    if (files.empty()) {
+        Flash(L"Sélectionnez un ou plusieurs fichiers");
+        return;
+    }
+    Hash_Show(g_hwnd, g_font, std::move(files));
+}
+// Raccourci de l'utilisateur : passe avant ceux de l'application. Touche sans Ctrl ni Alt (hors F1…F24) :
+// seulement quand la liste a le clavier, pour pouvoir encore la taper dans une zone de texte.
+bool RunUserKey(const MSG& m) {
+    if (g_userKeys.empty() || (m.message != WM_KEYDOWN && m.message != WM_SYSKEYDOWN)) return false;
+    const KeyChord c = Chord_FromKey((UINT)m.wParam);
+    if (!c) return false;
+    const UINT vk = c & 0xFFFF;
+    const bool plain = !(c & (kChordCtrl | kChordAlt)) && !(vk >= VK_F1 && vk <= VK_F24);
+    if (plain && GetFocus() != g_list) return false;
+    std::wstring id;
+    for (const auto& [k, chord] : g_userKeys)
+        if (chord == c) id = k;
+    if (id.empty()) return false;
+    for (auto& it : Commands())
+        if (it.id == id) {
+            if (it.disabled) Flash(L"« " + id + L" » : indisponible ici");
+            else it.run();
+            return true;
+        }
+    return false;
 }
 
 // Boutons de la barre : identifiant, texte, info-bulle, menu déroulant.
@@ -6226,6 +6377,7 @@ void ApplyFont() {
     for (HWND h : {g_lists[0], g_lists[1], g_paneHdr[0], g_paneHdr[1], g_addr, g_status, g_btnBack, g_btnFwd, g_btnUp,
                    g_btnRefresh, g_nav, g_crumbs, g_searchBox, g_tabBar, g_pane, g_cmdBar})
         SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
+    Term_SetFont(g_fontH);
     FillCommandBar();  // boutons à la taille du texte
 }
 
@@ -6288,7 +6440,12 @@ void Layout() {
     const int cmdY = y0 + h + S(3), cmdH = CommandBarHeight();
     if (g_cmdBar) place(g_cmdBar, m, cmdY, std::max(0, (int)rc.right - 2 * m), cmdH);
     const int top = cmdY + cmdH + S(3);
-    const int bodyH = std::max(0, (int)rc.bottom - top - statusH);
+    int bodyH = std::max(0, (int)rc.bottom - top - statusH);
+    if (g_term && Term_Shown()) {  // terminal intégré : en bas, sur toute la largeur
+        const int termH = std::min(std::max(S(120), bodyH * 3 / 10), std::max(0, bodyH - S(120)));
+        bodyH -= termH;
+        place(g_term, 0, top + bodyH, rc.right, termH);
+    }
     // Volet de navigation, séparateur (déplaçable à la souris), liste.
     const int split = S(5);
     const int navW = std::clamp(S(g_navW96), S(120), std::max(S(120), (int)rc.right / 2));
@@ -6411,6 +6568,7 @@ void CreateChildren(HWND hwnd) {
     nav.status = [](const std::wstring& text) { SetStatus(text); };
     g_nav = NavPane_Create(hwnd, ID_NAV, WM_APP_NAV, std::move(nav));
     g_pane = Pane_Create(hwnd, ID_PANE, [](const std::wstring& text) { SetStatus(text); });
+    g_term = Term_Create(hwnd, ID_TERM);
 
     g_status = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd,
                                (HMENU)ID_STATUS, g_inst, nullptr);
@@ -6421,6 +6579,7 @@ void CreateChildren(HWND hwnd) {
     UpdateTabStrip();
     LoadViewMode();  // mode d'affichage de la dernière session
     LoadPane();
+    g_userKeys = Keys_Load();
     g_dualAtStart = RegDword(L"Software\\FastExplorer", L"Dual", 0) != 0;  // double panneau au premier dossier
     Layout();  // fenêtre encore invisible : aucun repaint
 }
@@ -6782,6 +6941,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Thumbs_Stop();
             Props_Stop();
             Pane_Shutdown();
+            Term_Shutdown();
             DirSizes_Stop();
             Watch_Stop();
             ShellMenu_Discard(true);
@@ -6924,7 +7084,12 @@ bool HandleGlobalKeys(const MSG& m) {
         }
         return false;
     }
+    if (RunUserKey(m)) return true;
     const HWND focus = GetFocus();
+    // Terminal intégré : ses touches restent à lui (Entrée, Tab, Échap, ↑…), sauf Ctrl+… et F1…F12.
+    if (m.message == WM_KEYDOWN && Term_Owns(focus) && GetKeyState(VK_CONTROL) >= 0 &&
+        !(m.wParam >= VK_F1 && m.wParam <= VK_F24))
+        return false;
     if (m.message == WM_XBUTTONUP) {
         if (GET_XBUTTON_WPARAM(m.wParam) == XBUTTON1) GoBack(); else GoForward();
         return true;
@@ -6965,6 +7130,13 @@ bool HandleGlobalKeys(const MSG& m) {
         const size_t n = g_tabList.size();
         switch (m.wParam) {
             case 'T': NewTab(L"", true); return true;
+            case 'P':
+                if (!sh) break;
+                ShowPalette();
+                return true;
+            case VK_OEM_3:  // Ctrl+ù (Ctrl+` en QWERTY) : terminal intégré, comme VS Code
+                ToggleTerminal();
+                return true;
             case 'W':
             case VK_F4: CloseTab(g_tab); return true;
             case VK_RETURN:  // Ctrl+Entrée : le dossier sélectionné dans une nouvelle fenêtre

@@ -344,7 +344,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | Point | Prio |
 |---|---|
 | Ouvrir le dialogue de propriétés natif du Shell | ✅ P0 (Alt+Entrée, menu ; dossier courant si rien n'est sélectionné) ⚙️ `SHObjectProperties` / `SHMultiFileProperties` (gratuit et complet) |
-| Notre propre panneau rapide (taille, dates, hash…) | P2 |
+| Notre propre panneau rapide (taille, dates, hash…) | ✅ P2 (bloc 31 : « ··· » ▸ Empreintes des fichiers : MD5, SHA-1 et SHA-256 en une lecture, sur un thread ; taille et dates dans le volet de détails) |
 
 ---
 
@@ -519,6 +519,8 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 | Ctrl+Maj+1 … 8 | Mode d'affichage (voir §4.1) | ✅ P1 |
 | Ctrl+molette | Zoom des icônes | ✅ P1 |
 | Alt+P / Alt+Maj+P | Volet d'aperçu / de détails | ✅ P1 |
+| Ctrl+Maj+P | Palette de commandes | ✅ P2 (bloc 31) |
+| Ctrl+ù (Ctrl+`) | Terminal intégré : l'afficher, y aller, le masquer | ✅ P2 (bloc 31) |
 | Alt+1 … 9 / Alt+Maj+1 … 9 | Signets (FastExplorer) : y aller / y ranger le dossier affiché | ✅ P2 (bloc 26) |
 | Ctrl+pavé num. + | Ajuster toutes les colonnes | ✅ P2 |
 
@@ -556,11 +558,11 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | **Renommage par lot avancé** | Motifs, expressions régulières, compteur, casse, aperçu avant/après | ✅ P2 ⭐ (bloc 28 : Ctrl+Maj+F2 ou menu ; rechercher / remplacer, texte ou expression régulière, avec ou sans la casse et l'extension ; modèle {nom} {n} {n:3} {ext} {date} {dossier} ; 4 casses ; aperçu en direct avec noms refusés et doublons ; une seule étape d'annulation) |
 | **Qui utilise ce fichier ?** | Applications qui gardent un fichier (ou les fichiers d'un dossier) ouvert | ✅ P2 ⭐ (bloc 28 : « ··· » ▸ Qui utilise ces éléments ? ; Gestionnaire de redémarrage de Windows ; basculer vers l'application ou lui demander de se fermer) |
 | **Filtre instantané** du dossier courant | Taper pour filtrer la liste (sans lancer de recherche) | ✅ ⭐ (bloc 11 : zone de recherche, à chaque frappe, sans lire le disque ; filtre aussi des résultats de recherche ; mêmes règles que la recherche) |
-| **Raccourcis personnalisables** | Table de raccourcis éditable | P2 ⭐ |
-| **Palette de commandes** | Ctrl+Maj+P : toutes les actions accessibles au clavier | P2 ⭐ |
-| **Terminal intégré** | Volet terminal qui suit le dossier courant | P2 ⭐ |
-| **Aperçu du code avec coloration** | Volet d'aperçu rapide pour le texte et le code | P2 ⭐ |
-| **Hash et vérification** | MD5/SHA-256 dans les propriétés ou le menu | P3 ⭐ |
+| **Raccourcis personnalisables** | Table de raccourcis éditable | ✅ P2 ⭐ (bloc 31 : « ··· » ▸ Raccourcis clavier… ; chaque commande de la palette peut recevoir une combinaison, qui passe avant celles de l'application ; une combinaison ne sert qu'une commande ; `HKCU\Software\FastExplorer\Keys`) |
+| **Palette de commandes** | Ctrl+Maj+P : toutes les actions accessibles au clavier | ✅ P2 ⭐ (bloc 31 : actions directes et menus de l'application (« Afficher ▸ Détails »), mots sans casse ni accents, début de mot d'abord ; raccourci et coche affichés ; commandes indisponibles grisées) |
+| **Terminal intégré** | Volet terminal qui suit le dossier courant | ✅ P2 ⭐ (bloc 31 : Ctrl+ù (Ctrl+` en QWERTY) ; PowerShell sans console visible, relié par tuyaux, variables et fonctions gardées ; suit le dossier affiché quand il est libre ; ↑ ↓ historique, Ctrl+C arrête la commande (et ce qu'elle a lancé), `cls`, `exit` ; pas de programmes plein écran : « Ouvrir dans le Terminal » pour ceux-là) |
+| **Aperçu du code avec coloration** | Volet d'aperçu rapide pour le texte et le code | ✅ P2 ⭐ (bloc 31 : volet d'aperçu ; mots-clés, chaînes, commentaires, nombres, directives, balises ; C/C++, C#, Java/Kotlin/Swift, JS/TS, Go, Rust, Python, PowerShell, shell, SQL, Lua, JSON, XML/HTML, INI, YAML, fichiers de commandes, diff ; rendu RTF calculé hors de l'interface) |
+| **Hash et vérification** | MD5/SHA-256 dans les propriétés ou le menu | ✅ P3 ⭐ (bloc 31 : « ··· » ou palette ▸ Empreintes ; coller l'empreinte publiée pour comparer (✓ / ✗) ; copier SHA-256 ou tout) |
 | **Comparaison de dossiers** | Différences entre deux dossiers, synchronisation | P3 ⭐ |
 | **Sessions / espaces de travail** | Ensembles d'onglets nommés, restaurés en un clic | ✅ P2 ⭐ (bloc 26 : « ··· » ▸ Sessions : enregistrer les onglets sous un nom, rouvrir, supprimer) |
 | **Signets** | Favoris de dossiers avec raccourcis clavier | ✅ P2 ⭐ (bloc 26 : Alt+Maj+1…9 range le dossier, Alt+1…9 y va ; « ··· » ▸ Signets) |
@@ -658,7 +660,7 @@ P2, en blocs (dans cet ordre) :
 29. ✅ **Recherche** : syntaxe AQS, recherches récentes, contenu des fichiers (index Windows Search).
 30. ✅ **Cloud et lecteurs** : états de synchronisation, monter ISO / VHD, formater, renommer un volume,
     appareils MTP, propriétés de la Corbeille.
-31. **Productivité** ⭐ : palette de commandes, raccourcis personnalisables, terminal intégré, aperçu du code
+31. ✅ **Productivité** ⭐ : palette de commandes, raccourcis personnalisables, terminal intégré, aperçu du code
     coloré, panneau rapide (empreintes).
 32. **Intégrations** : Git ⭐, WSL ⭐, découverte du réseau, Galerie, remplacer l'Explorateur par défaut.
 
