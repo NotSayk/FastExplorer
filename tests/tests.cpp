@@ -41,6 +41,8 @@
 #include "paths.h"
 #include "shellns.h"
 #include "vdisk.h"
+#include "defexp.h"
+#include "git.h"
 #include "hashes.h"
 #include "palette.h"
 #include "syntax.h"
@@ -1661,6 +1663,133 @@ void TestProductivity() {
     CHECK(colored.find("\\cf2 int\\cf1 ") != std::string::npos);
 }
 
+// Bloc 32 : Git, Galerie, Linux, découverte du réseau, explorateur par défaut.
+void TestIntegrations() {
+    // État Git : analyse de la sortie de « git status --porcelain=v1 -z -b ».
+    {
+        const char raw[] = "## main...origin/main [ahead 1]\0 M src/a.cpp\0?? new.txt\0!! build/\0R  b.txt\0a.txt\0UU c.txt\0 D gone.txt\0"
+                           "A  src/deep/n.h\0";
+        GitStatus st;
+        st.root = L"C:\\repo";
+        st.ok = true;
+        Git_ParseStatus(std::string(raw, sizeof raw - 1), st);
+        CHECK_STR(st.branch, L"main");
+        CHECK(st.files.size() == 7 && st.files[L"src\\a.cpp"] == L'M' && st.files[L"new.txt"] == L'?' &&
+              st.files[L"build\\"] == L'!' && st.files[L"b.txt"] == L'R' && st.files[L"c.txt"] == L'U' &&
+              st.files[L"gone.txt"] == L'D' && !st.files.count(L"a.txt"));
+        auto top = Git_FolderStates(st, L"C:\\repo");
+        CHECK(top[L"src"] == L'm' && top[L"new.txt"] == L'?' && top[L"build"] == L'!' && top.size() == 6);
+        auto src = Git_FolderStates(st, L"C:\\Repo\\src\\");
+        CHECK(src.size() == 2 && src[L"a.cpp"] == L'M' && src[L"deep"] == L'm');
+        auto inIgnored = Git_FolderStates(st, L"C:\\repo\\build\\obj");
+        CHECK(inIgnored.size() == 1 && inIgnored[L"*"] == L'!');
+        CHECK(Git_FolderStates(st, L"D:\\autre").empty());
+        CHECK_STR(Git_StateText(L'?'), L"Non suivi");
+        GitStatus det;
+        Git_ParseStatus(std::string("## HEAD (no branch)\0", 20), det);
+        CHECK_STR(det.branch, L"(détachée)");
+        GitStatus fresh;
+        Git_ParseStatus(std::string("## No commits yet on dev\0", 25), fresh);
+        CHECK_STR(fresh.branch, L"dev");
+    }
+    ColSpec gc;
+    CHECK(Columns_FromId(L"git", gc) && gc.key == COL_GIT);
+    // Vrai dépôt (si git est installé) : état, branches, changement de branche.
+    if (Git_Available()) {
+        const std::wstring repo = Join(g_root, L"depot git"), sub = Join(repo, L"sous");
+        CreateDirectoryW(repo.c_str(), nullptr);
+        CreateDirectoryW(sub.c_str(), nullptr);
+        std::string out, err;
+        DWORD code = 0;
+        CHECK(Git_Run(repo, L"init -q -b principale", out, err, code) && code == 0);
+        auto write = [](const std::wstring& f, const char* text) {
+            HANDLE h = CreateFileW(f.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            DWORD w = 0;
+            WriteFile(h, text, (DWORD)strlen(text), &w, nullptr);
+            CloseHandle(h);
+        };
+        write(Join(repo, L"suivi.txt"), "a");
+        write(Join(sub, L"été.txt"), "b");
+        write(Join(repo, L".gitignore"), "*.log\n");
+        CHECK(Git_Run(repo, L"add -A", out, err, code) && code == 0);
+        CHECK(Git_Run(repo, L"-c user.name=t -c user.email=t@t commit -q -m init", out, err, code) && code == 0);
+        write(Join(repo, L"suivi.txt"), "changé");
+        write(Join(repo, L"nouveau.txt"), "n");
+        write(Join(repo, L"trace.log"), "l");
+        CHECK_STRI(Git_FindRoot(sub), repo);
+        CHECK(Git_FindRoot(g_root).empty());
+        const double t0 = NowMs();
+        const GitStatus st = Git_Status(repo);
+        printf("  git status : %zu entree(s) en %.0f ms\n", st.files.size(), NowMs() - t0);
+        CHECK(st.ok && st.branch == L"principale");
+        auto f = Git_FolderStates(st, repo);
+        CHECK(f[L"suivi.txt"] == L'M' && f[L"nouveau.txt"] == L'?' && f[L"trace.log"] == L'!' && !f.count(L"sous"));
+        CHECK(Git_Run(repo, L"branch autre", out, err, code) && code == 0);
+        const auto br = Git_Branches(repo);
+        CHECK(br.size() == 2 && std::find(br.begin(), br.end(), L"autre") != br.end());
+        std::wstring msg;
+        CHECK(Git_Switch(repo, L"autre", msg) == 0);
+        CHECK(Git_Status(repo).branch == L"autre");
+        CHECK(Git_Switch(repo, L"absente", msg) != 0 && !msg.empty());
+    }
+    // Galerie.
+    CHECK(Gallery_IsImage(L"a.JPG") && Gallery_IsImage(L"b.heic") && !Gallery_IsImage(L"c.txt") && !Gallery_IsImage(L"jpg"));
+    {
+        const std::wstring g = Join(g_root, L"galerie"), deep = Join(g, L"2026\\vacances"), hid = Join(g, L"cache");
+        SHCreateDirectoryExW(nullptr, deep.c_str(), nullptr);
+        CreateDirectoryW(hid.c_str(), nullptr);
+        SetFileAttributesW(hid.c_str(), FILE_ATTRIBUTE_HIDDEN);
+        for (const auto& f : {Join(g, L"a.jpg"), Join(deep, L"b.png"), Join(deep, L"notes.txt"), Join(hid, L"c.jpg")}) {
+            HANDLE h = CreateFileW(f.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            CloseHandle(h);
+        }
+        DirData d;
+        d.path = kGalleryPath;
+        Gallery_EnumerateFrom(d, {g, deep}, {}, 100);  // racine imbriquée : pas de doublon
+        CHECK(d.entries.size() == 2 && d.target.size() == 2 && d.origin.size() == 2);
+        bool deepSeen = false;
+        for (size_t i = 0; i < d.entries.size(); ++i) deepSeen |= d.target[i] == Join(deep, L"b.png") && d.origin[i] == deep;
+        CHECK(deepSeen);
+        DirData one;
+        Gallery_EnumerateFrom(one, {g}, {}, 1);
+        CHECK(one.entries.size() == 1 && one.truncated);
+    }
+    // Linux (WSL).
+    {
+        const wchar_t w16[] = L"Ubuntu\r\ndocker-desktop\r\n";
+        CHECK(Linux_ParseList(std::string((const char*)w16, sizeof w16 - sizeof(wchar_t))) ==
+              std::vector<std::wstring>({L"Ubuntu", L"docker-desktop"}));
+        CHECK(Linux_ParseList("Debian\n") == std::vector<std::wstring>({L"Debian"}));
+        CHECK(Linux_ParseList("").empty());
+        DirData d;
+        const double t0 = NowMs();
+        Linux_Enumerate(d);
+        printf("  Linux : %zu distribution(s) en %.0f ms\n", d.entries.size(), NowMs() - t0);
+        CHECK(d.entries.size() == Linux_Distributions().size() && d.target.size() == d.entries.size());
+        if (!d.entries.empty()) CHECK(d.target[0].rfind(L"\\\\wsl.localhost\\", 0) == 0 && !d.origin[0].empty());
+    }
+    CHECK(Places_FromAlias(L"Galerie") == kGalleryPath && Places_FromAlias(L"WSL") == kLinuxPath &&
+          Places_FromAlias(L"\\\\wsl$") == kLinuxPath);
+    CHECK(wcscmp(Places_Title(kGalleryPath), L"Galerie") == 0 && wcscmp(Places_Title(kLinuxPath), L"Linux") == 0);
+    // Découverte du réseau : une à la fois, finit.
+    {
+        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        const double t0 = NowMs();
+        CHECK(Net_Discover([ev](size_t) { SetEvent(ev); }));
+        CHECK(!Net_Discover({}));
+        const bool done = WaitForSingleObject(ev, 30000) == WAIT_OBJECT_0;
+        printf("  decouverte du reseau : %zu ordinateur(s) en %.0f ms\n", Net_Discovered().size(), NowMs() - t0);
+        CHECK(done);
+        CloseHandle(ev);
+        DirData d;
+        Net_EnumServers(d);
+        size_t found = 0;
+        for (const auto& o : d.origin) found += o == L"Découvert sur le réseau";
+        CHECK(found <= Net_Discovered().size());
+    }
+    CHECK_STR(DefExp_Command(L"C:\\x y\\FastExplorer.exe"), L"\"C:\\x y\\FastExplorer.exe\" \"%1\"");
+}
+
 void TestDevices() {
     // Disponibilité des fichiers cloud : d'après les attributs seulement.
     CHECK(SyncState(FILE_ATTRIBUTE_ARCHIVE, false) == 0 && SyncState(FILE_ATTRIBUTE_ARCHIVE, true) == 2);
@@ -2751,6 +2880,7 @@ int wmain() {
     TestAqs();
     TestDevices();
     TestProductivity();
+    TestIntegrations();
     TestFastCopy();
     TestFileOps();
     TestBatchRename();

@@ -11,6 +11,8 @@
 #include "dragdrop.h"
 #include "fileops.h"
 #include "foldersize.h"
+#include "defexp.h"
+#include "git.h"
 #include "groups.h"
 #include "hashes.h"
 #include "icons.h"
@@ -71,6 +73,8 @@ constexpr UINT WM_APP_RECLAIM = WM_APP + 7;     // reprendre le premier plan au 
 constexpr UINT WM_APP_SHELLNOTIFY = WM_APP + 8; // lecteur ou média ajouté / retiré (SHChangeNotifyRegister)
 constexpr UINT WM_APP_NAV = WM_APP + 9;         // résultat d'une lecture du volet de navigation
 constexpr UINT WM_APP_PASSIVE = WM_APP + 19;    // double panneau : contenu relu du panneau inactif (lParam = DirData*)
+constexpr UINT WM_APP_GIT = WM_APP + 22;       // état Git lu (lParam = GitResult*) ; wParam 1 : git switch fini (std::wstring*)
+constexpr UINT WM_APP_NETFOUND = WM_APP + 23;  // découverte du réseau finie (wParam = ordinateurs nouveaux)
 constexpr UINT WM_APP_CMDMENU = WM_APP + 60;  // menu d'un bouton de la barre de commandes
 constexpr UINT WM_APP_SELSUM = WM_APP + 10;     // sélection changée : résumé dans la barre d'état (une fois par rafale)
 constexpr UINT WM_APP_TABEDIT = WM_APP + 11;    // Tab pendant un renommage : renommer l'élément suivant
@@ -104,7 +108,7 @@ constexpr size_t kSyncSortMax = 20000;  // au-delà, le re-tri part en arrière-
 constexpr double kWatchMinDelayMs = 150, kWatchMaxDelayMs = 2000;
 
 enum { ID_BACK = 100, ID_FWD, ID_UP, ID_ADDR, ID_LIST, ID_STATUS, ID_NAV, ID_CRUMBS, ID_SEARCH, ID_REFRESH, ID_TABS, ID_PANE, ID_LIST2, ID_HDR0, ID_HDR1, ID_CMDBAR, ID_TERM,
-       CMD_NEW = 300, CMD_CUT, CMD_COPY, CMD_PASTE, CMD_RENAME, CMD_DELETE, CMD_SORT, CMD_VIEW, CMD_MORE };
+       CMD_NEW = 300, CMD_CUT, CMD_COPY, CMD_PASTE, CMD_RENAME, CMD_DELETE, CMD_SORT, CMD_VIEW, CMD_MORE, CMD_GIT };
 enum class Nav { Normal, Back, Forward, Refresh };
 enum class JobKind { Navigate, Sort };
 
@@ -186,6 +190,17 @@ bool g_splitDrag = false;      // séparateur volet / liste en cours de déplace
 RECT g_split{};                // zone du séparateur (coordonnées client)
 HWND g_pane;                   // volet de droite : aperçu ou détails
 HWND g_term = nullptr;            // terminal intégré (Ctrl+ù), en bas
+// Dépôt Git du dossier affiché : branche et état de ses éléments (nom en minuscules → code, « * » : tous).
+struct GitView {
+    bool on = false;
+    std::wstring dir, root, branch;
+    std::map<std::wstring, wchar_t> states;
+} g_git;
+uint64_t g_gitSeq = 0;
+void GitRefresh();
+bool GitShown();
+std::wstring GitStateOf(int idx);
+void DiscoverNetwork();
 int g_paneW96 = 320;           // sa largeur (à 96 ppp)
 bool g_paneDrag = false;
 RECT g_paneSplit{};            // séparateur liste / volet
@@ -1256,6 +1271,7 @@ void FillDispInfo(LVITEMW& it) {
                 wcsncpy_s(out, cch,
                           g_view.data->server            ? L"Partage réseau"
                           : g_view.data->path == kNetPath ? L"Ordinateur"
+                          : g_view.data->path == kLinuxPath ? L"Distribution Linux"
                                                           : L"Dossier de fichiers",
                           _TRUNCATE);
             else if (e.extOff + 1 < e.nameLen) {
@@ -1277,6 +1293,9 @@ void FillDispInfo(LVITEMW& it) {
             break;
         case COL_SYNC:
             if (!root) wcsncpy_s(out, cch, SyncText(SyncState(e.attr, g_view.data->cloud)), _TRUNCATE);
+            break;
+        case COL_GIT:
+            if (!root) wcsncpy_s(out, cch, GitStateOf(idx).c_str(), _TRUNCATE);
             break;
         case COL_ORIGIN:
             if ((size_t)idx < g_view.data->origin.size())
@@ -1309,6 +1328,13 @@ std::vector<ColSpec> VirtualColumns(const std::wstring& path) {
     v[0].width96 = 300;
     if (path == kBinPath) {
         v[2].title = L"Date de suppression";
+    } else if (path == kGalleryPath) {  // photos : date, dossier, taille
+        v = {v[0], v[2], v[1], v[3], v[4]};
+        v[2].title = L"Dossier";
+    } else if (path == kLinuxPath) {  // distributions WSL
+        v = {v[0], v[1], v[4]};
+        v[1].title = L"État";
+        v[1].width96 = 140;
     } else if (path == kNetPath) {  // serveurs connus
         v = {v[0], v[1], v[2], v[4]};
         v[1].title = L"Lecteurs réseau";
@@ -1407,6 +1433,14 @@ void ApplyColumns(std::vector<ColSpec> cols) {
 }
 
 // Dossier OneDrive, Dropbox… : la colonne Disponibilité après le nom, si elle n'est pas déjà là.
+// Dossier d'un dépôt Git : la colonne Git après le nom.
+std::vector<ColSpec> WithGitColumn(std::vector<ColSpec> v) {
+    for (const auto& c : v)
+        if (c.key == COL_GIT) return v;
+    v.insert(v.begin() + (v.empty() ? 0 : 1), Columns_Builtin(COL_GIT));
+    return v;
+}
+
 std::vector<ColSpec> WithSyncColumn(std::vector<ColSpec> v) {
     for (const auto& c : v)
         if (c.key == COL_SYNC) return v;
@@ -1417,13 +1451,14 @@ std::vector<ColSpec> WithSyncColumn(std::vector<ColSpec> v) {
 // Ce PC ↔ dossier : colonnes à changer ?
 void UpdateColumnsForView() {
     const bool root = HasView() && g_view.data->isRoot();
-    const std::vector<ColSpec> want = root                               ? RootColumns()
+    std::vector<ColSpec> want = root                               ? RootColumns()
                                       : InShellNs()                        ? ShellNsColumns()
                                       : InVirtual()                        ? VirtualColumns(g_view.data->path)
                                       : HasView() && g_view.data->inArchive() ? ArchiveColumns()
                                       : HasView() && g_view.data->server      ? ServerColumns()
                                       : HasView() && g_view.data->cloud       ? WithSyncColumn(g_folderCols)
                                                                            : g_folderCols;
+    if (GitShown()) want = WithGitColumn(std::move(want));
     if (ColumnsKey(want) != ColumnsKey(CurrentColumns())) ApplyColumns(want);
 }
 
@@ -1615,6 +1650,12 @@ FolderView ViewFor(const std::wstring& path) {
         v.sort = Columns_Builtin(COL_DATE);
         v.asc = false;
     }
+    if (path == kGalleryPath) {  // Galerie : grandes miniatures, regroupées par date
+        v.mode = VM_ICONS;
+        v.px = 96;
+        v.group = COL_DATE;
+    }
+    if (path == kLinuxPath) v.sort = Columns_Builtin(COL_NAME), v.asc = true;
     return v;
 }
 
@@ -2000,6 +2041,10 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
             Home_Enumerate(*d, pins, ct);
         } else if (path == kNetPath) {
             Net_EnumServers(*d, ct);
+        } else if (path == kGalleryPath) {
+            Gallery_Enumerate(*d, ct);
+        } else if (path == kLinuxPath) {
+            Linux_Enumerate(*d, ct);
         } else if (Net_IsServerPath(path)) {
             Net_EnumShares(*d, ct);  // « \\serveur » : ses partages
         } else if (ShellNs_IsPath(path)) {
@@ -2477,6 +2522,8 @@ void OnResult(Result* raw) {
     g_path = d.path;
     g_query = d.query;
     Term_SetDir(g_path);  // le terminal intégré suit le dossier
+    GitRefresh();         // dépôt Git : branche et état des fichiers
+    if (g_path == kNetPath && g_query.empty()) DiscoverNetwork();
     if (g_query.empty() && g_filter.empty() && GetWindowTextLengthW(g_searchBox) &&
         (GetFocus() != g_searchBox || p.nav != Nav::Refresh)) {
         g_searchSync = true;  // sorti de la recherche (autre dossier) : zone vidée
@@ -4312,6 +4359,8 @@ void ReloadPassive() {
         if (path == kBinPath) Recycle_Enumerate(*d);
         else if (path == kHomePath) Home_Enumerate(*d, pins);
         else if (path == kNetPath) Net_EnumServers(*d);
+        else if (path == kGalleryPath) Gallery_Enumerate(*d);
+        else if (path == kLinuxPath) Linux_Enumerate(*d);
         else if (Net_IsServerPath(path)) Net_EnumShares(*d);
         else if (std::wstring arc, inner; Archive_Split(path, arc, inner)) Archive_Enumerate(*d);
         else Enumerate(*d);
@@ -5403,6 +5452,8 @@ bool TerminalShown();
 void ShowHashes();
 void ShowPalette();
 void EditKeys();
+void ToggleDefaultExplorer();
+std::vector<MenuExtra> GitMenu();
 
 std::vector<MenuExtra> MoreItems() {
     const bool view = HasView();
@@ -5456,6 +5507,7 @@ std::vector<MenuExtra> MoreItems() {
     v.push_back({});
     v.push_back({L"Vérifier les copies (relire et comparer)", [] { SetVerifyCopies(!FileOps_Verify()); }, false,
                  FileOps_Verify()});
+    v.push_back({L"Ouvrir les dossiers et Win+E avec FastExplorer", ToggleDefaultExplorer, false, DefExp_IsOn()});
     return v;
 }
 
@@ -5494,6 +5546,8 @@ std::vector<PaletteItem> Commands() {
     add(L"Aller ▸ Ce PC", L"", [] { Navigate(L"", Nav::Normal); });
     add(L"Aller ▸ Réseau", L"", [] { Navigate(kNetPath, Nav::Normal); });
     add(L"Aller ▸ Corbeille", L"", [] { Navigate(kBinPath, Nav::Normal); });
+    add(L"Aller ▸ Galerie", L"", [] { Navigate(kGalleryPath, Nav::Normal); });
+    add(L"Aller ▸ Linux", L"", [] { Navigate(kLinuxPath, Nav::Normal); });
     const std::pair<const KNOWNFOLDERID*, const wchar_t*> known[] = {{&FOLDERID_Desktop, L"Aller ▸ Bureau"},
                                                                      {&FOLDERID_Downloads, L"Aller ▸ Téléchargements"},
                                                                      {&FOLDERID_Documents, L"Aller ▸ Documents"},
@@ -5525,6 +5579,7 @@ std::vector<PaletteItem> Commands() {
     FlattenMenu(v, L"Afficher ▸ ", DisplayItems());
     FlattenMenu(v, L"Trier par ▸ ", SortMenu().sub);
     FlattenMenu(v, L"Regrouper par ▸ ", GroupMenu().sub);
+    if (GitShown()) FlattenMenu(v, L"Git ▸ ", GitMenu());
     // « Plus » : sans préfixe, sans ce qui est déjà au-dessus.
     std::vector<PaletteItem> more;
     FlattenMenu(more, L"", MoreItems());
@@ -5594,6 +5649,153 @@ bool RunUserKey(const MSG& m) {
     return false;
 }
 
+// ───────────────────────────── Bloc 32 : Git, réseau, explorateur par défaut ─────────────────────────────
+
+struct GitResult {
+    uint64_t seq = 0;
+    std::wstring dir, root, branch;
+    std::map<std::wstring, wchar_t> states;
+    bool ok = false;
+};
+bool g_gitBusy = false, g_gitAgain = false;
+
+bool GitShown() { return g_git.on && HasView() && _wcsicmp(g_git.dir.c_str(), g_path.c_str()) == 0; }
+
+std::wstring GitStateOf(int idx) {
+    if (!GitShown()) return L"";
+    if (const auto all = g_git.states.find(L"*"); all != g_git.states.end()) return Git_StateText(all->second);
+    std::wstring n = NameOf(idx);
+    CharLowerBuffW(n.data(), (DWORD)n.size());
+    const auto it = g_git.states.find(n);
+    return it == g_git.states.end() ? L"" : Git_StateText(it->second);
+}
+
+void UpdateGitButton() {
+    if (!g_cmdBar) return;
+    const bool show = GitShown();
+    SendMessageW(g_cmdBar, TB_HIDEBUTTON, CMD_GIT, MAKELONG(show ? FALSE : TRUE, 0));
+    if (!show) return;
+    const std::wstring text = L"Git : " + g_git.branch;
+    TBBUTTONINFOW bi{sizeof bi};
+    bi.dwMask = TBIF_TEXT | TBIF_SIZE;
+    bi.pszText = (LPWSTR)text.c_str();
+    SIZE sz{};
+    if (HDC dc = GetDC(g_cmdBar)) {
+        HGDIOBJ old = SelectObject(dc, g_font);
+        GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &sz);
+        SelectObject(dc, old);
+        ReleaseDC(g_cmdBar, dc);
+    }
+    bi.cx = (WORD)(sz.cx + S(18) + S(14));
+    SendMessageW(g_cmdBar, TB_SETBUTTONINFOW, CMD_GIT, (LPARAM)&bi);
+}
+
+// État Git du dossier affiché, lu sur un thread (git status) ; une lecture à la fois.
+void GitRefresh() {
+    const bool real = HasView() && !g_path.empty() && !InVirtual() && !g_view.data->listOnly() && g_query.empty() &&
+                      g_path.size() >= 3 && (g_path[1] == L':' || (g_path[0] == L'\\' && g_path[1] == L'\\'));
+    if (!real || !Git_Available()) {
+        ++g_gitSeq;
+        if (g_git.on) {
+            g_git = {};
+            UpdateColumnsForView();
+            UpdateGitButton();
+        }
+        return;
+    }
+    if (g_gitBusy) {
+        g_gitAgain = true;
+        return;
+    }
+    g_gitBusy = true;
+    const uint64_t seq = ++g_gitSeq;
+    std::thread([dir = g_path, seq, hwnd = g_hwnd] {
+        auto* r = new GitResult;
+        r->seq = seq;
+        r->dir = dir;
+        r->root = Git_FindRoot(dir);
+        if (!r->root.empty()) {
+            const GitStatus st = Git_Status(r->root);
+            if (st.ok) {
+                r->branch = st.branch;
+                r->states = Git_FolderStates(st, dir);
+                r->ok = true;
+            }
+        }
+        if (!PostMessageW(hwnd, WM_APP_GIT, 0, (LPARAM)r)) delete r;
+    }).detach();
+}
+
+void OnGitResult(std::unique_ptr<GitResult> r) {
+    g_gitBusy = false;
+    if (g_gitAgain) {
+        g_gitAgain = false;
+        GitRefresh();
+        return;
+    }
+    if (r->seq != g_gitSeq) return;
+    const bool was = GitShown();
+    g_git.on = r->ok;
+    g_git.dir = r->dir;
+    g_git.root = r->root;
+    g_git.branch = r->branch;
+    g_git.states = std::move(r->states);
+    if (was != GitShown()) UpdateColumnsForView();
+    UpdateGitButton();
+    ListRedraw(false);
+}
+
+void GitSwitchTo(const std::wstring& branch) {
+    const std::wstring root = g_git.root;
+    SetStatus(L"git switch " + branch + L"…");
+    std::thread([root, branch, hwnd = g_hwnd] {
+        std::wstring msg;
+        const DWORD code = Git_Switch(root, branch, msg);
+        auto* text = new std::wstring(code == 0 ? L"Branche « " + branch + L" »" : L"git switch : " + msg);
+        if (!PostMessageW(hwnd, WM_APP_GIT, 1, (LPARAM)text)) delete text;
+    }).detach();
+}
+
+std::vector<MenuExtra> GitMenu() {
+    std::vector<MenuExtra> v;
+    if (!GitShown()) return v;
+    for (const auto& b : Git_Branches(g_git.root)) {
+        const std::wstring name = b;
+        v.push_back({MenuText(name), [name] { GitSwitchTo(name); }, false, name == g_git.branch});
+    }
+    if (v.empty()) v.push_back({L"Aucune branche", nullptr, false, false, {}, true});
+    v.push_back({});
+    v.push_back({L"Actualiser l'état Git", GitRefresh});
+    v.push_back({L"Ouvrir le dépôt", [] { Navigate(g_git.root, Nav::Normal); }, false, false, {},
+                 _wcsicmp(g_git.root.c_str(), g_path.c_str()) == 0});
+    return v;
+}
+
+// Réseau : découverte des ordinateurs (au plus une par minute), ajoutés à la liste quand ils arrivent.
+void DiscoverNetwork() {
+    static ULONGLONG last = 0;
+    if (last && GetTickCount64() - last < 60000) return;
+    last = GetTickCount64();
+    HWND hwnd = g_hwnd;
+    Net_Discover([hwnd](size_t added) { PostMessageW(hwnd, WM_APP_NETFOUND, added, 0); });
+}
+
+std::wstring ExePath() {
+    wchar_t buf[MAX_PATH * 2] = {};
+    GetModuleFileNameW(nullptr, buf, (DWORD)std::size(buf));
+    return buf;
+}
+
+void ToggleDefaultExplorer() {
+    const bool on = !DefExp_IsOn();
+    if (const LSTATUS r = DefExp_Set(on, ExePath())) {
+        Flash(L"Réglage impossible (erreur " + std::to_wstring(r) + L")");
+        return;
+    }
+    Flash(on ? L"FastExplorer ouvre désormais les dossiers, les lecteurs et Win+E"
+             : L"L'Explorateur de Windows ouvre de nouveau les dossiers et Win+E");
+}
+
 // Boutons de la barre : identifiant, texte, info-bulle, menu déroulant.
 struct CmdButton {
     int id;
@@ -5613,6 +5815,7 @@ constexpr CmdButton kCmdButtons[] = {
     {CMD_SORT, L"Trier", L"Trier les éléments", true},
     {CMD_VIEW, L"Afficher", L"Disposition et options d'affichage", true},
     {CMD_MORE, L"···", L"Voir plus", true},
+    {CMD_GIT, L"Git", L"Branche Git du dossier : changer de branche, actualiser l'état", true},  // dans un dépôt seulement
 };
 
 void UpdateCommandBar();
@@ -5662,6 +5865,7 @@ void FillCommandBar() {
         SelectObject(dc, old);
         ReleaseDC(g_cmdBar, dc);
     }
+    UpdateGitButton();
     SendMessageW(g_cmdBar, TB_AUTOSIZE, 0, 0);
     UpdateCommandBar();
 }
@@ -5681,6 +5885,7 @@ void UpdateCommandBar() {
     on(CMD_SORT, HasView());
     on(CMD_VIEW, true);
     on(CMD_MORE, true);
+    on(CMD_GIT, true);
 }
 
 int CommandBarHeight() {
@@ -5718,6 +5923,7 @@ void OnCommandDropdown(int id) {
             break;
         case CMD_VIEW: items = DisplayItems(); break;
         case CMD_MORE: items = MoreItems(); break;
+        case CMD_GIT: items = GitMenu(); break;
         default: return;
     }
     SendMessageW(g_cmdBar, TB_PRESSBUTTON, id, MAKELONG(TRUE, 0));
@@ -6531,6 +6737,7 @@ void CreateChildren(HWND hwnd) {
             if (p) CoTaskMemFree(p);
         };
         r.push_back({L"Accueil", kHomePath});
+        r.push_back({L"Galerie", kGalleryPath});
         known(FOLDERID_Desktop, L"Bureau");
         known(FOLDERID_Profile, nullptr);
         r.push_back({L"Ce PC", L""});
@@ -6705,6 +6912,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case WM_APP_INDEXDONE: OnIndexDone((DWORD)wp, lp != 0); return 0;
         case WM_APP_MOUNTED: OnMounted((DWORD)wp, std::unique_ptr<MountResult>((MountResult*)lp)); return 0;
+        case WM_APP_GIT:
+            if (wp == 1) {  // git switch fini
+                std::unique_ptr<std::wstring> text((std::wstring*)lp);
+                Flash(*text);
+                Refresh();
+            } else {
+                OnGitResult(std::unique_ptr<GitResult>((GitResult*)lp));
+            }
+            return 0;
+        case WM_APP_NETFOUND:
+            if (wp && HasView() && g_path == kNetPath && g_query.empty()) Refresh();
+            return 0;
         case WM_APP_SHELLDONE: {
             std::unique_ptr<std::wstring> folder((std::wstring*)lp);
             if (HasView() && _wcsicmp(folder->c_str(), g_path.c_str()) == 0) Refresh();

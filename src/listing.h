@@ -10,7 +10,7 @@
 #include <vector>
 
 // Clés de tri. COL_PROP : propriété du Shell, valeurs fournies à SortOrder (PropValues).
-enum Col { COL_NAME, COL_SIZE, COL_TYPE, COL_DATE, COL_CTIME, COL_ATIME, COL_ATTR, COL_ORIGIN, COL_SYNC, COL_COUNT, COL_PROP = 100 };
+enum Col { COL_NAME, COL_SIZE, COL_TYPE, COL_DATE, COL_CTIME, COL_ATIME, COL_ATTR, COL_ORIGIN, COL_SYNC, COL_GIT, COL_COUNT, COL_PROP = 100 };
 
 struct Entry {
     uint32_t nameOff;  // offset dans DirData::pool (nom terminé par \0)
@@ -105,6 +105,8 @@ std::vector<DriveInfo> QueryDrives(const std::vector<std::wstring>& roots, DWORD
 // Emplacements virtuels.
 inline constexpr const wchar_t* kBinPath = L"::bin";
 inline constexpr const wchar_t* kHomePath = L"::home";
+inline constexpr const wchar_t* kGalleryPath = L"::gallery";  // Galerie : les photos d'Images, par date
+inline constexpr const wchar_t* kLinuxPath = L"::linux";      // Linux : distributions WSL
 inline bool IsVirtualPath(const std::wstring& p) { return p.size() > 2 && p[0] == L':' && p[1] == L':'; }
 
 // Lit le dossier (ou les lecteurs si d.path est vide) et calcule les clés de tri.

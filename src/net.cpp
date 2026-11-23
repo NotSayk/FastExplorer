@@ -3,11 +3,17 @@
 #include "util.h"
 
 #include <lm.h>
+#include <objbase.h>
+#include <shlobj.h>
+#include <shobjidl.h>
 #include <winnetwk.h>
 
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <mutex>
+#include <set>
+#include <thread>
 #include <vector>
 
 #pragma comment(lib, "netapi32.lib")
@@ -36,6 +42,10 @@ struct Known {
     int64_t last = 0;     // dernière visite (0 : jamais, lecteur connecté seulement)
     std::vector<std::wstring> drives;
 };
+
+std::mutex g_discoLock;
+std::set<std::wstring> g_discovered;  // « \\PC » vus par la découverte du réseau (le temps de la session)
+bool g_discovering = false;
 
 // Serveurs mémorisés : une valeur REG_QWORD par serveur (nom = « \\serveur »).
 void ReadRemembered(std::map<std::wstring, Known>& out) {
@@ -140,6 +150,12 @@ void Net_EnumServers(DirData& d, const CancelToken& ct) {
     ReadDrives(known, RESOURCE_CONNECTED);
     if (ct.cancelled()) return;
     ReadDrives(known, RESOURCE_REMEMBERED);
+    std::set<std::wstring> seen;  // découverts sur le réseau, pas encore visités
+    {
+        std::lock_guard<std::mutex> l(g_discoLock);
+        for (const auto& srv : g_discovered)
+            if (!known.count(Lower(srv))) seen.insert(Lower(srv)), known[Lower(srv)].server = srv;
+    }
     for (auto& [key, k] : known) {
         std::sort(k.drives.begin(), k.drives.end());
         std::wstring drives;
@@ -147,7 +163,9 @@ void Net_EnumServers(DirData& d, const CancelToken& ct) {
         const std::wstring name = k.server.substr(2);
         DirData_Add(d, name.c_str(), (uint32_t)name.size(), FILE_ATTRIBUTE_DIRECTORY, 0, k.last);
         d.target.push_back(k.server);
-        d.origin.push_back(drives.empty() ? std::wstring() : (k.drives.size() > 1 ? L"Lecteurs " : L"Lecteur ") + drives);
+        d.origin.push_back(!drives.empty() ? (k.drives.size() > 1 ? L"Lecteurs " : L"Lecteur ") + drives
+                           : seen.count(key)  ? L"Découvert sur le réseau"
+                                              : std::wstring());
     }
     const double t1 = Ms();
     DirData_BuildKeys(d);
@@ -239,4 +257,45 @@ std::wstring Net_ErrorText(DWORD e) {
         return r;
     }
     return ErrorText(e);
+}
+
+bool Net_Discover(std::function<void(size_t)> done) {
+    {
+        std::lock_guard<std::mutex> l(g_discoLock);
+        if (g_discovering) return false;
+        g_discovering = true;
+    }
+    std::thread([done = std::move(done)] {
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        std::set<std::wstring> found;
+        IShellItem* net = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderItem(FOLDERID_NetworkFolder, KF_FLAG_DEFAULT, nullptr, IID_PPV_ARGS(&net)))) {
+            IEnumShellItems* en = nullptr;
+            if (SUCCEEDED(net->BindToHandler(nullptr, BHID_EnumItems, IID_PPV_ARGS(&en))) && en) {
+                IShellItem* it = nullptr;
+                while (en->Next(1, &it, nullptr) == S_OK) {
+                    PWSTR p = nullptr;
+                    if (SUCCEEDED(it->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &p)) && p && Net_IsServerPath(p)) found.insert(p);
+                    CoTaskMemFree(p);
+                    it->Release();
+                }
+                en->Release();
+            }
+            net->Release();
+        }
+        if (SUCCEEDED(co)) CoUninitialize();
+        size_t added = 0;
+        {
+            std::lock_guard<std::mutex> l(g_discoLock);
+            for (const auto& f : found) added += g_discovered.insert(f).second;
+            g_discovering = false;
+        }
+        if (done) done(added);
+    }).detach();
+    return true;
+}
+
+std::vector<std::wstring> Net_Discovered() {
+    std::lock_guard<std::mutex> l(g_discoLock);
+    return {g_discovered.begin(), g_discovered.end()};
 }

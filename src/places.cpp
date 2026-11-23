@@ -216,6 +216,8 @@ const wchar_t* Places_Title(const std::wstring& path) {
     if (path == kBinPath) return L"Corbeille";
     if (path == kHomePath) return L"Accueil";
     if (path == L"::net") return L"Réseau";
+    if (path == kGalleryPath) return L"Galerie";
+    if (path == kLinuxPath) return L"Linux";
     return L"";
 }
 
@@ -230,6 +232,10 @@ std::wstring Places_FromAlias(const std::wstring& text) {
     if (t == L"::net" || t == L"réseau" || t == L"network" || t == L"shell:networkplacesfolder" ||
         t == L"shell:::{f02c1a0d-be21-4350-88b0-7367fc96ef3c}")
         return L"::net";
+    if (t == L"::gallery" || t == L"galerie" || t == L"gallery" || t == L"shell:::{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}")
+        return kGalleryPath;
+    if (t == L"::linux" || t == L"linux" || t == L"wsl" || t == L"\\\\wsl.localhost" || t == L"\\\\wsl$")
+        return kLinuxPath;
     return L"";
 }
 
@@ -279,4 +285,160 @@ void Places_RememberTyped(const std::wstring& text) {
     multi += L'\0';
     RegSetKeyValueW(HKEY_CURRENT_USER, kTypedKey, kTypedValue, REG_MULTI_SZ, multi.data(),
                     (DWORD)(multi.size() * sizeof(wchar_t)));
+}
+
+// ───────────────────────────── Galerie ─────────────────────────────
+
+bool Gallery_IsImage(const wchar_t* name) {
+    static const wchar_t* kExt[] = {L".jpg",  L".jpeg", L".png", L".gif", L".bmp", L".webp", L".heic", L".heif", L".tif",
+                                    L".tiff", L".avif", L".jxl", L".dng", L".cr2", L".cr3",  L".nef",  L".arw",  L".raf",
+                                    L".orf",  L".rw2"};
+    const wchar_t* dot = wcsrchr(name, L'.');
+    if (!dot) return false;
+    for (const wchar_t* e : kExt)
+        if (!_wcsicmp(dot, e)) return true;
+    return false;
+}
+
+void Gallery_EnumerateFrom(DirData& d, const std::vector<std::wstring>& roots, const CancelToken& ct, size_t maxItems) {
+    const double t0 = Ms();
+    std::vector<std::wstring> stack(roots.rbegin(), roots.rend());
+    std::unordered_set<std::wstring> seen;  // racines imbriquées (Pellicule dans Images…) : une fois
+    while (!stack.empty() && d.entries.size() < maxItems && !ct.cancelled()) {
+        const std::wstring dir = stack.back();
+        stack.pop_back();
+        if (!seen.insert(Lower(dir)).second) continue;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+                                   FIND_FIRST_EX_LARGE_FETCH);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        std::vector<std::wstring> subs;
+        do {
+            if (fd.cFileName[0] == L'.' && (!fd.cFileName[1] || (fd.cFileName[1] == L'.' && !fd.cFileName[2]))) continue;
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+            const std::wstring full = dir + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) subs.push_back(full);  // pas de jonctions
+            } else if (Gallery_IsImage(fd.cFileName)) {
+                Add(d, fd.cFileName, fd.dwFileAttributes, ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow,
+                    FtToI(fd.ftLastWriteTime), full, dir, FtToI(fd.ftCreationTime), FtToI(fd.ftLastAccessTime));
+                if (d.entries.size() >= maxItems) {
+                    d.truncated = true;
+                    break;
+                }
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        for (auto it = subs.rbegin(); it != subs.rend(); ++it) stack.push_back(*it);
+    }
+    const double t1 = Ms();
+    DirData_BuildKeys(d);
+    d.enumMs = t1 - t0;
+    d.keyMs = Ms() - t1;
+}
+
+void Gallery_Enumerate(DirData& d, const CancelToken& ct) {
+    d.path = kGalleryPath;
+    std::vector<std::wstring> roots;
+    for (const KNOWNFOLDERID& id : {FOLDERID_Pictures, FOLDERID_CameraRoll, FOLDERID_SavedPictures, FOLDERID_Screenshots}) {
+        PWSTR p = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_DONT_VERIFY, nullptr, &p)) && p &&
+            GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES)
+            roots.push_back(p);
+        CoTaskMemFree(p);
+    }
+    Gallery_EnumerateFrom(d, roots, ct, 20000);
+}
+
+// ───────────────────────────── Linux (WSL) ─────────────────────────────
+
+std::vector<std::wstring> Linux_Distributions() {
+    std::vector<std::wstring> v;
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Lxss", 0, KEY_READ, &k))
+        return v;
+    for (DWORD i = 0;; ++i) {
+        wchar_t sub[128];
+        DWORD n = 128;
+        if (RegEnumKeyExW(k, i, sub, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        wchar_t name[256] = {};
+        DWORD cb = sizeof name;
+        if (RegGetValueW(k, sub, L"DistributionName", RRF_RT_REG_SZ, nullptr, name, &cb) == ERROR_SUCCESS && *name)
+            v.push_back(name);
+    }
+    RegCloseKey(k);
+    return v;
+}
+
+std::vector<std::wstring> Linux_ParseList(const std::string& raw) {
+    std::wstring w;
+    // wsl.exe écrit en UTF-16 (sans BOM) ; certaines versions en UTF-8 si WSL_UTF8=1.
+    const bool utf16 = raw.size() >= 2 && raw.size() % 2 == 0 && raw[1] == '\0';
+    if (utf16) w.assign((const wchar_t*)raw.data(), raw.size() / 2);
+    else {
+        w.resize((size_t)MultiByteToWideChar(CP_UTF8, 0, raw.data(), (int)raw.size(), nullptr, 0));
+        MultiByteToWideChar(CP_UTF8, 0, raw.data(), (int)raw.size(), w.data(), (int)w.size());
+    }
+    std::vector<std::wstring> v;
+    size_t i = 0;
+    while (i <= w.size()) {
+        size_t e = w.find(L'\n', i);
+        if (e == std::wstring::npos) e = w.size();
+        std::wstring line = w.substr(i, e - i);
+        while (!line.empty() && (line.back() == L'\r' || line.back() == L' ' || line.back() == 0)) line.pop_back();
+        while (!line.empty() && (line.front() == 0xFEFF || line.front() == L' ')) line.erase(0, 1);
+        if (!line.empty()) v.push_back(line);
+        i = e + 1;
+    }
+    return v;
+}
+
+namespace {
+// Sortie de « wsl.exe --list --running --quiet » (vide si WSL absent ou trop lent).
+std::string RunWslList(DWORD timeoutMs) {
+    wchar_t sys[MAX_PATH];
+    GetSystemDirectoryW(sys, MAX_PATH);
+    const std::wstring exe = std::wstring(sys) + L"\\wsl.exe";
+    if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) return {};
+    SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+    HANDLE r, w;
+    if (!CreatePipe(&r, &w, &sa, 0)) return {};
+    SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si{sizeof si};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = w;
+    si.hStdError = w;
+    std::wstring cmd = L"\"" + exe + L"\" --list --running --quiet";
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(w);
+    std::string out;
+    if (ok) {
+        if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+        char buf[4096];
+        DWORD got = 0, avail = 0;
+        while (PeekNamedPipe(r, nullptr, 0, nullptr, &avail, nullptr) && avail && ReadFile(r, buf, sizeof buf, &got, nullptr) && got)
+            out.append(buf, got);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    CloseHandle(r);
+    return out;
+}
+}  // namespace
+
+void Linux_Enumerate(DirData& d, const CancelToken& ct) {
+    const double t0 = Ms();
+    d.path = kLinuxPath;
+    const auto distros = Linux_Distributions();
+    std::vector<std::wstring> running;
+    if (!distros.empty() && !ct.cancelled()) running = Linux_ParseList(RunWslList(3000));
+    for (const auto& name : distros) {
+        const bool on = std::any_of(running.begin(), running.end(), [&](const std::wstring& r) { return !_wcsicmp(r.c_str(), name.c_str()); });
+        Add(d, name, FILE_ATTRIBUTE_DIRECTORY, 0, 0, L"\\\\wsl.localhost\\" + name, on ? L"Démarrée" : L"Arrêtée");
+    }
+    const double t1 = Ms();
+    DirData_BuildKeys(d);
+    d.enumMs = t1 - t0;
+    d.keyMs = Ms() - t1;
 }

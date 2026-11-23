@@ -40,7 +40,7 @@ if /i "%MODE%"=="asan" call :copyasan
 goto :ok
 
 :test
-cl %COMMON% %OPT% /Isrc tests\tests.cpp src\paths.cpp src\listing.cpp src\nt.cpp src\jobs.cpp src\shellmenu.cpp src\icons.cpp src\watch.cpp src\fileops.cpp src\fastcopy.cpp src\dragdrop.cpp src\navpane.cpp src\pins.cpp src\crumbs.cpp src\foldersize.cpp src\index.cpp src\columns.cpp src\panes.cpp src\places.cpp src\deflate.cpp src\archive.cpp src\net.cpp src\sessions.cpp src\groups.cpp src\batchrename.cpp src\wsearch.cpp src\shellns.cpp src\vdisk.cpp src\palette.cpp src\term.cpp src\hashes.cpp src\syntax.cpp /Fo%OUT%\ /Fd%OUT%\ /Fe%OUT%\tests.exe /link /SUBSYSTEM:CONSOLE %LOPT% || goto :fail
+cl %COMMON% %OPT% /Isrc tests\tests.cpp src\paths.cpp src\listing.cpp src\nt.cpp src\jobs.cpp src\shellmenu.cpp src\icons.cpp src\watch.cpp src\fileops.cpp src\fastcopy.cpp src\dragdrop.cpp src\navpane.cpp src\pins.cpp src\crumbs.cpp src\foldersize.cpp src\index.cpp src\columns.cpp src\panes.cpp src\places.cpp src\deflate.cpp src\archive.cpp src\net.cpp src\sessions.cpp src\groups.cpp src\batchrename.cpp src\wsearch.cpp src\shellns.cpp src\vdisk.cpp src\palette.cpp src\term.cpp src\hashes.cpp src\syntax.cpp src\git.cpp src\defexp.cpp /Fo%OUT%\ /Fd%OUT%\ /Fe%OUT%\tests.exe /link /SUBSYSTEM:CONSOLE %LOPT% || goto :fail
 call :copyasan
 "%OUT%\tests.exe" || goto :fail
 goto :ok

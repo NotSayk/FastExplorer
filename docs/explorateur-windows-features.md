@@ -28,7 +28,7 @@ De haut en bas :
 | **Barre d'onglets** (barre de titre) | Onglets, bouton « + », boutons fenêtre | ✅ P1 (barre sous la barre de titre) |
 | **Barre de navigation** | Précédent, Suivant, Dossier parent, Actualiser, barre d'adresse, recherche | ✅ (bouton Actualiser : bloc 10) |
 | **Barre de commandes** | Nouveau ▾, Couper, Copier, Coller, Renommer, Partager, Supprimer, Trier ▾, Afficher ▾, Filtrer ▾ (selon la version), « … » (plus) | ✅ P1 (bloc 24 : Nouveau ▾ dossier / document texte / autres, Couper, Copier, Coller, Renommer, Supprimer, Trier ▾, Afficher ▾, « ··· » ; boutons grisés selon la sélection, le presse-papiers et l'emplacement) |
-| **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅🟡 P0 (Accueil, Accès rapide épinglé, arborescence de Ce PC, Réseau, Corbeille ; Galerie, Linux à venir) |
+| **Volet de navigation** (gauche) | Accueil, Galerie, dossiers épinglés, Ce PC (arborescence), Réseau, Linux, téléphone… | ✅ P0 (Accueil, Galerie, Accès rapide épinglé, arborescence de Ce PC, Réseau, Linux si des distributions existent, Corbeille) |
 | **Zone de contenu** | La liste des éléments | ✅ P0 |
 | **Volet d'aperçu / de détails** (droite) | Aperçu du fichier, ou métadonnées | ✅ P1 |
 | **Barre d'état** (bas) | Nombre d'éléments, nombre et taille de la sélection, boutons Détails / Grandes icônes | ✅🟡 P0 (trois zones : contenu du dossier, sélection, temps de lecture ; boutons d'affichage à venir avec les autres vues) |
@@ -77,11 +77,11 @@ De haut en bas :
 | Emplacement | Ce que c'est | Prio |
 |---|---|---|
 | **Accueil** (Home) | Page d'accueil : *Accès rapide* (dossiers épinglés et fréquents), *Favoris* (fichiers épinglés), *Récents*, *Recommandés* (2025 : aussi pour les comptes locaux et Microsoft), *Partagés* (comptes pro). Colonne « Activité » avec avatars pour les comptes Entra ID. Depuis 2026 : « Ouvrir l'emplacement du fichier » et « Demander à Copilot » (comptes pro/scolaires) | ✅🟡 P1 (bloc 21 : dossiers de l'Accès rapide puis 40 fichiers récents, colonnes Emplacement / Utilisé le, « Ouvrir l'emplacement du fichier », menu du Shell sur les vrais fichiers ; raccourcis récents lus directement, sans le Shell : ~80 ms), P3 (Favoris, Recommandés, Partagés) |
-| **Galerie** | Mosaïque chronologique de toutes les photos (dossier Images + sources ajoutées), regroupées par mois, filtre de collection | P2 |
+| **Galerie** | Mosaïque chronologique de toutes les photos (dossier Images + sources ajoutées), regroupées par mois, filtre de collection | ✅ P2 (bloc 32 : Images, Pellicule, Images enregistrées, Captures d'écran ; vue en icônes 96 px groupée par date ; colonne Dossier ; « galerie » dans la barre d'adresse) |
 | **Dossiers épinglés** | Bureau, Téléchargements, Documents, Images, Musique, Vidéos + vos épingles (« Épingler à Accès rapide ») | **P0** |
 | **Ce PC** | Lecteurs (avec jauge d'espace libre), dossiers de l'utilisateur, emplacements réseau, appareils (téléphones MTP, appareils photo) | ✅ P0 (lecteurs : libellé, jauge, espace libre ; téléphones et appareils photo listés après les lecteurs, bloc 30 ; Réseau à part) |
-| **Réseau** | Machines découvertes (SMB, WSD), serveurs multimédia (DLNA), routeurs (UPnP) | P2 |
-| **Linux** | Distributions WSL via `\\wsl.localhost\<distro>` | P2 |
+| **Réseau** | Machines découvertes (SMB, WSD), serveurs multimédia (DLNA), routeurs (UPnP) | ✅🟡 P2 (bloc 32 : ordinateurs découverts par le Shell en arrière-plan, ajoutés à la liste ; DLNA / UPnP non) |
+| **Linux** | Distributions WSL via `\\wsl.localhost\<distro>` | ✅ P2 (bloc 32) |
 | **Téléphone mobile Android** | Accès sans fil aux fichiers du téléphone via « Lien avec Windows » (2025) | P3 |
 | **Bibliothèques** | Masquées par défaut. Vues agrégées de plusieurs dossiers (Documents, Musique, Images, Vidéos) | P3 |
 | **Corbeille** | Voir §11 | ✅ P1 (bloc 21) |
@@ -393,7 +393,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | Lister les partages d'un serveur | Taper `\\serveur` | ✅ P1 (bloc 23 : `NetShareEnum` sur le thread de navigation, abandonné si l'on va ailleurs ; partages d'administration « C$ » cachés ; colonnes Nom, Type, Commentaire ; fil d'Ariane Réseau ▸ serveur ▸ partage ; remonter d'un partage → son serveur → Réseau) |
 | Connecter un lecteur réseau | Ce PC ▸ « … » ▸ Connecter un lecteur réseau ; reconnexion à l'ouverture de session | ✅ P2 (fenêtre de Windows : clic droit sur un partage, partage proposé ; fond de Réseau) |
 | Ajouter un emplacement réseau | Raccourci FTP / WebDAV dans Ce PC | P3 |
-| Découverte réseau | Machines, imprimantes, serveurs multimédia (DLNA) | 🟡 P3 (Réseau liste les serveurs déjà visités et ceux des lecteurs réseau, sans attente ; Suppr les retire ; découverte automatique à venir) |
+| Découverte réseau | Machines, imprimantes, serveurs multimédia (DLNA) | 🟡 P3 (Réseau liste les serveurs déjà visités et ceux des lecteurs réseau, sans attente ; Suppr les retire ; bloc 32 : découverte en arrière-plan des ordinateurs du réseau, au plus une fois par minute, fusionnés avec la liste ; imprimantes et DLNA non) |
 | Fichiers hors connexion | Centre de synchronisation (éditions Pro) | P3 |
 | Robustesse | Un partage lent ou absent ne doit pas figer la fenêtre | ✅ (annulation `CancelSynchronousIo`) |
 
@@ -480,7 +480,7 @@ l'utilisateur** au démarrage, pour respecter ses habitudes sans reconfiguration
 ### Fenêtres et onglets
 | Raccourci | Action | État |
 |---|---|---|
-| Win+E | Ouvrir l'Explorateur | P2 (remplacement par défaut, voir §20) |
+| Win+E | Ouvrir l'Explorateur | ✅ P2 (bloc 32 : ouvre FastExplorer quand il remplace l'Explorateur, voir §20) |
 | Ctrl+N | Nouvelle fenêtre | ✅ P1 |
 | Ctrl+T / Ctrl+W / Ctrl+F4 | Nouvel onglet / fermer l'onglet | ✅ P1 |
 | Ctrl+Tab / Ctrl+Maj+Tab | Onglet suivant / précédent | ✅ P1 |
@@ -567,13 +567,13 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 | **Sessions / espaces de travail** | Ensembles d'onglets nommés, restaurés en un clic | ✅ P2 ⭐ (bloc 26 : « ··· » ▸ Sessions : enregistrer les onglets sous un nom, rouvrir, supprimer) |
 | **Signets** | Favoris de dossiers avec raccourcis clavier | ✅ P2 ⭐ (bloc 26 : Alt+Maj+1…9 range le dossier, Alt+1…9 y va ; « ··· » ▸ Signets) |
 | **Fichiers verrouillés** | « Qui utilise ce fichier ? » + fermer l'application | P2 ⭐ |
-| **Intégration Git** | Dans un dépôt : branche courante affichée, **changer de branche** en un clic, état des fichiers (modifié, nouveau, ignoré) en colonne ou surimpression ; à faire une fois l'interface aboutie | P2 ⭐ |
-| **Onglet WSL** | Section dédiée aux distributions Linux (`\\wsl.localhost\<distro>`) : liste des distributions, ouverture directe, état (démarrée / arrêtée) | P2 ⭐ |
+| **Intégration Git** | Dans un dépôt : branche courante affichée, **changer de branche** en un clic, état des fichiers (modifié, nouveau, ignoré) en colonne ou surimpression | ✅ P2 ⭐ (bloc 32 : colonne Git ajoutée d'office dans un dépôt — Modifié, Non suivi, Ignoré…, « Modifié (contenu) » pour un dossier ; bouton « Git : branche » dans la barre : changer de branche, actualiser ; `git status` en arrière-plan, sans verrou) |
+| **Onglet WSL** | Section dédiée aux distributions Linux (`\\wsl.localhost\<distro>`) : liste des distributions, ouverture directe, état (démarrée / arrêtée) | ✅ P2 ⭐ (bloc 32 : nœud Linux du volet ; liste lue dans le registre, état par `wsl --list --running`, sans démarrer de distribution ; « wsl » ou `\\wsl$` dans la barre d'adresse) |
 | **Connexions SFTP** | Serveurs SFTP enregistrés, parcourus comme des dossiers (copier, glisser-déposer, renommer), clés SSH, mots de passe dans le Gestionnaire d'identification Windows | P2 ⭐ |
 | **Connexions cloud** | Google Drive, OneDrive, Dropbox… parcourus directement par leurs API (sans client de synchronisation installé), comptes connectés par OAuth | P2 ⭐ |
 | **Portable** | Un seul .exe, aucune installation, configuration dans un fichier | ✅ ⭐ |
 | Chemins de plus de 260 caractères | L'Explorateur les gère mal (selon les opérations) | ✅ ⭐ |
-| Remplacer l'Explorateur par défaut | Win+E et « Ouvrir le dossier » des autres applications ⚙️ clé `HKCU\Software\Classes\Folder\shell` (à faire proprement et de façon réversible) | P2 |
+| Remplacer l'Explorateur par défaut | Win+E et « Ouvrir le dossier » des autres applications ⚙️ clé `HKCU\Software\Classes\Folder\shell` (à faire proprement et de façon réversible) | ✅ P2 (bloc 32 : ··· ▸ « Ouvrir les dossiers et Win+E avec FastExplorer » ; verbe par défaut de `Directory` et `Drive` dans HKCU plus Win+E ; l'ancien réglage est gardé et rendu tel quel à la désactivation, sans droits administrateur) |
 
 ---
 
@@ -662,7 +662,7 @@ P2, en blocs (dans cet ordre) :
     appareils MTP, propriétés de la Corbeille.
 31. ✅ **Productivité** ⭐ : palette de commandes, raccourcis personnalisables, terminal intégré, aperçu du code
     coloré, panneau rapide (empreintes).
-32. **Intégrations** : Git ⭐, WSL ⭐, découverte du réseau, Galerie, remplacer l'Explorateur par défaut.
+32. ✅ **Intégrations** : Git ⭐, WSL ⭐, découverte du réseau, Galerie, remplacer l'Explorateur par défaut.
 
 Plus tard, une fois l'interface aboutie :
 connexions SFTP ⭐, connexions cloud (Google Drive, OneDrive, Dropbox…) ⭐.

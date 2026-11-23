@@ -1,7 +1,9 @@
 #pragma once
 #include "listing.h"
 
+#include <functional>
 #include <string>
+#include <vector>
 
 // Réseau. « ::net » (Réseau) : les serveurs connus — ceux déjà visités
 // (mémorisés) et ceux des lecteurs réseau connectés. « \\serveur » : ses
@@ -20,6 +22,12 @@ std::wstring Net_ServerOf(const std::wstring& p);
 void Net_EnumShares(DirData& d, const CancelToken& ct = {});
 // Serveurs connus (d.path = kNetPath) : target = « \\serveur », origin = lecteurs connectés, mtime = dernière visite.
 void Net_EnumServers(DirData& d, const CancelToken& ct = {});
+
+// Découverte du réseau (dossier Réseau du Shell : WSD, NetBIOS…, selon les réglages de Windows), sur un thread.
+// Les ordinateurs trouvés s'ajoutent ensuite à Net_EnumServers (« Découvert sur le réseau »).
+// done(nouveaux) est appelé sur ce thread. false : une découverte est déjà en cours.
+bool Net_Discover(std::function<void(size_t)> done);
+std::vector<std::wstring> Net_Discovered();
 
 // Mémorise le serveur d'un chemin réseau ouvert avec succès (dernière visite).
 void Net_Remember(const std::wstring& path);

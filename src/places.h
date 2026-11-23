@@ -20,6 +20,18 @@ void Home_Enumerate(DirData& d, const std::vector<NavFolder>& pins, const Cancel
 void Home_EnumerateFrom(DirData& d, const std::wstring& recentDir, const std::vector<NavFolder>& pins,
                         const CancelToken& ct, size_t maxRecent);
 
+// Galerie : images des dossiers Images, Pellicule, Captures d'écran… (récursif, maxItems au plus).
+// target = chemin, origin = dossier ; dossiers et fichiers cachés ignorés, jonctions non suivies.
+bool Gallery_IsImage(const wchar_t* name);
+void Gallery_Enumerate(DirData& d, const CancelToken& ct = {});
+void Gallery_EnumerateFrom(DirData& d, const std::vector<std::wstring>& roots, const CancelToken& ct, size_t maxItems);
+
+// Linux : distributions WSL de l'utilisateur (registre Lxss), en dossiers ; target = « \\wsl.localhost\<nom> »,
+// origin = « Démarrée » / « Arrêtée » (wsl.exe --list --running, 3 s au plus).
+std::vector<std::wstring> Linux_Distributions();
+std::vector<std::wstring> Linux_ParseList(const std::string& wslOutput);
+void Linux_Enumerate(DirData& d, const CancelToken& ct = {});
+
 // Nom affiché d'un emplacement virtuel (« Corbeille », « Accueil »), "" sinon.
 const wchar_t* Places_Title(const std::wstring& path);
 // Texte tapé dans la barre d'adresse → emplacement virtuel (« corbeille », « shell:RecycleBinFolder »…), "" sinon.

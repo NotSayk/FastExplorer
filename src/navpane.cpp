@@ -1,4 +1,5 @@
 #include "navpane.h"
+#include "places.h"
 
 #include "net.h"
 
@@ -119,7 +120,8 @@ UINT g_msg = 0;
 NavHost g_host;
 std::unordered_map<uintptr_t, Node> g_nodes;
 uintptr_t g_nextId = 1;
-HTREEITEM g_quick = nullptr, g_pc = nullptr, g_home = nullptr, g_bin = nullptr, g_net = nullptr;
+HTREEITEM g_quick = nullptr, g_pc = nullptr, g_home = nullptr, g_bin = nullptr, g_net = nullptr, g_gallery = nullptr,
+          g_linux = nullptr;
 int g_folderIcon = 0;
 bool g_syncing = false;  // sélection faite par le programme : pas de navigation
 ULONGLONG g_pinnedAt = 0;
@@ -131,6 +133,7 @@ struct Result {
     std::vector<NavFolder> folders;
     int rootIcon = -1;  // icône du nœud racine (Accès rapide, Ce PC)
     int homeIcon = -1, binIcon = -1, netIcon = -1;  // Pinned : icônes de l'Accueil, de la Corbeille, de Réseau
+    int galleryIcon = -1, linuxIcon = -1;
     bool unpinFailed = false;
 };
 std::wstring g_unpinQueued;  // désépinglage demandé pendant une lecture
@@ -493,6 +496,8 @@ HWND NavPane_Create(HWND parent, UINT id, UINT msg, NavHost host) {
 
     NavFolder home{L"Accueil", L"::home", -1, false};
     g_home = Insert(TVI_ROOT, TVI_LAST, home, Kind::Place);
+    NavFolder gallery{L"Galerie", kGalleryPath, -1, false};
+    g_gallery = Insert(TVI_ROOT, TVI_LAST, gallery, Kind::Place);
     NavFolder quick{L"Accès rapide", L"", -1, true};
     g_quick = Insert(TVI_ROOT, TVI_LAST, quick, Kind::Quick);
     if (Node* n = NodeOf(g_quick)) n->loaded = true;  // ses enfants viennent de NavPane_RefreshPinned
@@ -501,6 +506,10 @@ HWND NavPane_Create(HWND parent, UINT id, UINT msg, NavHost host) {
     if (Node* n = NodeOf(g_pc)) n->expandWhenLoaded = true;  // ouvert d'emblée, comme l'Explorateur
     NavFolder net{L"Réseau", L"::net", -1, false};
     g_net = Insert(TVI_ROOT, TVI_LAST, net, Kind::Place);
+    if (!Linux_Distributions().empty()) {  // WSL installé : ses distributions
+        NavFolder linux{L"Linux", kLinuxPath, -1, false};
+        g_linux = Insert(TVI_ROOT, TVI_LAST, linux, Kind::Place);
+    }
     NavFolder bin{L"Corbeille", L"::bin", -1, false};
     g_bin = Insert(TVI_ROOT, TVI_LAST, bin, Kind::Place);
     StartLoad(IdOf(g_pc));
@@ -571,7 +580,9 @@ void StartPinnedRead(const std::wstring& unpinFirst) {
         }
         for (auto [icon, place] : {std::pair{&r->homeIcon, L"shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}"},
                                    std::pair{&r->binIcon, L"shell:::{645FF040-5081-101B-9F08-00AA002F954E}"},
-                                   std::pair{&r->netIcon, L"shell:::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}"}}) {
+                                   std::pair{&r->netIcon, L"shell:::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}"},
+                                   std::pair{&r->galleryIcon, L"shell:::{E88865EA-0E1C-4E20-9AA6-EDCD0212C87C}"},
+                                   std::pair{&r->linuxIcon, L"shell:::{B2B4A4D1-2754-4140-A2EB-9A76D9D7CDC6}"}}) {
             PIDLIST_ABSOLUTE q = nullptr;
             if (SUCCEEDED(SHParseDisplayName(place, nullptr, &q, 0, nullptr))) {
                 SHFILEINFOW sfi{};
@@ -674,6 +685,8 @@ void NavPane_OnResult(LPARAM lp) {
         SetIcon(g_home, r->homeIcon);
         SetIcon(g_bin, r->binIcon);
         SetIcon(g_net, r->netIcon);
+        SetIcon(g_gallery, r->galleryIcon);
+        if (g_linux) SetIcon(g_linux, r->linuxIcon);
         SetChildrenFlag(g_quick, !r->folders.empty());
         if (first && !r->folders.empty()) TreeView_Expand(g_tree, g_quick, TVE_EXPAND);
         return;

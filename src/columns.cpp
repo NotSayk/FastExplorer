@@ -40,6 +40,7 @@ const Builtin kBuiltins[] = {
     {COL_ATTR, L"attr", L"Attributs", 90, false, &PKEY_FileAttributes},
     {COL_ORIGIN, L"origin", L"Emplacement d'origine", 260, false, nullptr},  // emplacements virtuels seulement,
     {COL_SYNC, L"sync", L"Disponibilité", 220, false, nullptr},
+    {COL_GIT, L"git", L"Git", 140, false, nullptr},  // dans un dépôt Git
 };
 
 const Builtin* FindBuiltin(int key) {
