@@ -1,4 +1,5 @@
 #include "listing.h"
+#include "shellns.h"
 
 #include "nt.h"
 #include "paths.h"
@@ -154,7 +155,21 @@ void EnumerateDrives(DirData& d) {
     }
     std::vector<std::wstring> roots;
     for (const Entry& e : d.entries) roots.emplace_back(d.name(e));
+    // Téléphones et appareils photo (sans lettre), lus pendant que les lecteurs répondent.
+    std::vector<ShellNsDevice> devices;
+    std::thread dev([&] { devices = ShellNs_Devices(); });
     d.drives = QueryDrives(roots, 400);
+    dev.join();
+    if (!devices.empty()) {
+        d.target.assign(d.entries.size(), std::wstring());
+        for (auto& v : devices) {
+            AddEntry(d, v.name.c_str(), (uint32_t)v.name.size(), FILE_ATTRIBUTE_DIRECTORY, 0, 0);
+            d.entries.back().extra = kDriveDevice;
+            d.entries.back().icon = v.icon;
+            d.target.push_back(std::move(v.path));
+            d.drives.emplace_back();
+        }
+    }
 }
 
 // Ajoute la clé de tri de `nm` à `out`, renvoie sa longueur en octets.
@@ -1160,6 +1175,7 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewP
     const uint64_t* DS = dirSizes && dirSizes->size() == n ? dirSizes->data() : nullptr;
     const PropValues* PV = prop && prop->text.size() == n && prop->num.size() == n ? prop : nullptr;
     const std::wstring* OR = d.origin.size() == n ? d.origin.data() : nullptr;
+    const bool CL = d.cloud;
     auto cmp = [=](uint32_t ia, uint32_t ib) {
         const Entry& a = E[ia];
         const Entry& b = E[ib];
@@ -1172,6 +1188,7 @@ std::vector<uint32_t> SortOrder(const DirData& d, int col, bool asc, const ViewP
             case COL_CTIME: c = Cmp3(a.ctime, b.ctime); break;
             case COL_ATIME: c = Cmp3(a.atime, b.atime); break;
             case COL_ATTR: c = Cmp3(a.attr & kShownAttrs, b.attr & kShownAttrs); break;
+            case COL_SYNC: c = Cmp3(SyncState(a.attr, CL), SyncState(b.attr, CL)); break;
             case COL_ORIGIN:
                 if (OR)
                     c = CompareStringEx(LOCALE_NAME_USER_DEFAULT, LINGUISTIC_IGNORECASE | SORT_DIGITSASNUMBERS,
@@ -1228,6 +1245,38 @@ std::wstring AttrText(uint32_t attr) {
     return s;
 }
 
+int SyncState(uint32_t attr, bool inSyncRoot) {
+    if (attr & FILE_ATTRIBUTE_PINNED) return 3;
+    if (attr & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE)) return 1;
+    if (attr & FILE_ATTRIBUTE_UNPINNED) return inSyncRoot ? 2 : 1;  // « Libérer de l'espace » demandé
+    return inSyncRoot ? 2 : 0;
+}
+
+const wchar_t* SyncText(int state) {
+    switch (state) {
+        case 1: return L"Disponible en ligne";
+        case 2: return L"Disponible sur cet appareil";
+        case 3: return L"Toujours disponible sur cet appareil";
+        default: return L"";
+    }
+}
+
+bool Cloud_InSyncRoot(const std::wstring& path) {
+    if (path.size() < 3 || IsVirtualPath(path)) return false;
+    // cldapi.dll chargée à la demande : absente des anciennes versions de Windows.
+    using GetInfo = HRESULT(WINAPI*)(LPCWSTR, int, PVOID, DWORD, DWORD*);
+    static const GetInfo get = [] {
+        HMODULE m = LoadLibraryExW(L"cldapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return m ? (GetInfo)GetProcAddress(m, "CfGetSyncRootInfoByPath") : nullptr;
+    }();
+    if (!get) return false;
+    BYTE buf[512];
+    DWORD got = 0;
+    // CF_SYNC_ROOT_INFO_BASIC = 0 : seulement savoir si une racine couvre ce chemin.
+    const HRESULT hr = get(path.c_str(), 0, buf, sizeof buf, &got);
+    return SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_MORE_DATA);
+}
+
 const wchar_t* DriveTypeText(UINT t) {
     switch (t) {
         case DRIVE_FIXED: return L"Disque local";
@@ -1235,6 +1284,7 @@ const wchar_t* DriveTypeText(UINT t) {
         case DRIVE_REMOTE: return L"Lecteur réseau";
         case DRIVE_CDROM: return L"Lecteur CD/DVD";
         case DRIVE_RAMDISK: return L"Disque RAM";
+        case kDriveDevice: return L"Appareil portable";
         default: return L"Lecteur";
     }
 }

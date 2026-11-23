@@ -105,6 +105,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         return IndexService_Uninstall();
     }
+    if (argc >= 4 && _wcsicmp(argv[1], L"--set-label") == 0) {  // nom de volume (process élevé, lancé par l'application)
+        std::wstring root = argv[2];
+        if (root.size() != 2 || root[1] != L':') return ERROR_INVALID_PARAMETER;
+        root += L'\\';
+        return SetVolumeLabelW(root.c_str(), argv[3]) ? 0 : (int)GetLastError();
+    }
     std::wstring start;
     if (argc >= 3 && _wcsicmp(argv[1], L"--bench") == 0) {
         if (argc >= 4 && _wcsicmp(argv[3], L"--seq") == 0) SetParallel(Parallel::Never);

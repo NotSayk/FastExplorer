@@ -84,7 +84,11 @@ std::vector<NavFolder> FoldersOf(const DirData& d, bool probeChildren) {
     for (uint32_t i : SortedDirs(d)) {
         const Entry& e = d.entries[i];
         NavFolder f;
-        if (d.isRoot()) {
+        if (d.isRoot() && e.extra == kDriveDevice) {  // téléphone, appareil photo
+            f.path = i < d.target.size() ? d.target[i] : std::wstring();
+            f.text = d.name(e);
+            f.icon = e.icon;
+        } else if (d.isRoot()) {
             f.path = d.name(e);
             f.text = DriveDisplayName(f.path, e.extra,
                                       i < d.drives.size() ? d.drives[i] : DriveInfo{});

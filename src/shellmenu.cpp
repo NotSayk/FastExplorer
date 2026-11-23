@@ -29,7 +29,10 @@ bool ShellObjectOf(HWND owner, const std::wstring& folder, const std::vector<std
     std::vector<Pidl> abs;
     abs.reserve(names.size());
     for (const auto& n : names) {
-        Pidl p = ParsePath(Join(folder, n.c_str()));
+        // Nom déjà complet (« ::{…}\… » d'un appareil, « C:\… ») : pas relatif au dossier.
+        const bool full = (n.size() > 2 && n[0] == L':' && n[1] == L':') || (n.size() > 1 && n[1] == L':') ||
+                          (n.size() > 1 && n[0] == L'\\' && n[1] == L'\\');
+        Pidl p = ParsePath(full ? n : Join(folder, n.c_str()));
         if (!p) return false;
         abs.push_back(std::move(p));
     }

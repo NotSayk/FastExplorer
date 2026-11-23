@@ -23,6 +23,8 @@
 #include "paths.h"
 #include "places.h"
 #include "sessions.h"
+#include "shellns.h"
+#include "vdisk.h"
 #include "archive.h"
 #include "batchrename.h"
 #include "net.h"
@@ -74,6 +76,8 @@ constexpr UINT WM_APP_DIRSIZE = WM_APP + 14;    // taille d'un dossier calculée
 constexpr UINT WM_APP_THUMB = WM_APP + 16;      // miniature lue (lParam = ThumbResult*)
 constexpr UINT WM_APP_PROPS = WM_APP + 17;      // propriétés lues (lParam = PropResult*)
 constexpr UINT WM_APP_SAVEVIEW = WM_APP + 18;   // colonne redimensionnée ou déplacée : mémoriser l'affichage du dossier
+constexpr UINT WM_APP_SHELLDONE = WM_APP + 20;
+constexpr UINT WM_APP_MOUNTED = WM_APP + 21;    // image disque montée (wParam = erreur, lParam = MountResult*)  // opération du Shell finie dans un appareil (lParam = std::wstring* dossier)
 constexpr UINT WM_APP_INDEXDONE = WM_APP + 15;  // service de recherche installé / retiré (wParam = code, lParam = 1 : installé)
 constexpr UINT ID_SYS_INDEX = 0x0100;           // menu de la fenêtre : activer / désactiver la recherche instantanée
 constexpr UINT WM_APP_TESTDPI = WM_APP + 13;    // tests : comme WM_DPICHANGED (wParam = nouvelle échelle), que Windows
@@ -86,6 +90,7 @@ constexpr UINT kMenuHoverMs = 100;
 constexpr UINT_PTR TIMER_PROGRESS = 7;  // progression des copies de notre moteur
 constexpr UINT_PTR TIMER_PANE = 10;     // sélection posée : mettre à jour le volet de droite
 constexpr UINT_PTR TIMER_INDEXASK = 9;  // peu après le premier lancement : proposer la recherche instantanée
+constexpr UINT_PTR TIMER_SHELLREFRESH = 31;  // après une commande du Shell dans un appareil : relire
 constexpr UINT_PTR TIMER_PINNED = 8;    // après un menu contextuel : relire l'Accès rapide (épinglage)
 constexpr UINT_PTR TIMER_DRIVES = 4;  // Ce PC : regroupe les annonces d'arrivée / retrait de lecteurs
 constexpr UINT_PTR TIMER_EJECT = 5;   // éjection demandée : si elle échoue, on reprend la surveillance  // resélection après une opération, différée pendant un renommage
@@ -416,7 +421,9 @@ int FindEntryByName(const std::wstring& name) {
     if (!HasView() || name.empty()) return -1;
     const auto& es = g_view.data->entries;
     for (size_t i = 0; i < es.size(); ++i)
-        if (_wcsicmp(NameOf((int)i), name.c_str()) == 0) return (int)i;
+        if (_wcsicmp(NameOf((int)i), name.c_str()) == 0 ||
+            (i < g_view.data->target.size() && _wcsicmp(g_view.data->target[i].c_str(), name.c_str()) == 0))
+            return (int)i;
     return -1;
 }
 
@@ -426,7 +433,9 @@ std::vector<int> FindEntriesByNames(const std::vector<std::wstring>& names) {
     std::unordered_set<std::wstring_view> want(names.begin(), names.end());
     const auto& es = g_view.data->entries;
     for (size_t i = 0; i < es.size(); ++i)
-        if (want.count(std::wstring_view(NameOf((int)i), es[i].nameLen))) v.push_back((int)i);
+        if (want.count(std::wstring_view(NameOf((int)i), es[i].nameLen)) ||
+            (i < g_view.data->target.size() && !g_view.data->target[i].empty() && want.count(g_view.data->target[i])))
+            v.push_back((int)i);
     return v;
 }
 
@@ -490,15 +499,22 @@ int IconFor(int idx) { return IconOf(*g_view.data, E(idx)); }
 // Chemin complet d'une entrée : réel pour la Corbeille et l'Accueil (DirData::target), sinon dans g_path.
 std::wstring FullPathOf(const DirData& d, int idx) {
     if (d.isVirtual()) return (size_t)idx < d.target.size() ? d.target[idx] : std::wstring();
+    if (d.isRoot() && (size_t)idx < d.target.size() && !d.target[idx].empty()) return d.target[idx];  // appareil
     return Join(d.path, d.name(d.entries[idx]));
 }
 std::wstring FullPath(int idx) { return FullPathOf(*g_view.data, idx); }
 
 bool InVirtual() { return HasView() && g_view.data->isVirtual(); }
+// Téléphone, appareil photo (shellns.h) : chaque élément est désigné par son nom d'analyse du Shell.
+bool InShellNs() { return HasView() && ShellNs_IsPath(g_view.data->path); }
 
 // Nom affiché d'un emplacement : « Ce PC », « Corbeille », « Accueil » ou le chemin.
 std::wstring PlaceText(const std::wstring& path) {
     if (path.empty()) return L"Ce PC";
+    if (ShellNs_IsPath(path)) {
+        const std::wstring t = ShellNs_Title(path);
+        return t.empty() ? L"Appareil" : t;
+    }
     if (IsVirtualPath(path)) return Places_Title(path);
     return path;
 }
@@ -520,6 +536,7 @@ void FormatDate(int64_t t, wchar_t* out, int cch) {
 // Ce PC : informations du lecteur de l'entrée (nom, occupation).
 const DriveInfo* DriveOfEntry(int idx) {
     if (!HasView() || !g_view.data->isRoot() || idx < 0 || (size_t)idx >= g_view.data->drives.size()) return nullptr;
+    if (g_view.data->entries[idx].extra == kDriveDevice) return nullptr;  // téléphone : pas un lecteur
     return &g_view.data->drives[idx];
 }
 
@@ -813,7 +830,7 @@ int BigImage(int idx, int sysIcon) {
         const Entry& e = E(idx);
         th = THUMB_NONE;
         // Dossier : aperçu de ses premiers fichiers, lisible à partir de 48 px.
-        if (!g_view.data->isRoot() && !g_view.data->listOnly() && Thumbs_Wanted(e.attr, e.size) &&
+        if (!g_view.data->isRoot() && !g_view.data->listOnly() && !InShellNs() && Thumbs_Wanted(e.attr, e.size) &&
             !(e.isDir() && g_bigPx < S(48))) {
             th = THUMB_PENDING;
             Thumbs_Request(g_view.serial, (uint32_t)idx, FullPath(idx), g_bigPx);
@@ -1254,6 +1271,9 @@ void FillDispInfo(LVITEMW& it) {
         case COL_ATTR:
             if (!root) wcsncpy_s(out, cch, AttrText(e.attr).c_str(), _TRUNCATE);
             break;
+        case COL_SYNC:
+            if (!root) wcsncpy_s(out, cch, SyncText(SyncState(e.attr, g_view.data->cloud)), _TRUNCATE);
+            break;
         case COL_ORIGIN:
             if ((size_t)idx < g_view.data->origin.size())
                 wcsncpy_s(out, cch, g_view.data->origin[idx].c_str(), _TRUNCATE);
@@ -1305,6 +1325,10 @@ std::vector<ColSpec> ServerColumns() {
 }
 
 // Archive : ce que le répertoire du ZIP sait (pas de propriétés du Shell).
+std::vector<ColSpec> ShellNsColumns() {
+    return {Columns_Builtin(COL_NAME), Columns_Builtin(COL_DATE), Columns_Builtin(COL_TYPE), Columns_Builtin(COL_SIZE)};
+}
+
 std::vector<ColSpec> ArchiveColumns() {
     return {Columns_Builtin(COL_NAME), Columns_Builtin(COL_DATE), Columns_Builtin(COL_TYPE), Columns_Builtin(COL_SIZE)};
 }
@@ -1378,13 +1402,23 @@ void ApplyColumns(std::vector<ColSpec> cols) {
     g_applyingCols = false;
 }
 
+// Dossier OneDrive, Dropbox… : la colonne Disponibilité après le nom, si elle n'est pas déjà là.
+std::vector<ColSpec> WithSyncColumn(std::vector<ColSpec> v) {
+    for (const auto& c : v)
+        if (c.key == COL_SYNC) return v;
+    v.insert(v.begin() + (v.empty() ? 0 : 1), Columns_Builtin(COL_SYNC));
+    return v;
+}
+
 // Ce PC ↔ dossier : colonnes à changer ?
 void UpdateColumnsForView() {
     const bool root = HasView() && g_view.data->isRoot();
     const std::vector<ColSpec> want = root                               ? RootColumns()
+                                      : InShellNs()                        ? ShellNsColumns()
                                       : InVirtual()                        ? VirtualColumns(g_view.data->path)
                                       : HasView() && g_view.data->inArchive() ? ArchiveColumns()
                                       : HasView() && g_view.data->server      ? ServerColumns()
+                                      : HasView() && g_view.data->cloud       ? WithSyncColumn(g_folderCols)
                                                                            : g_folderCols;
     if (ColumnsKey(want) != ColumnsKey(CurrentColumns())) ApplyColumns(want);
 }
@@ -1572,7 +1606,7 @@ FolderView ViewFor(const std::wstring& path) {
     FolderView v;
     if (ReadView(ViewName(path), v)) return v;
     v = DefaultView();
-    if (IsVirtualPath(path)) {  // Corbeille, Accueil : en détails, les plus récents d'abord
+    if (IsVirtualPath(path) && !ShellNs_IsPath(path)) {  // Corbeille, Accueil : en détails, les plus récents d'abord
         v.mode = VM_DETAILS;
         v.sort = Columns_Builtin(COL_DATE);
         v.asc = false;
@@ -1964,6 +1998,8 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
             Net_EnumServers(*d, ct);
         } else if (Net_IsServerPath(path)) {
             Net_EnumShares(*d, ct);  // « \\serveur » : ses partages
+        } else if (ShellNs_IsPath(path)) {
+            ShellNs_Enumerate(*d, ct);  // téléphone, appareil photo : par le Shell
         } else if (std::wstring arc, inner; Archive_Split(path, arc, inner)) {
             Archive_Enumerate(*d, ct);  // ZIP : parcouru comme un dossier (pas de recherche dedans)
         } else if (!q.empty()) {
@@ -1984,6 +2020,7 @@ void Navigate(const std::wstring& path, Nav nav, std::wstring focus = {}, std::v
             }
         } else if (climb) EnumerateNearest(*d, ct);
         else Enumerate(*d, ct);
+        if (!d->error && !d->isRoot() && !d->isVirtual() && !d->listOnly()) d->cloud = Cloud_InSyncRoot(d->path);
         if (ct.cancelled()) return;
         if (!d->error && q.empty() && !Net_ServerOf(path).empty()) Net_Remember(path);  // serveur visité : dans Réseau
         auto* r = new Result{ct.gen, JobKind::Navigate};
@@ -2569,7 +2606,9 @@ void ShowHistoryMenu(bool back) {
 }
 void GoUp() {
     std::wstring parent, child;
-    if (HasView() && IsVirtualPath(g_path)) Navigate(L"", Nav::Normal);  // Corbeille, Accueil : vers Ce PC
+    std::wstring up;
+    if (HasView() && ShellNs_Parent(g_path, up)) Navigate(up, Nav::Normal);  // appareil : son dossier parent
+    else if (HasView() && IsVirtualPath(g_path)) Navigate(L"", Nav::Normal);  // Corbeille, Accueil : vers Ce PC
     else if (HasView() && ParentOf(g_path, parent, child)) Navigate(parent, Nav::Normal, child);
 }
 void Refresh() {
@@ -2650,6 +2689,12 @@ void NavigateAddress() {
     }
     if (_wcsicmp(trimmed.c_str(), L"Ce PC") == 0 || _wcsicmp(trimmed.c_str(), L"shell:MyComputerFolder") == 0) {
         Navigate(L"", Nav::Normal);
+        g_pending.typed = trimmed;
+        SetFocus(g_list);
+        return;
+    }
+    if (ShellNs_IsPath(trimmed)) {  // nom d'analyse du Shell (appareil…) : ouvert ici
+        Navigate(trimmed, Nav::Normal);
         g_pending.typed = trimmed;
         SetFocus(g_list);
         return;
@@ -2831,6 +2876,37 @@ std::wstring PickFolder(const std::wstring& initial, const wchar_t* title) {
 
 bool BrokenShortcut(const std::wstring& lnk, const std::wstring& target);
 
+struct MountResult {
+    std::wstring image, root;
+};
+
+// Monte l'image sur un thread (quelques secondes) ; la fin arrive par WM_APP_MOUNTED.
+void MountImage(const std::wstring& image) {
+    std::wstring parent, leaf;
+    ParentOf(image, parent, leaf);
+    SetStatus(L"Montage de « " + leaf + L" »…");
+    std::thread([image, hwnd = g_hwnd] {
+        auto* r = new MountResult{image, {}};
+        const DWORD e = VDisk_Mount(image, r->root);
+        if (!PostMessageW(hwnd, WM_APP_MOUNTED, e, (LPARAM)r)) delete r;
+    }).detach();
+}
+
+void OnMounted(DWORD err, std::unique_ptr<MountResult> r) {
+    std::wstring parent, leaf;
+    ParentOf(r->image, parent, leaf);
+    if (err == ERROR_SUCCESS && !r->root.empty()) {
+        Navigate(r->root, Nav::Normal);
+        Flash(L"« " + leaf + L" » monté en " + r->root.substr(0, 2) + L" (Éjecter, dans le menu du lecteur, pour le démonter)");
+    } else if (err == ERROR_SUCCESS) {
+        SetStatus(L"« " + leaf + L" » monté, sans lettre de lecteur (voir la Gestion des disques).");
+    } else if (err == ERROR_ACCESS_DENIED || err == ERROR_PRIVILEGE_NOT_HELD) {
+        OpenWithShell(r->image);  // VHD : Windows le monte (il demande l'autorisation au besoin)
+    } else {
+        SetStatus(L"Impossible de monter « " + leaf + L" » : " + ErrorText(err));
+    }
+}
+
 void ActivateEntry(int idx) {
     if (idx < 0) return;
     if (InArchive() && !E(idx).isDir()) {  // extrait (dossier temporaire) puis ouvert
@@ -2846,11 +2922,19 @@ void ActivateEntry(int idx) {
         Navigate(full, Nav::Normal);
         return;
     }
+    if (InShellNs()) {  // le Shell le copie puis l'ouvre, comme dans l'Explorateur
+        if (!ShellNs_Open(g_hwnd, full)) SetStatus(L"Impossible d'ouvrir « " + std::wstring(NameOf(idx)) + L" ».");
+        return;
+    }
     // Raccourci : on navigue DANS FastExplorer si la cible est un dossier
     // (le Shell ouvrirait l'Explorateur Windows). Sinon le Shell l'ouvre,
     // y compris pour une cible disparue (il propose de la rechercher).
     if (!InArchive() && Archive_IsZip(NameOf(idx))) {  // ZIP : on entre dedans (illisible : le Shell l'ouvre)
         Navigate(full, Nav::Normal, {}, {}, full, true);
+        return;
+    }
+    if (VDisk_IsImage(NameOf(idx)) && !InVirtual()) {  // ISO, VHD : monté, puis son lecteur ouvert ici
+        MountImage(full);
         return;
     }
     std::wstring target;
@@ -2869,7 +2953,12 @@ void Activate(int row) { ActivateEntry(EntryAt(row)); }
 std::vector<std::wstring> NamesOf(const std::vector<int>& entries) {
     std::vector<std::wstring> v;
     v.reserve(entries.size());
-    for (int e : entries) v.emplace_back(NameOf(e));
+    // Appareil (et appareil de Ce PC) : son nom d'analyse complet, que le Shell sait retrouver.
+    const DirData* d = HasView() ? g_view.data.get() : nullptr;
+    const bool shell = d && (ShellNs_IsPath(d->path) || d->isRoot());
+    for (int e : entries)
+        if (shell && (size_t)e < d->target.size() && !d->target[e].empty()) v.push_back(d->target[e]);
+        else v.emplace_back(NameOf(e));
     return v;
 }
 
@@ -3342,6 +3431,12 @@ void CopyNames(const std::vector<std::wstring>& names, bool cut) {
         else ExtractEntries(ArchivePicks(), ThenDo::Clipboard);
         return;
     }
+    if (InShellNs()) {  // appareil : l'objet de données du Shell (le pilote fournit le contenu)
+        if (!names.empty() && Clipboard_Put(g_hwnd, L"", names, cut))
+            SetStatus(std::to_wstring(names.size()) + (names.size() > 1 ? L" éléments" : L" élément") +
+                      (cut ? L" coupé(s)" : L" copié(s)") + L" dans le presse-papiers.");
+        return;
+    }
     if (InVirtual() && !InBin() && !cut) {  // Accueil : copie des fichiers eux-mêmes (dossiers différents)
         const auto t = TargetsOf(SelectedEntries());
         if (!t.empty() && Clipboard_Put(g_hwnd, L"", t, false))
@@ -3407,7 +3502,16 @@ void OnClipboardUpdate() {
     InvalidateRect(g_list, nullptr, FALSE);
 }
 
+// Fin d'une opération du Shell dans un appareil : relire le dossier s'il est affiché.
+void ShellNsDone(const std::wstring& folder) {
+    PostMessageW(g_hwnd, WM_APP_SHELLDONE, 0, (LPARAM) new std::wstring(folder));
+}
+
 void Paste(const std::wstring& dest) {
+    if (ShellNs_IsPath(dest)) {  // vers un appareil : le Shell copie (sa fenêtre de progression)
+        ShellNs_Paste(g_hwnd, dest, [dest](bool) { ShellNsDone(dest); });
+        return;
+    }
     if (!CanModify() || dest.empty()) return;
     FileOp op;
     if (!Clipboard_Get(op.items, op.clipboardCut, op.clipSeq)) {
@@ -3425,6 +3529,10 @@ void NetForget(const std::vector<int>& sel);
 void DeleteNames(const std::vector<std::wstring>& names, bool permanent) {
     if (InBin()) {  // dans la Corbeille, supprimer = définitivement
         BinPurge();
+        return;
+    }
+    if (InShellNs()) {  // appareil : le Shell confirme et supprime (pas de Corbeille sur un téléphone)
+        if (!names.empty()) ShellNs_Delete(g_hwnd, names, [p = g_path](bool) { ShellNsDone(p); });
         return;
     }
     if (HasView() && g_view.data->path == kNetPath) {  // Réseau : retirer de la liste
@@ -3470,7 +3578,7 @@ std::vector<std::wstring> g_multiRename;
 bool g_inBeginRename = false;  // la saisie s'ouvre depuis BeginRename (sinon : pas de renommage multiple)
 
 void BeginRename() {
-    if (!CanModify()) return;
+    if (!CanModify() && !InShellNs() && !(HasView() && g_view.data->isRoot())) return;
     int row = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED | LVNI_SELECTED);
     if (row < 0) row = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
     if (row < 0) return;
@@ -3509,10 +3617,32 @@ std::vector<std::wstring> MultiRenameNames(const std::wstring& typed, const std:
     return out;
 }
 
+// Ce PC : lecteur dont le nom de volume peut changer (pas un lecteur réseau, ni un CD, ni un appareil).
+bool VolumeRenamable(int idx) {
+    if (!HasView() || !g_view.data->isRoot() || idx < 0) return false;
+    const uint32_t t = E(idx).extra;
+    return t == DRIVE_FIXED || t == DRIVE_REMOVABLE;
+}
+
 BOOL OnBeginLabelEdit(const NMLVDISPINFOW* di) {
     const int idx = EntryAt(di->item.iItem);
-    if (!CanModify() || idx < 0 || g_pending.active) return TRUE;  // refusé
+    if (idx < 0 || g_pending.active) return TRUE;
+    if (VolumeRenamable(idx)) {  // nom de volume : la saisie ne montre que lui (« Données », pas « Données (D:) »)
+        g_multiRename.clear();
+        g_editing = true;
+        g_editName = NameOf(idx);
+        g_editExt.clear();
+        if (HWND ed = ListView_GetEditControl(g_list)) {
+            const DriveInfo* dv = DriveOfEntry(idx);
+            SetWindowTextW(ed, dv ? dv->label.c_str() : L"");
+            SendMessageW(ed, EM_SETSEL, 0, -1);
+            SendMessageW(ed, EM_LIMITTEXT, 32, 0);  // NTFS : 32 caractères
+        }
+        return FALSE;
+    }
+    if ((!CanModify() && !InShellNs()) || g_pending.active) return TRUE;  // refusé
     if (!g_inBeginRename) g_multiRename.clear();  // nouveau dossier, clic sur le nom : un seul élément
+    if (InShellNs()) g_multiRename.clear();  // appareil : un élément à la fois (le Shell renomme)
     g_editing = true;
     g_editName = NameOf(idx);
     const Entry& e = E(idx);
@@ -3592,6 +3722,48 @@ void OnTabEdit() {
     ListView_EditLabel(g_list, g_view.rowOf[e]);
 }
 
+// Nom de volume (Ce PC ▸ F2). Lecteur système : il faut être administrateur, demandé à Windows.
+void RenameVolume(const std::wstring& root, std::wstring label) {
+    while (!label.empty() && iswspace(label.back())) label.pop_back();
+    while (!label.empty() && iswspace(label.front())) label.erase(0, 1);
+    if (SetVolumeLabelW(root.c_str(), label.c_str())) {
+        Refresh();
+        NavPane_RefreshDrives();
+        return;
+    }
+    DWORD e = GetLastError();
+    if (e == ERROR_ACCESS_DENIED) {
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring q = label;  // guillemets retirés : un nom de volume n'en contient pas
+        std::erase(q, L'"');
+        const std::wstring args = L"--set-label " + root.substr(0, 2) + L" \"" + q + L"\"";
+        SHELLEXECUTEINFOW sei{sizeof sei};
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        sei.hwnd = g_hwnd;
+        sei.lpVerb = L"runas";
+        sei.lpFile = exe;
+        sei.lpParameters = args.c_str();
+        sei.nShow = SW_HIDE;
+        if (ShellExecuteExW(&sei) && sei.hProcess) {
+            WaitForSingleObject(sei.hProcess, 30000);
+            DWORD code = 1;
+            GetExitCodeProcess(sei.hProcess, &code);
+            CloseHandle(sei.hProcess);
+            e = code;
+            if (!code) {
+                Refresh();
+                NavPane_RefreshDrives();
+                return;
+            }
+        } else {
+            e = GetLastError();
+        }
+    }
+    SetStatus(e == ERROR_CANCELLED ? std::wstring(L"Nom du volume inchangé : autorisation refusée.")
+                                   : L"Impossible de renommer le volume : " + ErrorText(e));
+}
+
 void OnEndLabelEdit(const NMLVDISPINFOW* di) {
     g_editing = false;
     const std::wstring old = g_editName;
@@ -3605,6 +3777,21 @@ void OnEndLabelEdit(const NMLVDISPINFOW* di) {
         return;
     }
     const std::wstring typed = di->item.pszText;
+    if (HasView() && g_view.data->isRoot()) {  // nom de volume
+        RenameVolume(old, typed);
+        return;
+    }
+    if (InShellNs()) {  // appareil : le Shell renomme
+        const int e = FindEntryByName(old);
+        const std::wstring name = CleanFileName(typed + g_editExt);
+        if (e < 0 || name.empty() || name == old) return;
+        if (const wchar_t* err = FileNameError(name)) {
+            Flash(err);
+            return;
+        }
+        ShellNs_Rename(g_hwnd, FullPath(e), name, [p = g_path](bool) { ShellNsDone(p); });
+        return;
+    }
     if (multi.size() > 1) {  // F2 sur plusieurs éléments : tous renommés d'après ce nom
         const std::wstring base = CleanFileName(typed);
         if (base == old || base + g_editExt == old) {  // validé sans changement : rien à renommer
@@ -4594,6 +4781,12 @@ void ShowNetMenu(POINT pt, const std::vector<int>& sel) {
 
 // Corbeille, Accueil : nos propres commandes ; un élément de l'Accueil (ou des éléments
 // d'un même dossier) garde le menu du Shell de son vrai dossier.
+// Propriétés de la Corbeille (celles de Windows : taille maximale par lecteur, suppression directe, confirmation).
+void BinProperties() {
+    if (!ShellMenu_Invoke(g_hwnd, L"", {L"::{645FF040-5081-101B-9F08-00AA002F954E}"}, "properties"))
+        SetStatus(L"Propriétés de la Corbeille indisponibles.");
+}
+
 void ShowVirtualMenu(POINT pt, const std::vector<int>& sel) {
     const DirData& d = *g_view.data;
     if (d.path == kNetPath) {
@@ -4638,7 +4831,7 @@ void ShowVirtualMenu(POINT pt, const std::vector<int>& sel) {
             return;
         }
     }
-    enum : UINT { kOpen = 1, kRestore, kRestoreAll, kPurge, kEmpty, kCopy, kPaths, kRefresh };
+    enum : UINT { kOpen = 1, kRestore, kRestoreAll, kPurge, kEmpty, kCopy, kPaths, kRefresh, kBinProps };
     HMENU m = CreatePopupMenu();
     if (bin) {
         if (!sel.empty()) {
@@ -4650,6 +4843,7 @@ void ShowVirtualMenu(POINT pt, const std::vector<int>& sel) {
             AppendMenuW(m, MF_STRING | (d.entries.empty() ? MF_GRAYED : 0), kRestoreAll, L"Restaurer tous les éléments");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(m, MF_STRING, kRefresh, L"Actualiser\tF5");
+            AppendMenuW(m, MF_STRING, kBinProps, L"Propriétés de la Corbeille\tAlt+Entrée");
         }
     } else if (!sel.empty()) {
         AppendMenuW(m, MF_STRING, kOpen, L"Ouvrir");
@@ -4672,6 +4866,7 @@ void ShowVirtualMenu(POINT pt, const std::vector<int>& sel) {
         case kCopy: CopyNames({}, false); break;
         case kPaths: CopyPaths({}); break;
         case kRefresh: Refresh(); break;
+        case kBinProps: BinProperties(); break;
     }
 }
 
@@ -4720,6 +4915,7 @@ void ShowArchiveMenu(POINT pt, const std::vector<int>& sel) {
 }
 
 void ShowFullMenu(POINT pt, std::vector<int> sel);
+void ShowShellNsMenu(POINT pt, const std::vector<int>& sel);
 
 void ShowContextMenu(LPARAM lp) {
     if (!HasView()) return;
@@ -4738,6 +4934,10 @@ void ShowContextMenu(LPARAM lp) {
         hit.pt = c;
         if (ListView_HitTest(g_list, &hit) < 0) sel.clear();  // clic dans le vide : menu du dossier
     }
+    if (InShellNs()) {
+        ShowShellNsMenu(pt, sel);
+        return;
+    }
     if (InVirtual()) {
         ShowVirtualMenu(pt, sel);
         return;
@@ -4755,7 +4955,7 @@ void ShowFullMenu(POINT pt, std::vector<int> sel) {
     // Les noms (et non des index) : la vue peut être rafraîchie pendant que le menu est ouvert.
     const std::vector<std::wstring> names = NamesOf(sel);
     std::vector<MenuExtra> extras;
-    if (sel.size() == 1 && E(sel[0]).isDir()) {
+    if (sel.size() == 1 && E(sel[0]).isDir() && !ShellNs_IsPath(names[0])) {
         const std::wstring dir = g_path.empty() ? names[0] : Join(g_path, names[0].c_str());  // Ce PC : un lecteur
         extras = PinExtras(dir, true);
     } else if (sel.empty() && !g_path.empty()) {  // fond du dossier : annuler / rétablir, options d'affichage
@@ -4807,6 +5007,30 @@ void ShowFullMenu(POINT pt, std::vector<int> sel) {
         SetStatus(L"Menu contextuel : choisissez des résultats d'un même dossier.");
     else if (!ok) SetStatus(L"Menu contextuel indisponible pour cet emplacement.");
     SetTimer(g_hwnd, TIMER_PINNED, 800, nullptr);  // « Épingler à Accès rapide » a pu être choisi
+}
+
+// Appareil : le menu du Shell tel quel ; ouvrir un dossier, coller, supprimer et renommer restent chez nous.
+void ShowShellNsMenu(POINT pt, const std::vector<int>& sel) {
+    const std::vector<std::wstring> names = NamesOf(sel);
+    const std::wstring here = g_path;
+    const bool ok = ShellMenu_Show(g_hwnd, g_path, names, pt, GetKeyState(VK_SHIFT) < 0, [names, here](const std::wstring& verb) {
+        auto is = [&](const wchar_t* v) { return _wcsicmp(verb.c_str(), v) == 0; };
+        const int single = names.size() == 1 ? FindEntryByName(names[0]) : -1;
+        if (single >= 0 && E(single).isDir() && (is(L"open") || is(L"explore"))) { ActivateEntry(single); return true; }
+        if (single >= 0 && E(single).isDir() && (is(L"opennewwindow") || is(L"opennewtab"))) {
+            if (is(L"opennewwindow")) NewWindow(names[0]); else NewTab(names[0], true);
+            return true;
+        }
+        if (is(L"paste")) { Paste(single >= 0 && E(single).isDir() ? names[0] : here); return true; }
+        if (!names.empty() && is(L"delete")) { DeleteNames(names, false); return true; }
+        if (single >= 0 && is(L"rename") && g_view.rowOf[single] >= 0) {
+            ListView_EditLabel(g_list, g_view.rowOf[single]);
+            return true;
+        }
+        if (is(L"NewFolder") || names.empty()) SetTimer(g_hwnd, TIMER_SHELLREFRESH, 1500, nullptr);
+        return false;
+    });
+    if (!ok) SetStatus(L"Menu contextuel indisponible pour cet appareil.");
 }
 
 // Menu contextuel d'un dossier du volet de navigation.
@@ -4869,6 +5093,16 @@ void ShowProperties() {
         std::wstring parent, leaf;
         if (!ParentOf(g_view.data->archive, parent, leaf) || !ShellMenu_Invoke(g_hwnd, parent, {leaf}, "properties"))
             SetStatus(L"Propriétés indisponibles.");
+        return;
+    }
+    if (InBin() && SelectedEntries().empty()) {  // fond de la Corbeille : ses propriétés
+        BinProperties();
+        return;
+    }
+    if (InShellNs()) {  // appareil : celles du Shell (élément, ou l'appareil lui-même)
+        std::vector<std::wstring> names = NamesOf(SelectedEntries());
+        if (names.empty()) names = {g_path};
+        if (!ShellMenu_Invoke(g_hwnd, L"", names, "properties")) SetStatus(L"Propriétés indisponibles.");
         return;
     }
     if (InVirtual()) {  // élément réel (Accueil) ; Corbeille : celui qui est dans $Recycle.Bin
@@ -5285,9 +5519,9 @@ void FillCommandBar() {
 void UpdateCommandBar() {
     if (!g_cmdBar) return;
     const bool sel = HasView() && ListView_GetSelectedCount(g_list) > 0;
-    const bool mod = CanModify();
+    const bool mod = CanModify() || InShellNs();  // appareil : le Shell copie, renomme et supprime
     auto on = [](int id, bool e) { SendMessageW(g_cmdBar, TB_ENABLEBUTTON, id, MAKELONG(e ? TRUE : FALSE, 0)); };
-    on(CMD_NEW, mod);
+    on(CMD_NEW, CanModify());
     on(CMD_CUT, sel && mod);
     on(CMD_COPY, sel && !InNet());
     on(CMD_PASTE, mod && ClipboardHasFiles());
@@ -6311,6 +6545,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case WM_APP_INDEXDONE: OnIndexDone((DWORD)wp, lp != 0); return 0;
+        case WM_APP_MOUNTED: OnMounted((DWORD)wp, std::unique_ptr<MountResult>((MountResult*)lp)); return 0;
+        case WM_APP_SHELLDONE: {
+            std::unique_ptr<std::wstring> folder((std::wstring*)lp);
+            if (HasView() && _wcsicmp(folder->c_str(), g_path.c_str()) == 0) Refresh();
+            return 0;
+        }
         case WM_SETTINGCHANGE:
             if (lp && wcscmp((const wchar_t*)lp, L"ShellState") == 0) ApplyViewPrefs(ReadViewPrefs());
             break;
@@ -6381,6 +6621,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == TIMER_PINNED) { KillTimer(hwnd, wp); NavPane_RefreshPinned(true); return 0; }
+            if (wp == TIMER_SHELLREFRESH) {
+                KillTimer(hwnd, wp);
+                if (InShellNs()) Refresh();
+                return 0;
+            }
             if (wp == TIMER_PANE) {
                 UpdatePane();
                 return 0;

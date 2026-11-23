@@ -10,7 +10,7 @@
 #include <vector>
 
 // Clés de tri. COL_PROP : propriété du Shell, valeurs fournies à SortOrder (PropValues).
-enum Col { COL_NAME, COL_SIZE, COL_TYPE, COL_DATE, COL_CTIME, COL_ATIME, COL_ATTR, COL_ORIGIN, COL_COUNT, COL_PROP = 100 };
+enum Col { COL_NAME, COL_SIZE, COL_TYPE, COL_DATE, COL_CTIME, COL_ATIME, COL_ATTR, COL_ORIGIN, COL_SYNC, COL_COUNT, COL_PROP = 100 };
 
 struct Entry {
     uint32_t nameOff;  // offset dans DirData::pool (nom terminé par \0)
@@ -61,6 +61,8 @@ struct DirData {
     std::wstring archive;
     // Partages d'un serveur (« \\serveur », net.h) : origin = commentaire de chaque partage.
     bool server = false;
+    // Dossier synchronisé par un fournisseur cloud (OneDrive, Dropbox… : Cloud_InSyncRoot).
+    bool cloud = false;
 
     bool isRoot() const { return path.empty() && query.empty(); }  // Ce PC (pas une recherche dans tout le PC)
     bool isVirtual() const { return path.size() > 2 && path[0] == L':' && path[1] == L':'; }
@@ -78,11 +80,22 @@ constexpr uint32_t kShownAttrs = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN
                                  FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
 std::wstring AttrText(uint32_t attr);
 
+// Fichiers cloud (colonne Disponibilité, comme l'« État » de l'Explorateur) : d'après les attributs
+// seulement, sans jamais lire le fichier (ce qui le téléchargerait).
+//   0 : rien à dire (hors dossier synchronisé), 1 : en ligne uniquement, 2 : disponible sur cet appareil,
+//   3 : toujours disponible sur cet appareil.
+int SyncState(uint32_t attr, bool inSyncRoot);
+const wchar_t* SyncText(int state);
+// Le dossier est-il sous une racine de synchronisation (Cloud Files API) ? Rapide (appel au noyau).
+bool Cloud_InSyncRoot(const std::wstring& path);
+
 // Parallélisme des clés de tri et du tri (Auto = seulement pour les gros dossiers).
 enum class Parallel { Auto, Never, Always };
 void SetParallel(Parallel p);
 
-// Texte du type de lecteur (DRIVE_*).
+// Ce PC : Entry::extra d'un appareil sans lettre (téléphone, appareil photo) ; DirData::target = son nom d'analyse.
+constexpr uint32_t kDriveDevice = 0x100;
+// Texte du type de lecteur (DRIVE_*, kDriveDevice).
 const wchar_t* DriveTypeText(UINT type);
 // Nom affiché d'un lecteur, comme l'Explorateur : « Données (D:) », « Disque local (C:) ».
 std::wstring DriveDisplayName(const std::wstring& root, UINT type, const DriveInfo& info);

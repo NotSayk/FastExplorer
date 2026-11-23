@@ -1,4 +1,5 @@
 #include "crumbs.h"
+#include "shellns.h"
 
 #include "navpane.h"
 
@@ -17,6 +18,12 @@ std::vector<Crumb> Crumbs_Split(const std::wstring& path,
     if (p == L"::bin") return {{L"Corbeille", p}};  // emplacements virtuels (places.h)
     if (p == L"::home") return {{L"Accueil", p}};
     if (p == L"::net") return {{L"Réseau", p}};
+    if (ShellNs_IsPath(p)) {  // téléphone, appareil photo : les dossiers parents d'après le Shell
+        std::vector<Crumb> c;
+        for (auto& x : ShellNs_Chain(p)) c.push_back({x.text, x.path});
+        if (!c.empty()) return c;
+        return {{L"Appareil", p}};
+    }
 
     std::wstring cur, rest;
     if (p.size() >= 2 && p[1] == L':') {  // C:\…

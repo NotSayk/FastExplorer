@@ -39,6 +39,7 @@ const Builtin kBuiltins[] = {
     {COL_ATIME, L"atime", L"Date d'accès", 170, false, &PKEY_DateAccessed},
     {COL_ATTR, L"attr", L"Attributs", 90, false, &PKEY_FileAttributes},
     {COL_ORIGIN, L"origin", L"Emplacement d'origine", 260, false, nullptr},  // emplacements virtuels seulement,
+    {COL_SYNC, L"sync", L"Disponibilité", 220, false, nullptr},
 };
 
 const Builtin* FindBuiltin(int key) {
@@ -101,7 +102,7 @@ ColSpec Columns_Prop(const PROPERTYKEY& pk) {
 
 std::vector<ColSpec> Columns_Common() {
     std::vector<ColSpec> v;
-    for (int k : {COL_SIZE, COL_TYPE, COL_DATE, COL_CTIME, COL_ATIME, COL_ATTR}) v.push_back(Columns_Builtin(k));
+    for (int k : {COL_SIZE, COL_TYPE, COL_DATE, COL_CTIME, COL_ATIME, COL_ATTR, COL_SYNC}) v.push_back(Columns_Builtin(k));
     for (const PROPERTYKEY* pk : {&PKEY_ItemFolderPathDisplay, &PKEY_Author, &PKEY_Title, &PKEY_Image_Dimensions,
                                   &PKEY_Photo_DateTaken, &PKEY_Media_Duration, &PKEY_Music_Artist, &PKEY_Music_AlbumTitle,
                                   &PKEY_FileVersion, &PKEY_FileOwner})

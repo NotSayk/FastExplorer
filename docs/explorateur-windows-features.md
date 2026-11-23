@@ -79,7 +79,7 @@ De haut en bas :
 | **Accueil** (Home) | Page d'accueil : *Accès rapide* (dossiers épinglés et fréquents), *Favoris* (fichiers épinglés), *Récents*, *Recommandés* (2025 : aussi pour les comptes locaux et Microsoft), *Partagés* (comptes pro). Colonne « Activité » avec avatars pour les comptes Entra ID. Depuis 2026 : « Ouvrir l'emplacement du fichier » et « Demander à Copilot » (comptes pro/scolaires) | ✅🟡 P1 (bloc 21 : dossiers de l'Accès rapide puis 40 fichiers récents, colonnes Emplacement / Utilisé le, « Ouvrir l'emplacement du fichier », menu du Shell sur les vrais fichiers ; raccourcis récents lus directement, sans le Shell : ~80 ms), P3 (Favoris, Recommandés, Partagés) |
 | **Galerie** | Mosaïque chronologique de toutes les photos (dossier Images + sources ajoutées), regroupées par mois, filtre de collection | P2 |
 | **Dossiers épinglés** | Bureau, Téléchargements, Documents, Images, Musique, Vidéos + vos épingles (« Épingler à Accès rapide ») | **P0** |
-| **Ce PC** | Lecteurs (avec jauge d'espace libre), dossiers de l'utilisateur, emplacements réseau, appareils (téléphones MTP, appareils photo) | ✅ P0 (lecteurs : libellé, jauge, espace libre ; réseau et appareils à venir) |
+| **Ce PC** | Lecteurs (avec jauge d'espace libre), dossiers de l'utilisateur, emplacements réseau, appareils (téléphones MTP, appareils photo) | ✅ P0 (lecteurs : libellé, jauge, espace libre ; téléphones et appareils photo listés après les lecteurs, bloc 30 ; Réseau à part) |
 | **Réseau** | Machines découvertes (SMB, WSD), serveurs multimédia (DLNA), routeurs (UPnP) | P2 |
 | **Linux** | Distributions WSL via `\\wsl.localhost\<distro>` | P2 |
 | **Téléphone mobile Android** | Accès sans fil aux fichiers du téléphone via « Lien avec Windows » (2025) | P3 |
@@ -355,7 +355,7 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 | Parcourir | Colonnes *Emplacement d'origine* et *Date de suppression* | ✅ P1 (bloc 21 : lecture directe des `$I` de tous les lecteurs locaux, ~30 ms pour 70 éléments ; colonnes fixes Nom, Emplacement d'origine, Date de suppression, Taille, Type ; les plus récents d'abord ; triable par emplacement) |
 | Restaurer | La sélection, ou tous les éléments | ✅ P1 (clic droit ▸ Restaurer / fond ▸ Restaurer tous les éléments ; dossier d'origine recréé s'il a disparu ; jamais par-dessus un élément existant) |
 | Vider | Tout supprimer définitivement | ✅ P1 (fond ▸ Vider la Corbeille, confirmation et progression du Shell ; Suppr dans la Corbeille = suppression définitive de la sélection, confirmée) |
-| Propriétés | Taille maximale **par lecteur**, option « Ne pas déplacer les fichiers vers la Corbeille », confirmation de suppression | P2 |
+| Propriétés | Taille maximale **par lecteur**, option « Ne pas déplacer les fichiers vers la Corbeille », confirmation de suppression | ✅ P2 (bloc 30 : la fenêtre de Windows, par Alt+Entrée ou le menu du fond de la Corbeille) |
 | Fonctionnement | ⚙️ Un dossier `$Recycle.Bin\<SID>` par volume ; chaque élément = `$R…` (données) + `$I…` (nom d'origine, taille, date) ; API : `IFileOperation` avec `FOFX_RECYCLEONDELETE`, énumération via le dossier Shell `CLSID_RecycleBin` | — |
 
 ---
@@ -376,12 +376,12 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 
 | Fonction | Détail | Prio |
 |---|---|---|
-| États de synchro | Nuage (en ligne uniquement), coche verte creuse (disponible localement), coche pleine (toujours conserver), flèches (synchro en cours), croix rouge (erreur) | P2 ⚙️ attributs `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` / `PINNED` / `UNPINNED` + Cloud Files API |
+| États de synchro | Nuage (en ligne uniquement), coche verte creuse (disponible localement), coche pleine (toujours conserver), flèches (synchro en cours), croix rouge (erreur) | ✅ P2 (bloc 30 : icônes superposées du fournisseur, déjà là ; colonne Disponibilité ci-dessous) ⚙️ attributs `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` / `PINNED` / `UNPINNED` + Cloud Files API |
 | Toujours conserver / Libérer de l'espace | Menu contextuel | ✅ (par le menu de Windows : l'entrée du fournisseur, OneDrive par exemple) |
-| **Ne pas déclencher de téléchargement** | Lire les métadonnées d'un fichier « en ligne uniquement » ne doit **jamais** le télécharger (miniatures et aperçus compris) | **P0** (piège de performance majeur) |
+| **Ne pas déclencher de téléchargement** | Lire les métadonnées d'un fichier « en ligne uniquement » ne doit **jamais** le télécharger (miniatures et aperçus compris) | ✅ **P0** (pas de miniature pour un fichier absent ; la disponibilité se lit dans les attributs, sans ouvrir le fichier) |
 | Partager | Partage proche (Nearby Share), envoi par mail ou application | P3 |
-| Fournisseurs | Dropbox, Google Drive, iCloud, Box : mêmes mécanismes (Cloud Files API) | P2 |
-| Colonne État / Disponibilité | Vue Détails | P2 |
+| Fournisseurs | Dropbox, Google Drive, iCloud, Box : mêmes mécanismes (Cloud Files API) | ✅ P2 (tout dossier sous une racine de synchronisation, `CfGetSyncRootInfoByPath`) |
+| Colonne État / Disponibilité | Vue Détails | ✅ P2 (bloc 30 : « Disponibilité » : disponible en ligne, disponible sur cet appareil, toujours disponible ; ajoutée d'office dans un dossier synchronisé, proposée partout ailleurs ; triable) |
 
 ---
 
@@ -405,12 +405,12 @@ Quota, Personnaliser, BitLocker (selon l'édition).
 |---|---|
 | Jauge d'espace libre, libellé du volume (« Windows (C:) ») | ✅ **P0** |
 | Éjecter (clés USB, disques externes) | ✅ (menu du Shell sur le lecteur ; éjection non bloquée par la surveillance, bloc 4) ⚙️ `CM_Request_Device_Eject` |
-| Formater (FAT32, exFAT, NTFS, ReFS) | P2 (déléguer au dialogue `SHFormatDrive`) |
-| Renommer le volume | P2 |
-| **Monter** une image ISO/VHD/VHDX (double-clic) ; Éjecter pour démonter | P2 |
+| Formater (FAT32, exFAT, NTFS, ReFS) | ✅ (menu de Windows sur le lecteur ▸ Formater…) |
+| Renommer le volume | ✅ P2 (bloc 30 : F2 sur le lecteur dans Ce PC, la saisie montre le seul nom du volume ; lecteur système : autorisation de Windows demandée) |
+| **Monter** une image ISO/VHD/VHDX (double-clic) ; Éjecter pour démonter | ✅ P2 (bloc 30 : double-clic sur .iso / .img / .vhd / .vhdx : montée par `AttachVirtualDisk` (sans droits d'administrateur pour un ISO) et son lecteur ouvert ici, ~0,1 s, sans fenêtre de l'Explorateur ; VHD refusé : Windows le monte ; Éjecter dans le menu du lecteur) |
 | Graver (CD/DVD) | P3 |
 | Exécution automatique (AutoPlay) à l'insertion | P3 |
-| Téléphones et appareils photo (**MTP**) : parcourir et copier | P2 ⚙️ espace de noms Shell (pas de chemin Win32 : PIDL seulement) |
+| Téléphones et appareils photo (**MTP**) : parcourir et copier | ✅🟡 P2 (bloc 30 : listés dans Ce PC et le volet ; parcourus par `IShellItem` (fil d'Ariane, dossier parent, icônes, taille et date) ; ouvrir, copier, couper, coller, supprimer, renommer, propriétés et menu par le Shell. Vérifié sur un autre emplacement sans chemin, les Bibliothèques, faute d'appareil branché) ⚙️ espace de noms Shell (pas de chemin Win32 : PIDL seulement) |
 | BitLocker (déverrouiller, gérer) | P3 |
 | Dev Drive (ReFS) | P3 |
 | Arrivée et départ de lecteurs en direct | ✅ (bloc 4) ⚙️ `WM_DEVICECHANGE` / `SHChangeNotify(SHCNE_DRIVEADD…)` |
@@ -579,7 +579,7 @@ Points faibles connus, sur lesquels FastExplorer peut se démarquer :
 
 | Sujet | Comment ça marche |
 |---|---|
-| **Espace de noms Shell** | Tout est un `IShellItem` / PIDL : fichiers, mais aussi Ce PC, Réseau, téléphone, Corbeille, Panneau de configuration. Les emplacements virtuels **n'ont pas de chemin Win32**. FastExplorer lit les dossiers Win32 par l'API NT (rapide) et devra passer par le Shell pour les emplacements virtuels (MTP, Corbeille, Réseau, Galerie). |
+| **Espace de noms Shell** | Tout est un `IShellItem` / PIDL : fichiers, mais aussi Ce PC, Réseau, téléphone, Corbeille, Panneau de configuration. Les emplacements virtuels **n'ont pas de chemin Win32**. FastExplorer lit les dossiers Win32 par l'API NT (rapide) et passe par le Shell pour les emplacements sans chemin (appareils MTP, `shellns.*`). |
 | **Known Folders** | Emplacements standard (Documents, Téléchargements…) via `SHGetKnownFolderPath(FOLDERID_*)`, jamais en dur (ils peuvent être déplacés ou redirigés vers un cloud ou un serveur). Noms localisés via `desktop.ini` (`LocalizedResourceName`). |
 | **Extensions Shell** | Menus contextuels (`IContextMenu`, `IExplorerCommand`), propriétés (`IPropertyStore` + property handlers), miniatures (`IThumbnailProvider`), aperçus (`IPreviewHandler`), surimpressions (`IShellIconOverlayIdentifier`), feuilles de propriétés, gestionnaires de glisser-déposer, copy hooks. Code tiers chargé **dans le processus** : un plantage ou une lenteur d'extension affecte l'application. Les héberger avec prudence (hors du thread de l'interface, délai maximal). |
 | **Moteur de copie** | `IFileOperation` : conflits, progression, annulation, élévation, Corbeille ; s'intègre à l'historique d'annulation de l'Explorateur. |
@@ -656,8 +656,8 @@ P2, en blocs (dans cet ordre) :
     « qui utilise ce fichier ? » ⭐, reprise après erreur et vérification des copies, perte de propriétés,
     raccourci dont la cible a disparu.
 29. ✅ **Recherche** : syntaxe AQS, recherches récentes, contenu des fichiers (index Windows Search).
-30. **Cloud et lecteurs** : états de synchronisation, monter
-    ISO / VHD, formater, renommer un volume, appareils MTP, propriétés de la Corbeille.
+30. ✅ **Cloud et lecteurs** : états de synchronisation, monter ISO / VHD, formater, renommer un volume,
+    appareils MTP, propriétés de la Corbeille.
 31. **Productivité** ⭐ : palette de commandes, raccourcis personnalisables, terminal intégré, aperçu du code
     coloré, panneau rapide (empreintes).
 32. **Intégrations** : Git ⭐, WSL ⭐, découverte du réseau, Galerie, remplacer l'Explorateur par défaut.

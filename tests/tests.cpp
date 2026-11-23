@@ -39,6 +39,8 @@
 #include <shobjidl.h>
 #include <propkey.h>
 #include "paths.h"
+#include "shellns.h"
+#include "vdisk.h"
 #include "util.h"
 
 #include <cstdio>
@@ -1580,6 +1582,80 @@ void TestSelectionText() {
     CHECK_STR(SelectionText(1, false, 0), std::wstring(L"1 élément sélectionné  ") + b);  // fichier vide
 }
 
+void TestDevices() {
+    // Disponibilité des fichiers cloud : d'après les attributs seulement.
+    CHECK(SyncState(FILE_ATTRIBUTE_ARCHIVE, false) == 0 && SyncState(FILE_ATTRIBUTE_ARCHIVE, true) == 2);
+    CHECK(SyncState(FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_UNPINNED, true) == 1);
+    CHECK(SyncState(FILE_ATTRIBUTE_OFFLINE, false) == 1 && SyncState(FILE_ATTRIBUTE_PINNED, true) == 3);
+    CHECK(SyncState(FILE_ATTRIBUTE_PINNED | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, true) == 3);
+    CHECK(wcscmp(SyncText(1), L"Disponible en ligne") == 0 && SyncText(0)[0] == 0);
+    CHECK(!Cloud_InSyncRoot(L"C:\\Windows") && !Cloud_InSyncRoot(L"::bin"));
+    ColSpec sc;
+    CHECK(Columns_FromId(L"sync", sc) && sc.key == COL_SYNC);
+    // Images disque.
+    CHECK(VDisk_IsImage(L"win.ISO") && VDisk_IsImage(L"a.vhdx") && VDisk_IsImage(L"b.img") && !VDisk_IsImage(L"iso.txt"));
+    std::wstring root;
+    CHECK(VDisk_Mount(Join(g_root, L"absent.iso"), root, 500) != 0 && root.empty());
+
+    // Emplacements du Shell sans chemin : les Bibliothèques servent d'exemple (toujours là).
+    const std::wstring libs = L"::{031E4825-7B94-4dc3-B131-E946B44C8DD5}";
+    CHECK(ShellNs_IsPath(libs) && !ShellNs_IsPath(L"::bin") && !ShellNs_IsPath(L"C:\\"));
+    DirData d;
+    d.path = libs;
+    const double t0 = NowMs();
+    ShellNs_Enumerate(d);
+    printf("  Bibliotheques : %zu elements en %.0f ms\n", d.entries.size(), NowMs() - t0);
+    CHECK(d.error == 0 && d.target.size() == d.entries.size());
+    if (!d.entries.empty()) {
+        CHECK(!d.target[0].empty());
+        CHECK(d.entries[0].icon >= 0);
+        std::wstring parent;
+        if (ShellNs_IsPath(d.target[0])) CHECK(ShellNs_Parent(d.target[0], parent) && _wcsicmp(parent.c_str(), libs.c_str()) == 0);
+        // Menu et objet de données à partir des noms d'analyse complets.
+        IDataObject* dobj = nullptr;
+        CHECK(ShellObjectOf(nullptr, libs, {d.target[0]}, IID_IDataObject, (void**)&dobj) && dobj);
+        if (dobj) dobj->Release();
+    }
+    CHECK(!ShellNs_Title(libs).empty());
+    auto chain = ShellNs_Chain(libs);
+    CHECK(!chain.empty() && _wcsicmp(chain.back().path.c_str(), libs.c_str()) == 0);
+    auto crumbs = Crumbs_Split(libs);
+    CHECK(!crumbs.empty() && crumbs.back().text == chain.back().text);
+    std::wstring up;
+    CHECK(ShellNs_Parent(libs, up) && up.empty() && !ShellNs_Parent(L"C:\\Windows", up));
+    DirData gone;
+    gone.path = L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\\\?\\usb#vid_0000&pid_0000#absent#{6ac27878-a6fa-4155-ba85-f98f491d4f33}";
+    ShellNs_Enumerate(gone);
+    CHECK(gone.error != 0 && gone.entries.empty());  // appareil débranché : erreur, pas de plantage
+    // Opérations du Shell (celles d'un téléphone) : même chemin de code, ici sur des fichiers ordinaires.
+    {
+        const std::wstring a = Join(g_root, L"sn_a"), b = Join(g_root, L"sn_b");
+        CreateDirectoryW(a.c_str(), nullptr);
+        CreateDirectoryW(b.c_str(), nullptr);
+        HANDLE h = CreateFileW(Join(a, L"x.txt").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        CloseHandle(h);
+        auto run = [](auto start) {
+            HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            bool ok = false;
+            start([&](bool r) { ok = r; SetEvent(ev); });
+            const bool done = WaitForSingleObject(ev, 20000) == WAIT_OBJECT_0;
+            CloseHandle(ev);
+            return done && ok;
+        };
+        CHECK(run([&](auto cb) { ShellNs_CopyInto(nullptr, {Join(a, L"x.txt")}, b, cb); }));
+        CHECK(GetFileAttributesW(Join(b, L"x.txt").c_str()) != INVALID_FILE_ATTRIBUTES);
+        CHECK(run([&](auto cb) { ShellNs_Rename(nullptr, Join(b, L"x.txt"), L"y.txt", cb); }));
+        CHECK(GetFileAttributesW(Join(b, L"y.txt").c_str()) != INVALID_FILE_ATTRIBUTES);
+        // Suppression définitive pour le test (pas de passage par la Corbeille de l'utilisateur) : DeleteFile direct.
+        DeleteFileW(Join(b, L"y.txt").c_str());
+        RemoveTree(a);
+        RemoveTree(b);
+    }
+    const auto devs = ShellNs_Devices();
+    printf("  appareils (MTP) branches : %zu\n", devs.size());
+    for (const auto& v : devs) CHECK(ShellNs_IsPath(v.path) && !v.name.empty());
+}
+
 void TestAqs() {
     SYSTEMTIME st{2026, 3, 0, 15, 12, 0, 0, 0};
     FILETIME ft;
@@ -2594,6 +2670,7 @@ int wmain() {
     TestSelectionText();
     TestSearch();
     TestAqs();
+    TestDevices();
     TestFastCopy();
     TestFileOps();
     TestBatchRename();
